@@ -1,0 +1,7 @@
+# project-scoped r2 source — a Mode 1 route reading this must fail
+# build-time validation.
+[sources.project_blobs]
+kind = "r2"
+scope = "project"
+bucket = "fixture-project-blobs"
+endpoint_env = "FIXTURE_R2_ENDPOINT"

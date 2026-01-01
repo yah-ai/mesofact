@@ -1,0 +1,23 @@
+# mesofact.config.toml — example/smoke target only.
+#
+# This example is the smoke target for `scripts/smoke-yah-dev.sh` (build +
+# in-memory publish). It does not represent a real deploy — the yah.dev
+# marketing site moved to <yah>/app/yah/web/ with its own config.
+#
+# Values below are placeholders so mesofact-publish has something to read
+# under --in-memory mode; replace them only if you ever wire this example
+# to a real R2 bucket (you shouldn't — see app/yah/web/mesofact.config.toml
+# in yah for the real prod config).
+#
+# Run the smoke from mesofact root:
+#   bash scripts/smoke-yah-dev.sh
+
+[publish]
+bucket   = "mesofact-example-static"
+endpoint = "https://ACCOUNT_ID.r2.cloudflarestorage.com"
+region   = "auto"
+zone_id  = "ZONE_ID"
+
+access_key_id_env     = "MESOFACT_S3_ACCESS_KEY_ID"
+secret_access_key_env = "MESOFACT_S3_SECRET_ACCESS_KEY"
+api_token_env         = "CLOUDFLARE_API_TOKEN"

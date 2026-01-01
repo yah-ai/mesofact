@@ -1,0 +1,102 @@
+[pipeline]
+name = "release-build"
+label = "Build mesofact release artifacts"
+on_fail = []
+placement = "anywhere"
+
+[[pipeline.steps]]
+name = "cargo-check"
+argv = ["cargo", "check", "--workspace"]
+produces = []
+kind = "subprocess"
+push = false
+load = false
+
+[pipeline.steps.env]
+
+[pipeline.steps.on_fail]
+kind = "abort"
+
+[[pipeline.steps]]
+name = "build-publisher"
+argv = ["cargo", "build", "--release", "-p", "mesofact-publisher"]
+kind = "subprocess"
+push = false
+load = false
+
+[pipeline.steps.env]
+
+[pipeline.steps.on_fail]
+kind = "abort"
+
+[[pipeline.steps.produces]]
+binary = "mesofact-publish"
+path = "target/release/mesofact-publish"
+
+[[pipeline.steps]]
+name = "build-publisher-x86_64-linux-musl"
+argv = [
+    "cross",
+    "build",
+    "--release",
+    "-p",
+    "mesofact-publisher",
+    "--locked",
+    "--target",
+    "x86_64-unknown-linux-musl",
+]
+timeout = 1800
+kind = "subprocess"
+push = false
+load = false
+
+[pipeline.steps.env]
+DOCKER_DEFAULT_PLATFORM = "linux/amd64"
+
+[pipeline.steps.on_fail]
+kind = "abort"
+
+[[pipeline.steps.produces]]
+binary = "mesofact-publish"
+path = "target/x86_64-unknown-linux-musl/release/mesofact-publish"
+triple = "x86_64-unknown-linux-musl"
+
+[[pipeline.steps]]
+name = "build-publisher-aarch64-linux-musl"
+argv = [
+    "cross",
+    "build",
+    "--release",
+    "-p",
+    "mesofact-publisher",
+    "--locked",
+    "--target",
+    "aarch64-unknown-linux-musl",
+]
+timeout = 1800
+kind = "subprocess"
+push = false
+load = false
+
+[pipeline.steps.env]
+DOCKER_DEFAULT_PLATFORM = "linux/amd64"
+
+[pipeline.steps.on_fail]
+kind = "abort"
+
+[[pipeline.steps.produces]]
+binary = "mesofact-publish"
+path = "target/aarch64-unknown-linux-musl/release/mesofact-publish"
+triple = "aarch64-unknown-linux-musl"
+
+[pipeline.params]
+
+[[pipeline.on_success]]
+kind = "publish"
+provider = "r2"
+bucket = "mesofact-releases"
+base_url = "https://releases.mesofact.dev"
+
+[[pipeline.triggers]]
+kind = "tag"
+pattern = "v*.*.*"

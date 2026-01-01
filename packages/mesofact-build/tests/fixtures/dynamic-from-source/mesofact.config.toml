@@ -1,0 +1,7 @@
+# Same `assets` source as `static-only/`. The test pre-registers a stub
+# R2Adapter for this name before invoking `build()`, so no env vars are read.
+[sources.assets]
+kind = "r2"
+scope = "global"
+bucket = "fixture-assets"
+endpoint_env = "FIXTURE_R2_ENDPOINT"

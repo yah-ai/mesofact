@@ -1,0 +1,10 @@
+{
+  "subclassId": "bundle-ollama-local-cleric-primary",
+  "name": "Local Sage",
+  "class": "Cleric",
+  "runner": "claude_cli",
+  "connectionId": "",
+  "auth": "subscription",
+  "model": "qwen3.5",
+  "source": "preroll"
+}

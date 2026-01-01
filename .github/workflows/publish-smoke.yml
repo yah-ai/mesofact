@@ -1,0 +1,86 @@
+name: publish smoke
+
+# Exercises mesofact-publish against a real Cloudflare R2 bucket + zone using
+# CI-injected credentials. Skipped on PRs from forks (no secret access) and on
+# every event when the secret set isn't populated — keeps local + open-source
+# contributors unblocked while still smoking the real-network path on `main`.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/mesofact-publisher/**"
+      - ".github/workflows/publish-smoke.yml"
+  workflow_dispatch:
+
+jobs:
+  publish-smoke:
+    runs-on: ubuntu-latest
+    # Gate on the R2 access key being set (a known-skipped value when secrets
+    # are unavailable; pull requests from forks fall into this branch).
+    if: ${{ secrets.MESOFACT_S3_ACCESS_KEY_ID != '' }}
+    env:
+      MESOFACT_S3_ACCESS_KEY_ID: ${{ secrets.MESOFACT_S3_ACCESS_KEY_ID }}
+      MESOFACT_S3_SECRET_ACCESS_KEY: ${{ secrets.MESOFACT_S3_SECRET_ACCESS_KEY }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      SMOKE_BUCKET: ${{ secrets.MESOFACT_SMOKE_BUCKET }}
+      SMOKE_ENDPOINT: ${{ secrets.MESOFACT_SMOKE_ENDPOINT }}
+      SMOKE_ZONE_ID: ${{ secrets.MESOFACT_SMOKE_ZONE_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          cache-on-failure: true
+
+      - name: Build mesofact-publish
+        run: cargo build --release -p mesofact-publisher --bin mesofact-publish
+
+      - name: Stage a minimal dist/
+        run: |
+          BUILD_ID=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
+          mkdir -p smoke-dist/server smoke-dist/html
+          cat >smoke-dist/manifest.json <<JSON
+          {
+            "version": "1",
+            "build_id": "${BUILD_ID}",
+            "routes": [{
+              "route": "/",
+              "mode": "static",
+              "render_entrypoint": "dist/server/home.js",
+              "cache_policy": { "ttl": 60 }
+            }],
+            "static_assets": []
+          }
+          JSON
+          cat >smoke-dist/tag-index.json <<JSON
+          { "build_id": "${BUILD_ID}", "tags": { "smoke:home": ["/"] } }
+          JSON
+          echo "export const render = () => ({ html: '<h1>smoke</h1>', cache: { ttl: 60 } });" \
+            > smoke-dist/server/home.js
+          echo "<!doctype html><h1>smoke</h1>" > smoke-dist/html/home.html
+          echo "BUILD_ID=${BUILD_ID}" >> "$GITHUB_ENV"
+
+      - name: Write publish config
+        run: |
+          cat >mesofact.config.toml <<TOML
+          [publish]
+          bucket = "${SMOKE_BUCKET}"
+          endpoint = "${SMOKE_ENDPOINT}"
+          zone_id = "${SMOKE_ZONE_ID}"
+          TOML
+
+      - name: Publish
+        run: ./target/release/mesofact-publish smoke-dist
+
+      - name: Re-publish (idempotency smoke)
+        run: ./target/release/mesofact-publish smoke-dist | tee second.log
+
+      - name: Assert second run was a no-op
+        run: |
+          grep -E "uploaded: 0 key\(s\)" second.log
+          grep -E "purged:   0 tag\(s\)" second.log

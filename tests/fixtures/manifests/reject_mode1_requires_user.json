@@ -1,0 +1,21 @@
+{
+  "sources": {
+    "global_assets": { "scope": "global" }
+  },
+  "manifest": {
+    "version": "1",
+    "build_id": "2026-05-15T00:00:00Z-rqu0001",
+    "routes": [
+      {
+        "route": "/me",
+        "mode": "static",
+        "render_entrypoint": "dist/server/me.js",
+        "requires": ["user"],
+        "source_reads": ["global_assets"],
+        "cache_policy": { "ttl": 3600 }
+      }
+    ],
+    "static_assets": []
+  },
+  "expect": { "errors": [{ "kind": "mode1_requires_user" }] }
+}

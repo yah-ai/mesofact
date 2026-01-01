@@ -1,0 +1,10 @@
+{
+  "sources": {},
+  "manifest": {
+    "version": "99",
+    "build_id": "2026-05-15T00:00:00Z-ver9901",
+    "routes": [],
+    "static_assets": []
+  },
+  "expect": { "errors": [{ "kind": "unsupported_version" }] }
+}

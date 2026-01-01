@@ -1,0 +1,7 @@
+# Source catalog the build validator consults. `assets` is `global`, so a
+# Mode 1 route is free to read from it.
+[sources.assets]
+kind = "r2"
+scope = "global"
+bucket = "fixture-assets"
+endpoint_env = "FIXTURE_R2_ENDPOINT"

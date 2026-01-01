@@ -1,0 +1,9 @@
+{
+  "name": "mesofact-workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "examples/*"
+  ]
+}

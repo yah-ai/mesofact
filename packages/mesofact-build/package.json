@@ -1,0 +1,30 @@
+{
+  "name": "@mesofact/build",
+  "version": "0.1.0",
+  "description": "Build pipeline — TS bundle → route discovery → source inference → validate → Mode 1 prerender → manifest + tag-index.",
+  "license": "MIT OR Apache-2.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "bin": {
+    "mesofact-build": "./src/cli.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@mesofact/runtime": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.1.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.3"
+  }
+}

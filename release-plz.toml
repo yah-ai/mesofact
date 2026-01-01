@@ -1,0 +1,24 @@
+# release-plz configuration for the mesofact workspace.
+#
+# Publish with:  release-plz release --backend github
+#
+# mesofact is published first because mesofact-publisher depends on it.
+# release-plz detects the dependency order from Cargo.toml and publishes
+# in topological order. The path dep
+# `mesofact = { path = "../mesofact", version = "0.1.0" }` in
+# mesofact-publisher's Cargo.toml is rewritten to a registry dep before
+# publication.
+
+[workspace]
+# One tag per crate: mesofact-v0.1.0, mesofact-publisher-v0.1.0
+git_tag_name = "{{package}}-v{{version}}"
+# Allow extra time for reqwest/axum/tokio dep graphs to resolve and publish.
+publish_timeout = "300s"
+
+[[package]]
+name = "mesofact"
+# mesofact publishes first; no special overrides needed.
+
+[[package]]
+name = "mesofact-publisher"
+# release-plz waits for mesofact to appear on crates.io before publishing.

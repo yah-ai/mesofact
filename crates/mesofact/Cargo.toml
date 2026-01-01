@@ -1,0 +1,47 @@
+[package]
+name = "mesofact"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Tri-mode web server: static (push-to-CDN) / SSR (Bun render pool behind a Rust proxy) / SPA shell"
+readme = "README.md"
+keywords = ["web", "ssr", "static-site", "axum"]
+categories = ["web-programming::http-server"]
+
+[lib]
+name = "mesofact"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mesofact-proxy"
+path = "src/bin/mesofact-proxy.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "process", "sync", "signal", "fs"] }
+tower-http = { version = "0.5", features = ["fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+matchit = "0.8"
+num_cpus = "1"
+tempfile = "3"
+anyhow = "1"
+lru = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+toml = "0.8"
+# Shared auth contract: the session codec (mint/verify) and Claims type live in
+# cheers-core, consumed cross-camp by path dep (R009 / P11). See external/cheers.
+cheers-core = { path = "../../../cheers/crates/cheers-core" }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

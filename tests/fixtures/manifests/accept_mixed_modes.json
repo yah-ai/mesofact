@@ -1,0 +1,51 @@
+{
+  "sources": {
+    "global_assets": { "scope": "global" },
+    "project_db": { "scope": "project" }
+  },
+  "manifest": {
+    "version": "1",
+    "build_id": "2026-05-15T00:00:00Z-mixed01",
+    "routes": [
+      {
+        "route": "/",
+        "mode": "static",
+        "render_entrypoint": "dist/server/index.js",
+        "source_reads": ["global_assets"],
+        "cache_policy": { "ttl": 3600 }
+      },
+      {
+        "route": "/p/:id",
+        "mode": "ssr",
+        "render_entrypoint": "dist/server/p_id.js",
+        "requires": ["user", "project"],
+        "source_reads": ["project_db"],
+        "cache_policy": { "ttl": 60, "swr": 300, "negative_ttl": 10 },
+        "concurrency": 4
+      },
+      {
+        "route": "/app",
+        "mode": "spa",
+        "render_entrypoint": "dist/server/_shell.js",
+        "cache_policy": { "ttl": 60 },
+        "hydration": {
+          "script": "app.HASH.js",
+          "code_split": ["app.HASH.a.js"]
+        }
+      }
+    ],
+    "static_assets": [
+      {
+        "key": "css/app.HASH.css",
+        "content_hash": "sha256-deadbeef",
+        "content_type": "text/css",
+        "immutable": true
+      }
+    ],
+    "error_routes": {
+      "404": "dist/server/_404.js",
+      "5xx": "dist/server/_5xx.js"
+    }
+  },
+  "expect": "ok"
+}

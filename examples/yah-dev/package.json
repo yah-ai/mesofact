@@ -1,0 +1,16 @@
+{
+  "name": "@mesofact-examples/yah-dev",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Minimal mesofact-static showcase + smoke target. Originally hosted the yah.dev marketing copy; that moved to app/yah/web/ in the yah repo. This stub stays so mesofact's smoke (scripts/smoke-yah-dev.sh) keeps a build+publish integration test outside of any consumer.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mesofact/runtime": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3"
+  }
+}

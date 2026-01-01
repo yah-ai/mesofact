@@ -1,0 +1,185 @@
+{
+  "version": "1",
+  "rules": [
+    {
+      "kind": "tool",
+      "name": "ask_user"
+    },
+    {
+      "scope": {
+        "kind": "subclass",
+        "id": "bundle-anthropic-warrior-primary"
+      },
+      "kind": "tool_path",
+      "name": "Edit",
+      "glob": "/Users/user/ss/yah/external/mesofact/**"
+    },
+    {
+      "scope": {
+        "kind": "subclass",
+        "id": "bundle-anthropic-warrior-primary"
+      },
+      "kind": "tool_path",
+      "name": "Write",
+      "glob": "/Users/user/ss/yah/external/mesofact/**"
+    },
+    {
+      "scope": {
+        "kind": "subclass",
+        "id": "bundle-anthropic-warrior-primary"
+      },
+      "kind": "bash_cmd_pattern",
+      "cmd": "mkdir",
+      "args": [
+        {
+          "kind": "any"
+        }
+      ]
+    },
+    {
+      "scope": {
+        "kind": "subclass",
+        "id": "bundle-anthropic-warrior-primary"
+      },
+      "kind": "bash_cmd_pattern",
+      "cmd": "cd",
+      "args": [
+        {
+          "kind": "any"
+        }
+      ]
+    },
+    {
+      "scope": {
+        "kind": "subclass",
+        "id": "bundle-anthropic-warrior-primary"
+      },
+      "kind": "bash_cmd_pattern",
+      "cmd": "bun",
+      "args": [
+        {
+          "kind": "any"
+        }
+      ]
+    },
+    {
+      "scope": {
+        "kind": "subclass",
+        "id": "bundle-anthropic-cleric-primary"
+      },
+      "kind": "tool_path",
+      "name": "Edit",
+      "glob": "/Users/user/ss/yah/external/mesofact/crates/mesofact/**"
+    },
+    {
+      "scope": {
+        "kind": "subclass",
+        "id": "bundle-anthropic-cleric-primary"
+      },
+      "kind": "bash_cmd_pattern",
+      "cmd": "mkdir",
+      "args": [
+        {
+          "kind": "any"
+        }
+      ]
+    },
+    {
+      "scope": {
+        "kind": "subclass",
+        "id": "bundle-anthropic-cleric-primary"
+      },
+      "kind": "tool_path",
+      "name": "Write",
+      "glob": "/Users/user/ss/yah/external/mesofact/crates/mesofact/src/proxy/**"
+    },
+    {
+      "scope": {
+        "kind": "subclass",
+        "id": "bundle-anthropic-cleric-primary"
+      },
+      "kind": "tool_path",
+      "name": "Write",
+      "glob": "/Users/user/ss/yah/external/mesofact/crates/mesofact/src/bin/**"
+    },
+    {
+      "scope": {
+        "kind": "subclass",
+        "id": "bundle-anthropic-cleric-primary"
+      },
+      "kind": "tool_path",
+      "name": "Write",
+      "glob": "/Users/user/ss/yah/external/mesofact/crates/mesofact/tests/**"
+    },
+    {
+      "scope": {
+        "kind": "subclass",
+        "id": "sc:bundle-anthropic-miravel:1779408577615"
+      },
+      "kind": "tool_path",
+      "name": "Read",
+      "glob": "/Users/user/ss/yah/packages/yah/ui/src/components/infra/**"
+    },
+    {
+      "scope": {
+        "kind": "subclass",
+        "id": "sc:bundle-anthropic-miravel:1779408577615"
+      },
+      "kind": "tool",
+      "name": "Grep"
+    },
+    {
+      "scope": {
+        "kind": "subclass",
+        "id": "sc:bundle-anthropic-miravel:1779408577615"
+      },
+      "kind": "tool_path",
+      "name": "Read",
+      "glob": "/Users/user/ss/yah/app/yah/cli/src/**"
+    },
+    {
+      "scope": {
+        "kind": "subclass",
+        "id": "sc:bundle-anthropic-miravel:1779408577615"
+      },
+      "kind": "bash_cmd_pattern",
+      "cmd": "grep",
+      "args": [
+        {
+          "kind": "any"
+        }
+      ]
+    },
+    {
+      "scope": {
+        "kind": "subclass",
+        "id": "bundle-anthropic-warrior-primary"
+      },
+      "kind": "tool_path",
+      "name": "Read",
+      "glob": "/Users/user/ss/yah/crates/yah/agent-tools/src/**"
+    },
+    {
+      "scope": {
+        "kind": "subclass",
+        "id": "bundle-anthropic-warrior-primary"
+      },
+      "kind": "tool_path",
+      "name": "Read",
+      "glob": "/Users/user/ss/yah/crates/yah/kg/src/**"
+    },
+    {
+      "scope": {
+        "kind": "subclass",
+        "id": "bundle-anthropic-warrior-primary"
+      },
+      "kind": "tool",
+      "name": "Grep"
+    },
+    {
+      "kind": "tool_path",
+      "name": "Read",
+      "glob": "/Users/user/ss/yah/.yah/docs/working/**"
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "sources": {
+    "project_db": { "scope": "project" }
+  },
+  "manifest": {
+    "version": "1",
+    "build_id": "2026-05-15T00:00:00Z-scoped1",
+    "routes": [
+      {
+        "route": "/p/:id",
+        "mode": "static",
+        "render_entrypoint": "dist/server/p_id.js",
+        "source_reads": ["project_db"],
+        "cache_policy": { "ttl": 3600 }
+      }
+    ],
+    "static_assets": []
+  },
+  "expect": { "errors": [{ "kind": "mode1_scoped_source" }] }
+}
