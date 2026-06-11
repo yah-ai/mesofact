@@ -220,6 +220,7 @@ name = "cheers-core"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "base64",
  "serde",
  "serde_json",
  "thiserror",
