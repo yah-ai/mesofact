@@ -28,6 +28,7 @@ import type {
   ManifestHydration,
   ManifestPrerender,
   ManifestRoute,
+  ManifestStaticAsset,
   ResolvedPlacement,
   RouteEntry,
   RoutesConfig,
@@ -47,6 +48,8 @@ export type AssembleInput = {
   inferredSources: ReadonlyMap<string, readonly string[]>;
   // route → resolved client bundle (Mode 3 only; from `bundleClientEntrypoints`)
   hydration?: ReadonlyMap<string, ManifestHydration>;
+  // Discovered public/ overlay files (R490-F4; from `discoverStaticAssets`).
+  staticAssets?: readonly ManifestStaticAsset[];
   catalog: SourceCatalog;
 };
 
@@ -57,7 +60,7 @@ export function assembleManifest(input: AssembleInput): Manifest {
     version: MANIFEST_VERSION,
     build_id: input.buildId,
     routes,
-    static_assets: [],
+    static_assets: input.staticAssets ? [...input.staticAssets] : [],
     ...(input.routes.error_routes ? { error_routes: input.routes.error_routes } : {}),
     ...(ssrPrefixes.length > 0 ? { ssr_prefixes: ssrPrefixes } : {}),
   };
@@ -103,6 +106,7 @@ function buildRoute(entry: RouteEntry, input: AssembleInput): ManifestRoute {
     ...(hydration ? { hydration } : {}),
     ...(entry.prerender ? { prerender: toManifestPrerender(entry.prerender) } : {}),
     ...(entry.mode === "ssr" ? { placement: resolvePlacement(entry) } : {}),
+    ...(entry.resilience ? { resilience: entry.resilience } : {}),
   };
   return out;
 }

@@ -650,3 +650,67 @@ describe("build (failing fixtures)", () => {
     expect(existsSync(join(outDir, "manifest.json"))).toBe(false);
   });
 });
+
+describe("build (ssr resilience round-trip — W181)", () => {
+  test("manifest carries the resilience block verbatim", async () => {
+    const projectRoot = join(FIXTURES, "ssr-resilience");
+    const outDir = makeOut();
+
+    const result = await build({ projectRoot, outDir, buildId: "resilience-build" });
+
+    const manifest = JSON.parse(readFileSync(result.manifestPath, "utf8"));
+    const route = manifest.routes.find((r: { route: string }) => r.route === "/api/submit");
+    expect(route).toBeDefined();
+    expect(route.mode).toBe("ssr");
+    expect(route.resilience).toEqual({
+      timeout_ms: 5_000,
+      retry: { attempts: 3, backoff_ms: [50, 200], retry_on: "connection" },
+    });
+
+    // The block survives a validate() round-trip (not silently stripped —
+    // the data_inputs/R014 regression class).
+    const { validate } = await import("@mesofact/runtime");
+    const revalidated = validate(JSON.parse(readFileSync(result.manifestPath, "utf8")));
+    expect(revalidated.ok).toBe(true);
+    if (revalidated.ok) {
+      const rt = revalidated.manifest.routes.find((r) => r.route === "/api/submit");
+      expect(rt?.resilience?.retry?.attempts).toBe(3);
+    }
+  });
+});
+
+describe("build (static-assets overlay — R490-F4)", () => {
+  test("copies public/ into dist/html/ and populates manifest.static_assets", async () => {
+    const projectRoot = join(FIXTURES, "static-assets");
+    const outDir = makeOut();
+
+    const result = await build({ projectRoot, outDir, buildId: "assets-build" });
+
+    // Files copied verbatim, preserving relative paths.
+    const copied = join(outDir, "html", "illustrations", "foo.webp");
+    expect(existsSync(copied)).toBe(true);
+    expect(readFileSync(copied)).toEqual(readFileSync(join(projectRoot, "public/illustrations/foo.webp")));
+    expect(existsSync(join(outDir, "html", "robots.txt"))).toBe(true);
+
+    // Manifest lists both, sorted by key, with hash + content type.
+    const manifest = JSON.parse(readFileSync(result.manifestPath, "utf8"));
+    expect(manifest.static_assets).toHaveLength(2);
+    const keys = manifest.static_assets.map((a: { key: string }) => a.key);
+    expect(keys).toEqual(["illustrations/foo.webp", "robots.txt"]);
+    const webp = manifest.static_assets[0];
+    expect(webp.content_type).toBe("image/webp");
+    expect(webp.content_hash).toMatch(/^[0-9a-f]{64}$/);
+    expect(webp.immutable).toBe(false);
+
+    // Routes still build alongside the overlay.
+    expect(existsSync(join(outDir, "html", "index.html"))).toBe(true);
+  });
+
+  test("a workload without public/ emits an empty static_assets", async () => {
+    const projectRoot = join(FIXTURES, "static-only");
+    const outDir = makeOut();
+    const result = await build({ projectRoot, outDir, buildId: "no-assets" });
+    const manifest = JSON.parse(readFileSync(result.manifestPath, "utf8"));
+    expect(manifest.static_assets).toEqual([]);
+  });
+});

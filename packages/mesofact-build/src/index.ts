@@ -83,8 +83,9 @@ import {
 import { BuildError, loadRoutes } from "./load-routes.js";
 import { assembleManifest, ValidationFailed } from "./manifest-build.js";
 import { prerender, type PrerenderInput } from "./prerender.js";
-import { loadCatalog } from "./source-catalog.js";
+import { loadCatalog, loadConfigOpt } from "./source-catalog.js";
 import { inferFromFile } from "./source-infer.js";
+import { discoverStaticAssets, DEFAULT_PUBLIC_DIR } from "./static-assets.js";
 import { buildTagIndex } from "./tag-index.js";
 
 export { BuildError } from "./load-routes.js";
@@ -97,6 +98,7 @@ export { buildTagIndex } from "./tag-index.js";
 export { inferFromFile, inferFromSource } from "./source-infer.js";
 export type { InferenceResult } from "./source-infer.js";
 export { routeKey, prerenderKey } from "./route-key.js";
+export { discoverStaticAssets, contentTypeFor, DEFAULT_PUBLIC_DIR } from "./static-assets.js";
 
 export type BuildOptions = {
   // Project root containing `mesofact.routes.ts` (+ optional
@@ -219,6 +221,15 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
     inferredSources.set(r.route, inferFromFile(entry).source_reads);
   }
 
+  // Static-asset discovery (R490-F4) — copy the public/ overlay verbatim
+  // into dist/html/ and list each file in the manifest. Runs before manifest
+  // assembly so `static_assets` is populated; before prerender so a route
+  // emitting `<key>.html` over an overlay file is the route's (documented)
+  // win.
+  const publicDir = loadConfigOpt(join(projectRoot, "mesofact.config.toml"))?.build?.public_dir
+    ?? DEFAULT_PUBLIC_DIR;
+  const staticAssets = await discoverStaticAssets(projectRoot, outDir, publicDir);
+
   // Validate + assemble (phases 4 & 6) — throws ValidationFailed before any
   // HTML hits disk.
   const manifest = assembleManifest({
@@ -227,6 +238,7 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
     serverPaths,
     inferredSources,
     hydration,
+    staticAssets,
     catalog,
   });
 

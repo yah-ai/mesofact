@@ -41,6 +41,57 @@ pub struct Hydration {
     pub code_split: Vec<String>,
 }
 
+/// SSR placement as carried in the manifest — the build resolves `"auto"`
+/// to a concrete value before emission, so consumers never see `auto`.
+/// Mirrors `ResolvedPlacement` in `packages/mesofact-runtime/src/manifest.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResolvedPlacement {
+    Host,
+    Edge,
+}
+
+/// W181 resilience axis (v1: retry + timeout). Applied by the always-up
+/// edge (CF Worker in prod, the mesofact-dev proxy in dev) around the SSR
+/// origin hop. `queue` is type-reserved for v2; `defineRoutes` rejects it
+/// today, so a well-formed manifest never carries it — the slot exists so
+/// v1 binaries keep deserializing when v2 manifests appear.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    /// Total attempts including the first; 1 = no retry.
+    pub attempts: u32,
+    /// Gap before attempt i+1; `len() == attempts - 1`.
+    pub backoff_ms: Vec<u64>,
+    /// `"connection"` (default) | `"5xx"` | `"any"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_on: Option<String>,
+    /// Total wall-clock cap across request + retries + backoffs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuePolicy {
+    pub queue: String,
+    pub ack: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_delay_ms: Option<u64>,
+}
+
+/// Default per-attempt timeout when `resilience.timeout_ms` is omitted.
+pub const DEFAULT_RESILIENCE_TIMEOUT_MS: u64 = 30_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ResiliencePolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<QueuePolicy>,
+    /// Per-attempt request timeout; default [`DEFAULT_RESILIENCE_TIMEOUT_MS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
 /// Mode 1 only. Three shapes the publisher runs at build time:
 ///   - `Literal` — explicit list of param maps
 ///   - `SourceDerived` — a registered source adapter (R2 BlobSource) walked
@@ -74,6 +125,11 @@ pub struct Route {
     pub requires: Option<Vec<Requires>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_reads: Option<Vec<String>>,
+    /// Build-time data artifact paths (relative to project root). Present
+    /// when the route declared `data_inputs`; the reconciler uses it to map
+    /// file changes to route rebuilds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_inputs: Option<Vec<String>>,
     pub cache_policy: CachePolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<u32>,
@@ -81,6 +137,12 @@ pub struct Route {
     pub hydration: Option<Hydration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prerender: Option<Prerender>,
+    /// SSR routes only; never `auto` (resolved at build time per W173).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<ResolvedPlacement>,
+    /// SSR routes only (W181); see [`ResiliencePolicy`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resilience: Option<ResiliencePolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,4 +170,10 @@ pub struct Manifest {
     pub static_assets: Vec<StaticAsset>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_routes: Option<ErrorRoutes>,
+    /// Derived from every `mode:"ssr"` route per W173 § "SSR_PREFIXES
+    /// derivation rule". Segment-aware match at the consumer:
+    /// `path == p || path.starts_with(&format!("{p}/"))`. Absent when the
+    /// workload has no SSR routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssr_prefixes: Option<Vec<String>>,
 }

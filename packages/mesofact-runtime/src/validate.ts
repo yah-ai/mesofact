@@ -141,8 +141,69 @@ function checkRoute(idx: number, raw: unknown, errs: ValidationError[]): Manifes
     }
   }
 
+  if (raw.resilience !== undefined) {
+    const res = checkResilience(base, raw.resilience, out.mode, errs);
+    if (res) out.resilience = res;
+  }
+
   if (errs.length && errs.some((e) => e.path.startsWith(base))) return null;
   return out as ManifestRoute;
+}
+
+const RETRY_ON_VALUES = new Set(["connection", "5xx", "any"]);
+
+// Structural check for the W181 resilience block as carried in the manifest.
+// `defineRoutes` already enforced the semantic rules (ssr-only, queue
+// reserved, backoff length); this pass keeps a hand-written manifest honest
+// and — like data_inputs before it (R014) — prevents the field from being
+// silently stripped when the validator rebuilds the route object.
+function checkResilience(
+  base: string,
+  raw: unknown,
+  mode: ManifestRoute["mode"] | undefined,
+  errs: ValidationError[],
+): ManifestRoute["resilience"] | null {
+  const path = `${base}.resilience`;
+  if (!isObject(raw)) {
+    errs.push(shape(path, "expected object"));
+    return null;
+  }
+  if (mode !== undefined && mode !== "ssr") {
+    errs.push(shape(path, "resilience is only valid on mode:'ssr'"));
+    return null;
+  }
+  if (raw.queue !== undefined) {
+    errs.push(shape(`${path}.queue`, "queue policy is reserved for v2 (W181) and must not be emitted"));
+    return null;
+  }
+  if (raw.timeout_ms !== undefined && typeof raw.timeout_ms !== "number") {
+    errs.push(shape(`${path}.timeout_ms`, "expected number"));
+    return null;
+  }
+  if (raw.retry !== undefined) {
+    const retry = raw.retry;
+    if (
+      !isObject(retry) ||
+      typeof retry.attempts !== "number" ||
+      !Array.isArray(retry.backoff_ms) ||
+      retry.backoff_ms.some((b) => typeof b !== "number") ||
+      retry.backoff_ms.length !== retry.attempts - 1
+    ) {
+      errs.push(
+        shape(`${path}.retry`, "expected { attempts: number, backoff_ms: number[attempts - 1], ... }"),
+      );
+      return null;
+    }
+    if (retry.retry_on !== undefined && (typeof retry.retry_on !== "string" || !RETRY_ON_VALUES.has(retry.retry_on))) {
+      errs.push(shape(`${path}.retry.retry_on`, "expected 'connection' | '5xx' | 'any'"));
+      return null;
+    }
+    if (retry.budget_ms !== undefined && typeof retry.budget_ms !== "number") {
+      errs.push(shape(`${path}.retry.budget_ms`, "expected number"));
+      return null;
+    }
+  }
+  return raw as ManifestRoute["resilience"];
 }
 
 function checkStaticAsset(idx: number, raw: unknown, errs: ValidationError[]): ManifestStaticAsset | null {

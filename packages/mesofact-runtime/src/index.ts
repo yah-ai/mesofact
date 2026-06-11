@@ -38,9 +38,13 @@ export type {
   RouteEntry,
   ErrorRoutes,
   RoutesConfig,
+  RetryOn,
+  RetryPolicy,
+  QueuePolicy,
+  ResiliencePolicy,
 } from "./routes.js";
 
-export { defineRoutes } from "./routes.js";
+export { defineRoutes, DEFAULT_RESILIENCE_TIMEOUT_MS } from "./routes.js";
 
 export type {
   ManifestVersion,
@@ -90,6 +94,7 @@ export {
   ConfigError,
 } from "./config.js";
 export type {
+  BuildConfig,
   MesofactConfig,
   R2SourceConfig,
   SqliteSourceConfig,

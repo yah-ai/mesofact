@@ -34,13 +34,17 @@ fn static_manifest(route: &str) -> Manifest {
             render_entrypoint: "dist/server/index.js".to_string(),
             requires: None,
             source_reads: None,
+            data_inputs: None,
             cache_policy: CachePolicy { ttl: 0, swr: None, negative_ttl: None, vary: None },
             concurrency: None,
             hydration: None,
             prerender: None,
+            placement: None,
+            resilience: None,
         }],
         static_assets: vec![],
         error_routes: None,
+        ssr_prefixes: None,
     }
 }
 
@@ -57,10 +61,13 @@ fn ssr_route(
         render_entrypoint: stubs_dir().join(stub).to_string_lossy().to_string(),
         requires,
         source_reads: None,
+        data_inputs: None,
         cache_policy: CachePolicy { ttl, swr: None, negative_ttl: None, vary: None },
         concurrency: Some(4),
         hydration: None,
         prerender: None,
+        placement: None,
+        resilience: None,
     }
 }
 
@@ -77,6 +84,7 @@ async fn make_ssr_app(
         routes: vec![route],
         static_assets: vec![],
         error_routes: None,
+        ssr_prefixes: None,
     };
     let json = serde_json::to_vec(&manifest).unwrap();
     let pool = WorkerPool::spawn(&json, worker_entry(), 1)
@@ -552,6 +560,7 @@ async fn mode2_sqlite_generation_bump_invalidates() {
         routes: vec![route],
         static_assets: vec![],
         error_routes: None,
+        ssr_prefixes: None,
     };
     let json = serde_json::to_vec(&manifest).unwrap();
     let pool = WorkerPool::spawn_with_config(&json, worker_entry(), 1, Some(config_path.clone()))
@@ -684,13 +693,17 @@ async fn worker_pool_spawns_and_pings() {
             render_entrypoint: hello.to_string_lossy().to_string(),
             requires: None,
             source_reads: None,
+            data_inputs: None,
             cache_policy: CachePolicy { ttl: 0, swr: None, negative_ttl: None, vary: None },
             concurrency: Some(4),
             hydration: None,
             prerender: None,
+            placement: None,
+            resilience: None,
         }],
         static_assets: vec![],
         error_routes: None,
+        ssr_prefixes: None,
     };
 
     let json = serde_json::to_vec(&manifest).unwrap();

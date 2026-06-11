@@ -37,8 +37,17 @@ export type SqliteSourceConfig = {
 // Future kinds (pg, rpc) extend this union as their adapters land.
 export type SourceConfig = R2SourceConfig | SqliteSourceConfig;
 
+// Build-time knobs (R490-F4). `public_dir` names the workload-relative dir
+// whose files are copied verbatim into `dist/html/` and listed in the
+// manifest's `static_assets`. Default "public"; a missing dir is fine (no
+// assets emitted).
+export type BuildConfig = {
+  public_dir?: string;
+};
+
 export type MesofactConfig = {
   sources: Record<string, SourceConfig>;
+  build?: BuildConfig;
 };
 
 export function loadConfig(path: string): MesofactConfig {
@@ -50,8 +59,9 @@ export function parseConfig(toml: string): MesofactConfig {
   if (!isPlainObject(raw)) {
     throw new ConfigError("config must be a TOML object at top level");
   }
+  const build = parseBuild(raw.build);
   const sourcesRaw = raw.sources;
-  if (sourcesRaw === undefined) return { sources: {} };
+  if (sourcesRaw === undefined) return { sources: {}, ...(build ? { build } : {}) };
   if (!isPlainObject(sourcesRaw)) {
     throw new ConfigError("[sources] must be a table");
   }
@@ -59,7 +69,22 @@ export function parseConfig(toml: string): MesofactConfig {
   for (const [name, body] of Object.entries(sourcesRaw)) {
     sources[name] = parseSource(name, body);
   }
-  return { sources };
+  return { sources, ...(build ? { build } : {}) };
+}
+
+function parseBuild(raw: unknown): BuildConfig | undefined {
+  if (raw === undefined) return undefined;
+  if (!isPlainObject(raw)) {
+    throw new ConfigError("[build] must be a table");
+  }
+  const out: BuildConfig = {};
+  if (raw.public_dir !== undefined) {
+    if (typeof raw.public_dir !== "string" || raw.public_dir.length === 0) {
+      throw new ConfigError("[build] public_dir must be a non-empty string");
+    }
+    out.public_dir = raw.public_dir;
+  }
+  return out;
 }
 
 function parseSource(name: string, body: unknown): SourceConfig {

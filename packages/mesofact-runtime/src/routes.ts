@@ -48,6 +48,46 @@ export type CachePolicyConfig = {
   vary?: readonly string[];
 };
 
+// ─── Resilience axis (W181) ────────────────────────────────────────────────
+// Declarative retry / timeout applied at the always-up edge (CF Worker in
+// prod, the mesofact-dev proxy in dev) around the SSR origin hop. Not a cube
+// axis — it's the lifecycle wrapper around any `mode:"ssr"` cell. v1 ships
+// retry + timeout only; `queue` is type-reserved but rejected at validation
+// until v2 lands a real consumer (see W181 § "v1 scope").
+
+export type RetryOn = "connection" | "5xx" | "any";
+
+export type RetryPolicy = {
+  // Total attempts including the first; 1 = no retry.
+  attempts: number;
+  // Gap before attempt i+1; length must be `attempts - 1`.
+  backoff_ms: readonly number[];
+  // What failures trigger a retry. Default "connection" (ECONNREFUSED /
+  // fetch failure); "5xx" adds server errors; "any" adds everything non-2xx.
+  retry_on?: RetryOn;
+  // Total wall-clock cap across the request + all retries + backoffs. Must
+  // cover sum(backoff_ms) + attempts * per-attempt timeout when set.
+  budget_ms?: number;
+};
+
+// Reserved for v2 — the schema slot exists so v1 routes don't break when the
+// queue implementation lands, but `defineRoutes` rejects it today.
+export type QueuePolicy = {
+  queue: string;
+  ack: "on_enqueue" | "on_origin_2xx";
+  max_delay_ms?: number;
+};
+
+export type ResiliencePolicy = {
+  retry?: RetryPolicy;
+  queue?: QueuePolicy;
+  // Per-attempt request timeout; default 30_000.
+  timeout_ms?: number;
+};
+
+// Default per-attempt timeout used when `resilience.timeout_ms` is omitted.
+export const DEFAULT_RESILIENCE_TIMEOUT_MS = 30_000;
+
 // Literal param maps OR a source-derived query the publisher runs at build
 // time. Mode 1 routes only; non-parametric Mode 1 routes omit it.
 //
@@ -87,6 +127,12 @@ export type RouteEntry = {
   // SSR-only: where per-request rendering runs. Default `"auto"` resolves to
   // `"host"` until the W173 auto-classifier ships.
   placement?: Placement;
+  // SSR-only: declarative retry/timeout applied at the always-up edge (W181).
+  // No block = exactly today's behavior (one attempt, 30s timeout, 502 on
+  // failure). Rejected on static/spa and on placement:"edge" (retry-the-
+  // Worker-from-the-Worker is circular; reserved until an edge consumer
+  // needs it — W181 OQ1).
+  resilience?: ResiliencePolicy;
 };
 
 export type ErrorRoutes = {
@@ -114,6 +160,67 @@ export function defineRoutes(config: RoutesConfig): RoutesConfig {
         );
       }
     }
+    if (r.resilience !== undefined) validateResilience(r);
   }
   return config;
+}
+
+const RETRY_ON = new Set<RetryOn>(["connection", "5xx", "any"]);
+
+// W181 validation rules. Throws at defineRoutes time (fail fast at config
+// import, before any bundling work — same home as placement rejection).
+function validateResilience(r: RouteEntry): void {
+  const res = r.resilience!;
+  if (r.mode !== "ssr") {
+    throw new Error(
+      `defineRoutes: route ${r.route} declares resilience but mode=${JSON.stringify(r.mode)}; resilience is only valid on mode:"ssr" (the policy wraps the edge→origin proxy hop, which only exists for SSR routes)`,
+    );
+  }
+  if (r.placement === "edge") {
+    throw new Error(
+      `defineRoutes: route ${r.route} declares resilience on placement:"edge" — retrying the Worker from the Worker is circular (W181 OQ1); remove the block or use placement:"host"`,
+    );
+  }
+  if (res.queue !== undefined) {
+    throw new Error(
+      `defineRoutes: route ${r.route} declares resilience.queue — queue policy is reserved for v2 and not implemented yet (W181 § "v1 scope"); remove the block (the type slot exists so v1 routes won't break when v2 lands)`,
+    );
+  }
+  if (res.timeout_ms !== undefined && (!Number.isFinite(res.timeout_ms) || res.timeout_ms <= 0)) {
+    throw new Error(
+      `defineRoutes: route ${r.route} has resilience.timeout_ms=${String(res.timeout_ms)}; expected a positive number of milliseconds`,
+    );
+  }
+  const retry = res.retry;
+  if (retry === undefined) return;
+  if (!Number.isInteger(retry.attempts) || retry.attempts < 1) {
+    throw new Error(
+      `defineRoutes: route ${r.route} has resilience.retry.attempts=${String(retry.attempts)}; expected an integer >= 1 (1 = no retry)`,
+    );
+  }
+  if (!Array.isArray(retry.backoff_ms) || retry.backoff_ms.length !== retry.attempts - 1) {
+    throw new Error(
+      `defineRoutes: route ${r.route} has resilience.retry.backoff_ms of length ${Array.isArray(retry.backoff_ms) ? retry.backoff_ms.length : "?"}; expected attempts - 1 = ${retry.attempts - 1} entries (one gap between each pair of attempts)`,
+    );
+  }
+  if (retry.backoff_ms.some((b) => !Number.isFinite(b) || b < 0)) {
+    throw new Error(
+      `defineRoutes: route ${r.route} has a negative or non-numeric resilience.retry.backoff_ms entry`,
+    );
+  }
+  if (retry.retry_on !== undefined && !RETRY_ON.has(retry.retry_on)) {
+    throw new Error(
+      `defineRoutes: route ${r.route} has resilience.retry.retry_on=${JSON.stringify(retry.retry_on)}; expected "connection" | "5xx" | "any"`,
+    );
+  }
+  if (retry.budget_ms !== undefined) {
+    const perAttempt = res.timeout_ms ?? DEFAULT_RESILIENCE_TIMEOUT_MS;
+    const backoffSum = retry.backoff_ms.reduce((a, b) => a + b, 0);
+    const floor = backoffSum + retry.attempts * perAttempt;
+    if (retry.budget_ms < floor) {
+      throw new Error(
+        `defineRoutes: route ${r.route} has resilience.retry.budget_ms=${retry.budget_ms} < ${floor} (sum(backoff_ms)=${backoffSum} + attempts=${retry.attempts} × per-attempt timeout=${perAttempt}); raise budget_ms or lower the attempt/timeout shape`,
+      );
+    }
+  }
 }

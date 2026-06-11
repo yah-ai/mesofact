@@ -6,7 +6,7 @@
 // Versioned independently of the mesofact binary; major bumps force restart.
 // See `.yah/docs/architecture/mesofact.md` §"Manifest schema".
 
-import type { Placement, RouteMode, Requires } from "./routes.js";
+import type { Placement, ResiliencePolicy, RouteMode, Requires } from "./routes.js";
 
 // Placement as carried in the manifest — the build resolves `"auto"` to
 // `"host"` or `"edge"` before emission, so consumers never see `"auto"`.
@@ -50,6 +50,11 @@ export type ManifestRoute = {
   prerender?: ManifestPrerender;
   // SSR routes only; never "auto" (resolved at build time per W173).
   placement?: ResolvedPlacement;
+  // SSR routes only (W181). Carried verbatim from the route declaration so
+  // the Worker (prod) and the mesofact-dev proxy (dev) apply the same retry/
+  // timeout policy around the origin hop. Absent = one attempt, default
+  // timeout, fail with 502 — exactly the pre-W181 behavior.
+  resilience?: ResiliencePolicy;
 };
 
 export type ManifestStaticAsset = {

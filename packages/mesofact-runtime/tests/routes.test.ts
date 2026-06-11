@@ -193,3 +193,124 @@ describe("defineRoutes — placement validation", () => {
     expect(cfg.routes).toHaveLength(3);
   });
 });
+
+// W181 resilience axis — defineRoutes validation (R457 v1: retry + timeout;
+// queue reserved).
+describe("defineRoutes — resilience validation", () => {
+  const ssr = (resilience: unknown, extra: Record<string, unknown> = {}) =>
+    ({
+      route: "/api/submit",
+      mode: "ssr",
+      entrypoint: "src/submit.ts",
+      cache_policy: { ttl: 0 },
+      resilience,
+      ...extra,
+    }) as never;
+
+  test("accepts a valid retry + timeout block on ssr", () => {
+    const cfg = defineRoutes({
+      routes: [
+        ssr({
+          timeout_ms: 5_000,
+          retry: { attempts: 3, backoff_ms: [50, 200], retry_on: "connection" },
+        }),
+      ],
+    });
+    expect(cfg.routes[0].resilience?.retry?.attempts).toBe(3);
+  });
+
+  test("accepts attempts: 1 with empty backoff (no retry)", () => {
+    const cfg = defineRoutes({
+      routes: [ssr({ retry: { attempts: 1, backoff_ms: [] } })],
+    });
+    expect(cfg.routes[0].resilience?.retry?.backoff_ms).toEqual([]);
+  });
+
+  test("rejects resilience on static routes", () => {
+    expect(() =>
+      defineRoutes({
+        routes: [
+          {
+            route: "/",
+            mode: "static",
+            entrypoint: "src/home.ts",
+            cache_policy: { ttl: 3600 },
+            resilience: { timeout_ms: 1000 },
+          } as never,
+        ],
+      }),
+    ).toThrow(/resilience is only valid on mode:"ssr"/);
+  });
+
+  test("rejects resilience on spa routes", () => {
+    expect(() =>
+      defineRoutes({
+        routes: [
+          {
+            route: "/app",
+            mode: "spa",
+            entrypoint: "src/app.ts",
+            client_entrypoint: "src/app.client.ts",
+            cache_policy: { ttl: 0 },
+            resilience: { retry: { attempts: 2, backoff_ms: [100] } },
+          } as never,
+        ],
+      }),
+    ).toThrow(/resilience is only valid on mode:"ssr"/);
+  });
+
+  test("rejects resilience on placement: edge (W181 OQ1 — circular retry)", () => {
+    expect(() =>
+      defineRoutes({ routes: [ssr({ retry: { attempts: 2, backoff_ms: [50] } }, { placement: "edge" })] }),
+    ).toThrow(/placement:"edge"/);
+  });
+
+  test("rejects queue policy (reserved for v2)", () => {
+    expect(() =>
+      defineRoutes({ routes: [ssr({ queue: { queue: "issues-buffer", ack: "on_enqueue" } })] }),
+    ).toThrow(/reserved for v2/);
+  });
+
+  test("rejects backoff_ms length mismatch", () => {
+    expect(() =>
+      defineRoutes({ routes: [ssr({ retry: { attempts: 3, backoff_ms: [50] } })] }),
+    ).toThrow(/expected attempts - 1 = 2/);
+  });
+
+  test("rejects attempts < 1", () => {
+    expect(() =>
+      defineRoutes({ routes: [ssr({ retry: { attempts: 0, backoff_ms: [] } })] }),
+    ).toThrow(/expected an integer >= 1/);
+  });
+
+  test("rejects unknown retry_on", () => {
+    expect(() =>
+      defineRoutes({ routes: [ssr({ retry: { attempts: 2, backoff_ms: [50], retry_on: "dns" } })] }),
+    ).toThrow(/retry_on/);
+  });
+
+  test("rejects budget_ms below the attempts × timeout floor", () => {
+    expect(() =>
+      defineRoutes({
+        routes: [
+          ssr({
+            timeout_ms: 1_000,
+            retry: { attempts: 3, backoff_ms: [50, 200], budget_ms: 1_000 },
+          }),
+        ],
+      }),
+    ).toThrow(/budget_ms/);
+  });
+
+  test("accepts budget_ms at the floor", () => {
+    const cfg = defineRoutes({
+      routes: [
+        ssr({
+          timeout_ms: 1_000,
+          retry: { attempts: 3, backoff_ms: [50, 200], budget_ms: 3_250 },
+        }),
+      ],
+    });
+    expect(cfg.routes[0].resilience?.retry?.budget_ms).toBe(3_250);
+  });
+});
