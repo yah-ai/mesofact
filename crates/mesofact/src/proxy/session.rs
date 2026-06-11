@@ -25,7 +25,10 @@
 //!
 //! See `.yah/docs/architecture/mesofact.md` §"Auth & session contract".
 
-use cheers_core::{Claims, Codec, CodecError, PasetoV4Codec};
+use cheers_core::{Claims, Codec, CodecError};
+// Concrete symmetric codec moved out of cheers-core into cheers-server by the
+// F6 crate split (cheers-core is now the keyless trait/identity surface).
+use cheers_server::PasetoV4Codec;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 

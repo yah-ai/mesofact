@@ -36,9 +36,11 @@ lru = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 toml = "0.8"
-# Shared auth contract: the session codec (mint/verify) and Claims type live in
-# cheers-core, consumed cross-camp by path dep (R009 / P11). See external/cheers.
+# Shared auth contract: Claims + the keyless Codec trait live in cheers-core;
+# the concrete symmetric PasetoV4Codec (mint/verify) lives in cheers-server
+# after the F6 crate split. Both consumed cross-camp by path dep (R009 / P11).
 cheers-core = { path = "../../../cheers/crates/cheers-core" }
+cheers-server = { path = "../../../cheers/crates/cheers-server" }
 
 [dev-dependencies]
 serde_json = "1"
