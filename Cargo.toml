@@ -2,7 +2,12 @@
 # early iteration but is intended to move to its own repo. yah's `.gitignore`
 # excludes `external/`, so this tree carries independent git history.
 [workspace]
-members = ["crates/mesofact", "crates/mesofact-publisher", "crates/mesofact-dev"]
+members = [
+    "crates/mesofact",
+    "crates/mesofact-publisher",
+    "crates/mesofact-dev",
+    "crates/mesofact-build",
+]
 resolver = "2"
 
 [workspace.package]

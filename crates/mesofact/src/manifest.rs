@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 /// Current manifest schema version. Major bumps force a proxy restart.
 pub const MANIFEST_VERSION: &str = "1";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RouteMode {
     Static,
@@ -16,7 +16,7 @@ pub enum RouteMode {
     Spa,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Requires {
     User,

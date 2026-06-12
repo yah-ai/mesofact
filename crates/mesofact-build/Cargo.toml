@@ -1,0 +1,38 @@
+# Rust-native mesofact build pipeline (W174 / Q445). Parallel implementation
+# of packages/mesofact-build: Rolldown bundling + LightningCSS + asset
+# pipeline + deno_core SSG, plus a minimal lockfile-driven npm installer
+# (pacquet was retired upstream — see W174 amendment). `--legacy-bun` shells
+# out to the Bun pipeline so both can be diffed for behavioral equivalence
+# (R450).
+
+[package]
+name = "mesofact-build"
+description = "Rust-native build pipeline for mesofact workloads (Rolldown + LightningCSS + deno_core SSG)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mesofact = { path = "../mesofact" }
+
+rolldown = "1.1"
+rolldown_common = "1.1"
+lightningcss = "1.0.0-alpha.71"
+deno_core = "0.404"
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+flate2 = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "blocking"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+tar = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+toml = "0.8"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
