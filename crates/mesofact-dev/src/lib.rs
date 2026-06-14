@@ -98,7 +98,10 @@
 pub mod ssr;
 pub mod watcher;
 
-pub use ssr::{SpawnOptions as SsrSpawnOptions, SsrChild, SsrSlot};
+pub use ssr::{
+    ResiliencePolicy, RetryPolicy, SpawnOptions as SsrSpawnOptions, SsrChild, SsrSlot,
+    DEFAULT_RESILIENCE_TIMEOUT_MS,
+};
 pub use watcher::{WatchOptions, Watcher};
 
 use std::{
@@ -106,6 +109,8 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
+
+use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
@@ -255,14 +260,20 @@ async fn serve_dynamic(State(state): State<ServerState>, req: Request) -> Respon
     let uri_path = req.uri().path().to_string();
     if let Some(ssr) = state.ssr.current() {
         if ssr.matches(&uri_path) {
-            return proxy_to_ssr(&state.proxy, ssr.port(), req).await;
+            let policy = ssr.policy_for(&uri_path);
+            return proxy_to_ssr(&state.proxy, ssr.port(), policy, req).await;
         }
     }
     let dist = state.pointer.current();
     serve_from(&dist, &uri_path).await
 }
 
-async fn proxy_to_ssr(client: &reqwest::Client, port: u16, req: Request) -> Response {
+async fn proxy_to_ssr(
+    client: &reqwest::Client,
+    port: u16,
+    policy: Option<ResiliencePolicy>,
+    req: Request,
+) -> Response {
     let (parts, body) = req.into_parts();
     let path_and_query = parts
         .uri
@@ -270,22 +281,120 @@ async fn proxy_to_ssr(client: &reqwest::Client, port: u16, req: Request) -> Resp
         .map(|p| p.as_str())
         .unwrap_or(parts.uri.path());
     let url = format!("http://127.0.0.1:{port}{path_and_query}");
+    let route_path = parts.uri.path().to_string();
 
     let method = match reqwest::Method::from_bytes(parts.method.as_str().as_bytes()) {
         Ok(m) => m,
         Err(_) => return (StatusCode::BAD_GATEWAY, "invalid method").into_response(),
     };
 
-    // Forward the request body as a stream so large uploads don't sit in
-    // memory.
-    let body_stream = body
-        .into_data_stream()
-        .map_ok(|b| b.to_vec())
-        .map_err(io::other_box);
-    let reqwest_body = reqwest::Body::wrap_stream(body_stream);
+    // Materialise the request body once. Retries can't replay a streamed body
+    // (the inner stream is one-shot), so buffer up front when a retry policy
+    // is declared or when there's no body at all (GET/HEAD); when no policy
+    // is set AND there is a body, stream it as before to preserve the prior
+    // behavior for large uploads on unpolicied routes.
+    let has_retry = policy
+        .as_ref()
+        .and_then(|p| p.retry.as_ref().map(|r| r.attempts > 1))
+        .unwrap_or(false);
+    let timeout_ms = policy
+        .as_ref()
+        .and_then(|p| p.timeout_ms);
+    let retry = policy.as_ref().and_then(|p| p.retry.as_ref());
+    let attempts = retry.map(|r| r.attempts.max(1)).unwrap_or(1);
+    let backoff_ms = retry
+        .map(|r| r.backoff_ms.clone())
+        .unwrap_or_default();
+    let retry_on: String = retry
+        .and_then(|r| r.retry_on.clone())
+        .unwrap_or_else(|| "connection".to_string());
+    let budget_ms = retry.and_then(|r| r.budget_ms);
+    let start = Instant::now();
 
-    let mut builder = client.request(method, &url).body(reqwest_body);
-    for (k, v) in parts.headers.iter() {
+    let buffered_body: Option<Vec<u8>> = if has_retry {
+        // bounded by axum's request limit; collect to Vec
+        let stream = body.into_data_stream();
+        match collect_body(stream).await {
+            Ok(b) => Some(b),
+            Err(e) => {
+                warn!(error = %e, "failed to buffer ssr request body for retry");
+                return (StatusCode::BAD_GATEWAY, "request buffer failed").into_response();
+            }
+        }
+    } else {
+        // Single-shot path retains streaming.
+        let stream = body
+            .into_data_stream()
+            .map_ok(|b| b.to_vec())
+            .map_err(io::other_box);
+        let reqwest_body = reqwest::Body::wrap_stream(stream);
+        return send_once(
+            client,
+            &url,
+            method,
+            &parts.headers,
+            reqwest_body,
+            timeout_ms,
+            &route_path,
+            start,
+        )
+        .await;
+    };
+
+    let mut last_resp: Option<reqwest::Response> = None;
+    let mut last_err: Option<reqwest::Error> = None;
+
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            let gap = backoff_ms.get((attempt - 1) as usize).copied().unwrap_or(0);
+            if gap > 0 {
+                tokio::time::sleep(Duration::from_millis(gap)).await;
+            }
+            if let Some(budget) = budget_ms {
+                if start.elapsed() >= Duration::from_millis(budget) {
+                    break;
+                }
+            }
+        }
+        let body_clone = reqwest::Body::from(buffered_body.clone().unwrap_or_default());
+        let mut builder = client.request(method.clone(), &url).body(body_clone);
+        builder = apply_forward_headers(builder, &parts.headers);
+        if let Some(ms) = timeout_ms {
+            builder = builder.timeout(Duration::from_millis(ms));
+        }
+        match builder.send().await {
+            Ok(r) => {
+                if should_retry_status(r.status().as_u16(), &retry_on) && attempt + 1 < attempts {
+                    last_resp = Some(r);
+                    continue;
+                }
+                emit_telemetry(&route_path, attempt + 1, "ok", start.elapsed());
+                return forward_response(r).await;
+            }
+            Err(e) => {
+                warn!(error = %e, port, attempt = attempt + 1, "ssr proxy attempt failed");
+                last_err = Some(e);
+            }
+        }
+    }
+
+    let latency = start.elapsed();
+    if let Some(r) = last_resp {
+        emit_telemetry(&route_path, attempts, "exhausted_5xx", latency);
+        return forward_response(r).await;
+    }
+    emit_telemetry(&route_path, attempts, "exhausted_connection", latency);
+    let msg = last_err
+        .map(|e| format!("ssr proxy failed: {e}"))
+        .unwrap_or_else(|| "ssr proxy failed".to_string());
+    (StatusCode::BAD_GATEWAY, msg).into_response()
+}
+
+fn apply_forward_headers(
+    mut builder: reqwest::RequestBuilder,
+    headers: &axum::http::HeaderMap,
+) -> reqwest::RequestBuilder {
+    for (k, v) in headers.iter() {
         // Hop-by-hop headers must not be forwarded (RFC 7230 §6.1).
         let name = k.as_str().to_ascii_lowercase();
         if matches!(
@@ -305,19 +414,69 @@ async fn proxy_to_ssr(client: &reqwest::Client, port: u16, req: Request) -> Resp
         }
         builder = builder.header(k.as_str(), v.as_bytes());
     }
+    builder
+}
 
+fn should_retry_status(status: u16, retry_on: &str) -> bool {
+    match retry_on {
+        "any" => status >= 400,
+        "5xx" => status >= 500,
+        _ => false,
+    }
+}
+
+async fn collect_body(
+    mut stream: axum::body::BodyDataStream,
+) -> Result<Vec<u8>, axum::Error> {
+    use futures::StreamExt;
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk?;
+        buf.extend_from_slice(&bytes);
+    }
+    Ok(buf)
+}
+
+fn emit_telemetry(route: &str, attempts: u32, outcome: &str, latency: Duration) {
+    info!(
+        target: "mesofact_dev::resilience",
+        route = route,
+        attempts = attempts,
+        outcome = outcome,
+        latency_ms = latency.as_millis() as u64,
+        "ssr proxy outcome",
+    );
+}
+
+async fn send_once(
+    client: &reqwest::Client,
+    url: &str,
+    method: reqwest::Method,
+    headers: &axum::http::HeaderMap,
+    body: reqwest::Body,
+    timeout_ms: Option<u64>,
+    route_path: &str,
+    start: Instant,
+) -> Response {
+    let mut builder = client.request(method, url).body(body);
+    builder = apply_forward_headers(builder, headers);
+    if let Some(ms) = timeout_ms {
+        builder = builder.timeout(Duration::from_millis(ms));
+    }
     let resp = match builder.send().await {
         Ok(r) => r,
         Err(e) => {
-            warn!(error = %e, port, "ssr proxy request failed");
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("ssr proxy failed: {e}"),
-            )
+            warn!(error = %e, "ssr proxy request failed");
+            emit_telemetry(route_path, 1, "exhausted_connection", start.elapsed());
+            return (StatusCode::BAD_GATEWAY, format!("ssr proxy failed: {e}"))
                 .into_response();
         }
     };
+    emit_telemetry(route_path, 1, "ok", start.elapsed());
+    forward_response(resp).await
+}
 
+async fn forward_response(resp: reqwest::Response) -> Response {
     let status = StatusCode::from_u16(resp.status().as_u16())
         .unwrap_or(StatusCode::BAD_GATEWAY);
     let mut builder = Response::builder().status(status);
@@ -932,5 +1091,184 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_string(response).await, "user 42");
+    }
+
+    // ── W181 resilience tests ────────────────────────────────────────────
+
+    fn retry_policy(attempts: u32, backoff_ms: Vec<u64>, retry_on: &str) -> ResiliencePolicy {
+        ResiliencePolicy {
+            retry: Some(RetryPolicy {
+                attempts,
+                backoff_ms,
+                retry_on: Some(retry_on.to_string()),
+                budget_ms: None,
+            }),
+            queue: None,
+            timeout_ms: None,
+        }
+    }
+
+    /// Origin that fails N attempts with a connection refusal (we simulate
+    /// by binding & immediately shutting down a port and pointing the proxy
+    /// at it for the first N tries, then standing up the real origin on the
+    /// SAME port). Simpler stand-in: a counter-backed handler that responds
+    /// 502 the first N times and 200 after.
+    fn flaky_origin(
+        ok_after: usize,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        u16,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+        let app = Router::new().route(
+            "/api/issues",
+            axum::routing::any(move || {
+                let c = c.clone();
+                async move {
+                    let n = c.fetch_add(1, Ordering::SeqCst);
+                    if n < ok_after {
+                        (StatusCode::INTERNAL_SERVER_ERROR, "down").into_response()
+                    } else {
+                        (StatusCode::CREATED, format!("ok after {n}")).into_response()
+                    }
+                }
+            }),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (handle, port, counter)
+    }
+
+    /// Retry on 5xx: 3 attempts, origin returns 502 then 502 then 201 → 201.
+    #[tokio::test]
+    async fn resilience_retry_on_5xx_succeeds_on_third_attempt() {
+        let workload = workload_with(&[]);
+        let (_origin, port, counter) = flaky_origin(2);
+        let policy = retry_policy(3, vec![10, 10], "5xx");
+        let ssr = ssr::detached_for_test_with_policies(
+            port,
+            vec!["/api/issues".to_string()],
+            vec![("/api/issues".to_string(), policy)],
+        );
+        let server = Server::from_workload(workload.path()).unwrap().with_ssr(ssr);
+        let resp = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/issues")
+                    .body(Body::from("{\"title\":\"x\"}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// `retry_on:"connection"` (the default) does NOT retry HTTP 5xx.
+    /// Origin returns 500 once → proxy returns 500 verbatim, no retry.
+    #[tokio::test]
+    async fn resilience_no_retry_on_5xx_when_retry_on_connection() {
+        let workload = workload_with(&[]);
+        let (_origin, port, counter) = flaky_origin(usize::MAX);
+        let policy = retry_policy(3, vec![10, 10], "connection");
+        let ssr = ssr::detached_for_test_with_policies(
+            port,
+            vec!["/api/issues".to_string()],
+            vec![("/api/issues".to_string(), policy)],
+        );
+        let server = Server::from_workload(workload.path()).unwrap().with_ssr(ssr);
+        let resp = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/issues")
+                    .body(Body::from("{\"title\":\"x\"}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Per-attempt timeout fires: handler delays past `timeout_ms`, proxy
+    /// bails as connection failure.
+    #[tokio::test]
+    async fn resilience_per_attempt_timeout_aborts_slow_origin() {
+        let workload = workload_with(&[]);
+        let app = Router::new().route(
+            "/api/slow",
+            axum::routing::any(|| async {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                (StatusCode::OK, "late").into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _origin = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let policy = ResiliencePolicy {
+            retry: Some(RetryPolicy {
+                attempts: 2,
+                backoff_ms: vec![5],
+                retry_on: Some("connection".into()),
+                budget_ms: None,
+            }),
+            queue: None,
+            timeout_ms: Some(50),
+        };
+        let ssr = ssr::detached_for_test_with_policies(
+            port,
+            vec!["/api/slow".to_string()],
+            vec![("/api/slow".to_string(), policy)],
+        );
+        let server = Server::from_workload(workload.path()).unwrap().with_ssr(ssr);
+        let resp = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/slow")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// No `resilience` block declared → behaves like the pre-W181 proxy:
+    /// single attempt, no retry on 5xx.
+    #[tokio::test]
+    async fn resilience_absent_falls_back_to_single_attempt() {
+        let workload = workload_with(&[]);
+        let (_origin, port, counter) = flaky_origin(usize::MAX);
+        let ssr = ssr::detached_for_test(port, vec!["/api/issues".to_string()]);
+        let server = Server::from_workload(workload.path()).unwrap().with_ssr(ssr);
+        let resp = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/issues")
+                    .body(Body::from("{\"title\":\"x\"}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

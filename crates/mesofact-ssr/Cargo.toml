@@ -1,0 +1,47 @@
+# deno_core-hosted JS runtime shared by mesofact-build (SSG, one-shot render)
+# and mesofact-dev (long-lived SSR dispatch). Extracted from mesofact-build so
+# the dev-tier subprocess can be replaced with an in-process dispatch call
+# (W174 pillar 4, R449-F2). The Fetch API is provided by deno extension crates
+# (deno_web/deno_url/deno_fetch/deno_console) wired in by `SsrRuntime`; the
+# SSG path keeps using the lean polyfill bootstrap (build-time only, no I/O).
+
+[package]
+name = "mesofact-ssr"
+description = "deno_core-hosted JS runtime for mesofact SSG + dev-tier SSR dispatch"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+deno_core = "0.404"
+# Web/Fetch extensions for the dev-tier SSR isolate. Versions chosen for
+# binary-API compatibility with deno_core 0.404 (deno extension crates track
+# deno_core releases tightly — they share serde_v8/op-registration internals).
+# deno_url and deno_console are deprecated empty husks; deno_web provides
+# URL/URLSearchParams/console alongside its other Web primitives.
+deno_webidl = "0.251"
+deno_web = "0.282"
+deno_fetch = "0.275"
+# deno_fetch's 22_http_client.js pulls in ext:deno_net/02_tls.js — must be
+# registered even if SSR routes never construct a TLS client manually.
+deno_net = "0.243"
+# deno_fetch/26_fetch.js destructures internals.__telemetry at module-load.
+# deno_telemetry ships its bootstrap as a .ts file that needs swc transpile,
+# which we don't want to pull in for dev SSR — we stub internals.__telemetry
+# in ssr_bootstrap.js with no-op tracer/propagators instead.
+# deno_fs::FsError + deno_permissions::CheckedPath appear in the FetchPermissions
+# signature; pin to whatever deno_fetch picked up.
+deno_fs = "0.161"
+deno_permissions = "0.110"
+sys_traits = { version = "0.1", features = ["libc", "winapi"] }
+
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["rt", "macros", "sync"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

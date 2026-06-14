@@ -51,7 +51,38 @@ pub struct RouteEntry {
     pub mode: String,
     #[serde(default)]
     pub render_entrypoint: Option<String>,
+    /// W181 resilience block (retry + timeout). Only `mode:"ssr"` routes
+    /// carry it; defineRoutes rejects it on other modes upstream.
+    #[serde(default)]
+    pub resilience: Option<ResiliencePolicy>,
 }
+
+/// W181 v1 — schema mirror of `mesofact::manifest::ResiliencePolicy`. Kept
+/// local to avoid pulling the full mesofact crate into mesofact-dev's path.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ResiliencePolicy {
+    #[serde(default)]
+    pub retry: Option<RetryPolicy>,
+    /// Queue is reserved for v2; rejected upstream in `defineRoutes`, but
+    /// we accept the field shape so v2 manifests deserialize cleanly.
+    #[serde(default)]
+    pub queue: Option<serde_json::Value>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetryPolicy {
+    pub attempts: u32,
+    pub backoff_ms: Vec<u64>,
+    #[serde(default)]
+    pub retry_on: Option<String>,
+    #[serde(default)]
+    pub budget_ms: Option<u64>,
+}
+
+/// Default per-attempt request timeout when `resilience.timeout_ms` is unset.
+pub const DEFAULT_RESILIENCE_TIMEOUT_MS: u64 = 30_000;
 
 impl Manifest {
     /// Read `<gen_dir>/manifest.json`. Returns `Ok(None)` when the file is
@@ -71,6 +102,22 @@ impl Manifest {
 
     pub fn has_ssr(&self) -> bool {
         self.routes.iter().any(|r| r.mode == "ssr")
+    }
+
+    /// W181 — `(derived_prefix, policy)` pairs for every SSR route that
+    /// declared a `resilience` block. The prefix derivation matches
+    /// `ssr_prefixes()` so [`SsrChild::policy_for`] can do a longest-prefix
+    /// lookup against the same key space the matcher uses.
+    pub fn resilience_policies(&self) -> Vec<(String, ResiliencePolicy)> {
+        self.routes
+            .iter()
+            .filter(|r| r.mode == "ssr")
+            .filter_map(|r| {
+                r.resilience
+                    .clone()
+                    .map(|p| (derive_prefix(&r.route), p))
+            })
+            .collect()
     }
 
     /// SSR-prefix set per W173. Prefers the manifest's pre-derived
@@ -211,6 +258,10 @@ pub struct SsrChild {
     /// Mutable so [`SsrChild::restart_with`] can refresh it from a new
     /// manifest after a watch-mode gen flip.
     prefixes: Arc<RwLock<Vec<String>>>,
+    /// W181 — per-route resilience block, keyed by the route's derived
+    /// prefix. Looked up on each request via [`SsrChild::policy_for`];
+    /// refreshed in [`SsrChild::restart_with`] alongside prefixes.
+    policies: Arc<RwLock<Vec<(String, ResiliencePolicy)>>>,
     /// Active gen dir. Shared with the supervisor — read on each (re)spawn,
     /// updated by [`SsrChild::restart_with`].
     gen_dir: Arc<RwLock<PathBuf>>,
@@ -247,6 +298,23 @@ impl SsrChild {
         guard.iter().any(|p| matches_prefix(path, p))
     }
 
+    /// Resolve the resilience policy for `path` by longest-prefix match.
+    /// Returns `None` when no SSR route has declared a `resilience` block.
+    pub fn policy_for(&self, path: &str) -> Option<ResiliencePolicy> {
+        let guard = self.policies.read().ok()?;
+        let mut best: Option<(&String, &ResiliencePolicy)> = None;
+        for (prefix, policy) in guard.iter() {
+            if !matches_prefix(path, prefix) {
+                continue;
+            }
+            match best {
+                Some((p, _)) if p.len() >= prefix.len() => {}
+                _ => best = Some((prefix, policy)),
+            }
+        }
+        best.map(|(_, p)| p.clone())
+    }
+
     /// Re-read the manifest from a new gen dir, refresh the prefix set, and
     /// signal the supervisor to kill the current bun child so it respawns
     /// with the new module graph.
@@ -259,8 +327,12 @@ impl SsrChild {
         match Manifest::read(&gen_dir)? {
             Some(m) => {
                 let new_prefixes = m.ssr_prefixes();
+                let new_policies = m.resilience_policies();
                 if let Ok(mut p) = self.prefixes.write() {
                     *p = new_prefixes;
+                }
+                if let Ok(mut p) = self.policies.write() {
+                    *p = new_policies;
                 }
             }
             None => {
@@ -295,10 +367,20 @@ impl Drop for SsrChild {
 /// against a mock HTTP server without spawning bun.
 #[cfg(test)]
 pub(crate) fn detached_for_test(port: u16, prefixes: Vec<String>) -> SsrChild {
+    detached_for_test_with_policies(port, prefixes, Vec::new())
+}
+
+#[cfg(test)]
+pub(crate) fn detached_for_test_with_policies(
+    port: u16,
+    prefixes: Vec<String>,
+    policies: Vec<(String, ResiliencePolicy)>,
+) -> SsrChild {
     let (restart_tx, _restart_rx) = mpsc::unbounded_channel();
     SsrChild {
         port,
         prefixes: Arc::new(RwLock::new(prefixes)),
+        policies: Arc::new(RwLock::new(policies)),
         gen_dir: Arc::new(RwLock::new(std::env::temp_dir())),
         log_buffer: LogBuffer::new(),
         restart_tx,
@@ -374,6 +456,7 @@ pub async fn spawn(opts: SpawnOptions) -> Result<Option<SsrChild>> {
 
     let log_buffer = LogBuffer::new();
     let prefixes = Arc::new(RwLock::new(manifest.ssr_prefixes()));
+    let policies = Arc::new(RwLock::new(manifest.resilience_policies()));
     let gen_dir = Arc::new(RwLock::new(opts.gen_dir));
     let (restart_tx, restart_rx) = mpsc::unbounded_channel();
 
@@ -391,6 +474,7 @@ pub async fn spawn(opts: SpawnOptions) -> Result<Option<SsrChild>> {
     Ok(Some(SsrChild {
         port,
         prefixes,
+        policies,
         gen_dir,
         log_buffer,
         restart_tx,
