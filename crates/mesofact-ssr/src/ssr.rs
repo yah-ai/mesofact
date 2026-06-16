@@ -311,16 +311,41 @@ fn run_isolate(rx: mpsc::Receiver<Job>, ready: mpsc::Sender<Result<()>>) {
                             continue;
                         }
                     };
-                    let r = call_harness(&mut runtime, "dispatch", &bundle, Some(input)).await;
-                    let r = r.and_then(|v| {
-                        serde_json::from_value::<DispatchResponse>(v)
-                            .map_err(|e| anyhow!("deserialising SSR response: {e}"))
-                    });
+                    let r = dispatch_harness(&mut runtime, &bundle, input).await;
                     let _ = reply.send(r);
                 }
             }
         }
     });
+}
+
+/// Like `call_harness` for `dispatch`, but pulls the result straight out of
+/// V8 into a `DispatchResponse` so the Uint8Array body survives — going via
+/// `serde_json::Value` would fail on the byte-array path.
+async fn dispatch_harness(
+    runtime: &mut JsRuntime,
+    bundle: &Path,
+    input: Value,
+) -> Result<DispatchResponse> {
+    let url = ModuleSpecifier::from_file_path(bundle)
+        .map_err(|()| anyhow!("bundle path is not absolute: {}", bundle.display()))?;
+    let url_json = serde_json::to_string(url.as_str())?;
+    let script = format!(
+        "globalThis.__mesofact_ssr.dispatch({url_json}, {})",
+        serde_json::to_string(&input)?
+    );
+    let promise = runtime
+        .execute_script("mesofact-ssr:call", script)
+        .map_err(|e| anyhow!("dispatch dispatch failed: {e}"))?;
+    let watcher = runtime.resolve(promise);
+    let global = runtime
+        .with_event_loop_promise(watcher, PollEventLoopOptions::default())
+        .await
+        .map_err(|e| anyhow!("dispatch failed: {e}"))?;
+    deno_core::scope!(scope, runtime);
+    let local = deno_core::v8::Local::new(scope, global);
+    deno_core::serde_v8::from_v8::<DispatchResponse>(scope, local)
+        .map_err(|e| anyhow!("deserialising SSR response: {e}"))
 }
 
 async fn call_harness(

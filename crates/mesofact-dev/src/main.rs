@@ -78,8 +78,12 @@ async fn main() -> anyhow::Result<()> {
     opts.initial_build = !args.no_initial_build;
 
     // Post-build hook: each successful rebuild rotates dist into
-    // .mesofact-dev/gen-N/, so the bun child must restart against the new
-    // gen dir or it will keep dynamic-importing a stale module graph.
+    // .mesofact-dev/gen-N/, so the SSR runtime must be re-spawned against
+    // the new gen dir — V8's module cache would otherwise keep serving the
+    // old route entrypoints. Under R449-F2 the in-process model swaps the
+    // whole SsrChild in the slot (no SIGKILL/respawn dance the bun era
+    // needed); the prior Arc<SsrChild> drops, which joins the isolate
+    // thread.
     let slot_for_hook = ssr_slot.clone();
     let workload_for_hook = workload_abs.clone();
     let state_dir_for_hook = state_dir.clone();
@@ -88,19 +92,18 @@ async fn main() -> anyhow::Result<()> {
         let workload = workload_for_hook.clone();
         let state_dir = state_dir_for_hook.clone();
         Box::pin(async move {
-            match slot.current() {
+            let opts = SsrSpawnOptions::new(workload, gen_dir, state_dir);
+            match ssr::spawn(opts).await? {
                 Some(child) => {
-                    child.restart_with(gen_dir).await?;
+                    info!(
+                        prefixes = ?child.prefixes(),
+                        "mesofact-dev ssr runtime re-spawned against new gen",
+                    );
+                    slot.set(Some(Arc::new(child)));
                 }
                 None => {
-                    let opts = SsrSpawnOptions::new(workload, gen_dir, state_dir);
-                    if let Some(child) = ssr::spawn(opts).await? {
-                        info!(
-                            prefixes = ?child.prefixes(),
-                            "mesofact-dev ssr child attached after first build",
-                        );
-                        slot.set(Some(Arc::new(child)));
-                    }
+                    // Manifest declares no SSR routes; clear any prior child.
+                    slot.set(None);
                 }
             }
             Ok(())
