@@ -11,6 +11,11 @@ members = [
 ]
 resolver = "2"
 
+# The shipped framework binary statically links V8 (~139MB librusty_v8.a);
+# stripping symbols cuts the release binary from ~75MB to ~57MB (R449-T4).
+[profile.release]
+strip = true
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
