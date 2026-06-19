@@ -1,0 +1,56 @@
+# mesofact-serve — deno_core SSR-host container (W174 pillar 4 / R449-F3).
+#
+# Replaces the `oven/bun:1` + `bun run src/ssr.ts` container that warden's
+# pond `ssr_runtime` slot previously ran. One V8 isolate (via deno_core) hosts
+# every `mode:"ssr"` route's Fetch handler; static fall-through is served from
+# the bind-mounted `dist/html/`.
+#
+# Build context is the mesofact workspace root (oss/mesofact):
+#   docker build -f Dockerfile.ssr-runtime -t yah/mesofact-ssr-runtime:<tag> .
+#
+# Runtime contract (matches local_driver::pond_ssr_runtime::SsrRuntimeSpec):
+#   - The workload's built tree is bind-mounted at /app (volumes: host_dist → /app).
+#     So /app/dist/html + /app/dist/server + /app/manifest.json must be present.
+#   - Container listens on 0.0.0.0:3000 (override with --port).
+#   - Readiness: GET /__mesofact/health → 200. Point the reconciler's
+#     `ready_path` there for SSR-only sites (no static `/`).
+#
+# For a self-contained cloud image (no bind mount), layer a child Dockerfile
+# that `COPY`s the built tree into /app on top of this one.
+
+# oxc (under rolldown/deno_core toolchain) requires Rust >= 1.95 (if-let guards).
+FROM rust:1.95-bookworm AS builder
+
+# deno_core / rusty_v8 bindgen needs libclang; build-essential for native deps.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang \
+        libclang-dev \
+        cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+# Copy the whole mesofact workspace so path deps (mesofact-ssr, crates/mesofact)
+# resolve. .dockerignore should exclude target/ and node_modules/.
+COPY . .
+
+# Release build keeps the V8-dominated binary as small as the static link allows
+# (~50MB target, R449-T4).
+RUN cargo build --release -p mesofact-dev --bin mesofact-serve
+
+# ── runtime ────────────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
+
+# ca-certificates: outbound fetch() from SSR handlers (e.g. ISSUE_TRACKER_URL)
+# needs the system trust store for TLS.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/mesofact-serve /usr/local/bin/mesofact-serve
+
+# Workload tree is bind-mounted here at runtime (pond) or COPY'd in (cloud).
+WORKDIR /app
+
+EXPOSE 3000
+ENTRYPOINT ["mesofact-serve"]
+CMD ["/app", "--port", "3000"]

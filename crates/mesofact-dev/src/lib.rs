@@ -117,7 +117,7 @@ use axum::{
     extract::{Request, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::any,
+    routing::{any, get},
     Router,
 };
 use futures::StreamExt;
@@ -224,14 +224,32 @@ impl Server {
             ssr: self.ssr.clone(),
         };
         Router::new()
+            // Unambiguous readiness probe for the warden pond/cloud reconciler
+            // (R449-F3). SSR-only workloads have no static `/` to probe; the
+            // generous "any non-5xx is alive" criterion would also accept a
+            // 404, but a dedicated 200 endpoint lets `ready_path` point
+            // somewhere that means "the isolate booted" rather than "the
+            // process is listening". Reserved path; never a route key.
+            .route("/__mesofact/health", get(health))
             .route("/", any(serve_dynamic))
             .route("/*path", any(serve_dynamic))
             .with_state(state)
             .layer(TraceLayer::new_for_http())
     }
 
-    /// Bind to `127.0.0.1:port` and serve until Ctrl+C / SIGTERM.
+    /// Bind to `127.0.0.1:port` and serve until Ctrl+C / SIGTERM. The dev
+    /// loopback default; the `mesofact serve` container path uses
+    /// [`Server::serve_on`] to bind a routable address instead.
     pub async fn serve(self, port: u16) -> anyhow::Result<()> {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        self.serve_on(addr).await
+    }
+
+    /// Bind an explicit `addr` and serve until Ctrl+C / SIGTERM. The
+    /// SSR-host container (`mesofact serve`, R449-F3) binds `0.0.0.0:<port>`
+    /// so miniflare — running in a sibling container — can reach it over the
+    /// pond docker bridge; loopback-only would be unreachable.
+    pub async fn serve_on(self, addr: SocketAddr) -> anyhow::Result<()> {
         let dist = self.pointer.current();
         if !dist.exists() {
             warn!(
@@ -239,7 +257,6 @@ impl Server {
                 "served dir missing — run `bun run build` or start a watcher; 404s until it appears",
             );
         }
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let local = listener.local_addr()?;
         info!(
@@ -253,6 +270,13 @@ impl Server {
             .await?;
         Ok(())
     }
+}
+
+/// Liveness/readiness endpoint. Returns 200 once the server is listening and
+/// (for SSR workloads) the isolate has booted — `with_ssr` is set before the
+/// listener binds, so a successful bind implies the handlers are registered.
+async fn health() -> impl IntoResponse {
+    (StatusCode::OK, "ok")
 }
 
 async fn serve_dynamic(State(state): State<ServerState>, req: Request) -> Response {
@@ -631,6 +655,25 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(body_string(response).await.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_returns_200() {
+        // R449-F3: the SSR-host container's readiness probe target. Must be
+        // 200 even when the workload has no static `/` and no SSR child.
+        let workload = workload_with(&[]);
+        let app = Server::from_workload(workload.path()).unwrap().router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/__mesofact/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_string(response).await, "ok");
     }
 
     #[tokio::test]

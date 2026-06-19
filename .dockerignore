@@ -1,0 +1,7 @@
+# Keep the SSR-runtime build context (Dockerfile.ssr-runtime) lean.
+target/
+**/target/
+**/node_modules/
+**/dist/
+.git/
+.yah/
