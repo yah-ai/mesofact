@@ -95,9 +95,11 @@
 //! @yah:verify("./target/debug/mesofact-dev app/yah/web/marketing --no-watch --port 4400; curl -sS -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:4400/<build_id>/hydrate/issues.<hash>.js → 200")
 //! @yah:gotcha("Pre-existing — R342-F3 (SPA mode) hit the same gap but was never exercised end-to-end against mesofact-dev. The form's progressive-enhancement claim depends on this fix landing.")
 
+pub mod s3;
 pub mod ssr;
 pub mod watcher;
 
+pub use s3::{DevS3, DEFAULT_BUCKET as DEV_S3_BUCKET};
 pub use ssr::{
     ResiliencePolicy, RetryPolicy, SpawnOptions as SsrSpawnOptions, SsrChild, SsrSlot,
     DEFAULT_RESILIENCE_TIMEOUT_MS,

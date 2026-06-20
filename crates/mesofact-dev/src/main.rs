@@ -68,6 +68,21 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Dev-tier S3 surface (R490-F7): host a local s3s-fs bucket so a workload's
+    // @mesofact/runtime R2Adapter can resolve against it during dev instead of
+    // real Cloudflare R2. Coords go to .mesofact-dev/s3.json for discovery and
+    // into the build child's env below. (The in-process V8 SSR runtime can't
+    // inherit process env, so wiring its runtime reads is a separate step —
+    // tracked under R490-F7.)
+    let dev_s3 = mesofact_dev::DevS3::start(state_dir.join("s3"), mesofact_dev::DEV_S3_BUCKET).await?;
+    info!(endpoint = %dev_s3.endpoint, bucket = %dev_s3.bucket, "dev S3 surface ready");
+    if let Err(e) = std::fs::write(
+        state_dir.join("s3.json"),
+        serde_json::json!({ "endpoint": dev_s3.endpoint, "bucket": dev_s3.bucket }).to_string(),
+    ) {
+        info!(error = %e, "dev S3: could not write s3.json discovery file");
+    }
+
     if args.no_watch {
         info!("watch mode disabled");
         return server.serve(args.port).await;
@@ -76,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
     let pointer = server.pointer();
     let mut opts = WatchOptions::defaults_for_workload(&args.workload);
     opts.initial_build = !args.no_initial_build;
+    opts.build_env = dev_s3.env_vars();
 
     // Post-build hook: each successful rebuild rotates dist into
     // .mesofact-dev/gen-N/, so the SSR runtime must be re-spawned against

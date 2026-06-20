@@ -21,7 +21,14 @@ path = "src/serve.rs"
 
 [dependencies]
 axum = { version = "0.7", default-features = false, features = ["http1", "tokio"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "process", "time", "sync", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "process", "time", "sync", "io-util", "net"] }
+# Dev-tier S3 surface (R490-F7): FS-backed s3s-fs so a workload's
+# @mesofact/runtime R2Adapter resolves against a local bucket in `bun run dev`.
+# Apache-2.0; resolves cleanly here (the R274-F5 sha1/iroh-relay conflict is
+# camp-only — absent from mesofact-dev's tree).
+s3s = "0.13"
+s3s-fs = "0.13"
+hyper-util = { version = "0.1", features = ["server", "tokio", "http1"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
@@ -38,3 +45,5 @@ futures = "0.3"
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+# HTTP client for the dev S3 round-trip test (http://127.0.0.1 only, no TLS).
+reqwest = { version = "0.12", default-features = false }

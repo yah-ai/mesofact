@@ -107,6 +107,11 @@ pub struct WatchOptions {
     pub debounce: Duration,
     /// Run an initial build at startup even if `dist/html/` already exists.
     pub initial_build: bool,
+    /// Extra env vars injected into the build subprocess (R490-F7). Carries
+    /// the dev S3 coords (`R2_ENDPOINT`, `R2_BUCKET`, dummy creds) so a
+    /// workload's build-time `r2` reads resolve against mesofact-dev's local
+    /// s3s-fs surface instead of real R2.
+    pub build_env: Vec<(String, String)>,
 }
 
 impl WatchOptions {
@@ -123,6 +128,7 @@ impl WatchOptions {
             state_dir: workload.join(STATE_DIR_NAME),
             debounce: Duration::from_millis(DEBOUNCE_MS),
             initial_build: true,
+            build_env: Vec::new(),
         };
         if let Ok(text) = std::fs::read_to_string(workload.join("workload.toml")) {
             if let Ok(parsed) = toml::from_str::<WorkloadTomlPartial>(&text) {
@@ -284,6 +290,7 @@ impl Watcher {
             .arg("-c")
             .arg(&self.options.build_command)
             .current_dir(&self.workload)
+            .envs(self.options.build_env.iter().cloned())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status()
