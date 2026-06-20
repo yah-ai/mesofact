@@ -585,7 +585,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "cheers-core"
-version = "0.0.1"
+version = "0.8.13"
 dependencies = [
  "async-trait",
  "base64",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "cheers-server"
-version = "0.0.1"
+version = "0.8.13"
 dependencies = [
  "async-trait",
  "base64",
@@ -615,7 +615,7 @@ dependencies = [
 
 [[package]]
 name = "cheers-verify"
-version = "0.0.1"
+version = "0.8.13"
 dependencies = [
  "async-trait",
  "cheers-core",
@@ -2959,7 +2959,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact"
-version = "0.1.0"
+version = "0.8.13"
 dependencies = [
  "anyhow",
  "axum",
@@ -2986,7 +2986,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact-build"
-version = "0.1.0"
+version = "0.8.13"
 dependencies = [
  "anyhow",
  "clap",
@@ -3009,7 +3009,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact-dev"
-version = "0.1.0"
+version = "0.8.13"
 dependencies = [
  "anyhow",
  "axum",
@@ -3030,7 +3030,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact-publisher"
-version = "0.1.0"
+version = "0.8.13"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3052,7 +3052,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact-ssr"
-version = "0.1.0"
+version = "0.8.13"
 dependencies = [
  "anyhow",
  "deno_core",
