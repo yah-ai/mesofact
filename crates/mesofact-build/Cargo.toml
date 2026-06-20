@@ -15,8 +15,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-mesofact = { path = "../mesofact", version = "0.8.13" }
-mesofact-ssr = { path = "../mesofact-ssr", version = "0.8.13" }
+mesofact = { path = "../mesofact", version = "0.8.14" }
+mesofact-ssr = { path = "../mesofact-ssr", version = "0.8.14" }
 
 rolldown = "1.1"
 rolldown_common = "1.1"

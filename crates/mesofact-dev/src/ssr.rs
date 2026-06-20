@@ -11,6 +11,16 @@
 //! The bun subprocess + ssr-wrapper.ts + reverse-proxy machinery is gone. So
 //! is the requirement for `bun` on `PATH`; the dev server now works on a
 //! plain Rust toolchain.
+//!
+//! @yah:relay(R444, "Plumb dev S3 coords into in-process SSR isolate so R2Adapter resolves at runtime in dev hotreload")
+//! @yah:at(2026-06-20T20:37:04Z)
+//! @yah:status(open)
+//! @yah:next("Thread the dev S3 coords from mesofact-dev's main/ssr::spawn into SsrRuntime::start (crates/mesofact-dev/src/ssr.rs:380 + the SpawnOptions struct) and on into the mesofact-ssr isolate bootstrap.")
+//! @yah:next("Expose them to JS inside the isolate so @mesofact/runtime config.ts requireEnv(env, ...) resolves: either inject a process.env shim (globalThis.process = { env: {...} }) in the bootstrap, or pass an explicit env map the runtime's registerSourcesFromConfig consumes. Decide which the runtime should read (process.env shim is least-invasive to existing TS).")
+//! @yah:next("Verify end-to-end (this completes R490-F7's PENDING criterion): a mesofact dev app with a [sources.r2] source doing r2.fetch/list inside an SSR render handler resolves against mesofact-dev's s3s-fs in `bun run dev` and returns the bytes (PUT one, fetch it back through the rendered route).")
+//! @yah:next("Coordinate the env-var-name convention with R490-F7: today mesofact-dev injects conventional R2_* names; keep the isolate shim consistent (or have mesofact-dev read the workload's mesofact.config.toml to learn the declared endpoint_env names).")
+//! @yah:gotcha("Cross-camp seam: this is the runtime-reads half of the PARENT camp's R490-F7 (in the yah camp at /Users/leif/ss/yah). R490-F7 landed the dev S3 surface (s3s-fs in mesofact-dev) + BUILD-TIME r2 reads via the build subprocess env. The blocker for RUNTIME reads is here in the subcamp: the in-process V8 SSR runtime (SsrRuntime, R449-F2) can't inherit process.env, so the @mesofact/runtime R2Adapter executing inside SSR render code never sees R2_ENDPOINT.")
+//! @yah:gotcha("mesofact-dev already computes the coords (DevS3::env_vars(): R2_ENDPOINT/R2_BUCKET/R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY) and writes .mesofact-dev/s3.json. The missing piece is getting those into the isolate's JS env so registerSourcesFromConfig() can resolve [sources.r2].")
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
