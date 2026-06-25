@@ -1,12 +1,10 @@
 //! End-to-end pipeline tests over the shared fixtures in
-//! `packages/mesofact-build/tests/fixtures/`. When `bun` is on PATH the
-//! equivalence half also runs the Bun pipeline on the same fixture and
-//! asserts `diff_dists` comes back clean (the R450-F2 gate in miniature —
-//! the QED-hosted harness runs the same comparison against the real apps).
+//! `packages/mesofact-build/tests/fixtures/`, asserting the Rust-native
+//! pipeline emits the expected manifest, hydrate bundles, asset overlay,
+//! and SSR probe behavior.
 
 use mesofact_build::pipeline::{build, BuildOptions, InstallMode};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 fn fixtures_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -26,46 +24,8 @@ fn build_native(fixture: &str, out: &Path) -> mesofact_build::pipeline::BuildRes
     .unwrap_or_else(|e| panic!("native build of {fixture} failed: {e:?}"))
 }
 
-fn bun_available() -> bool {
-    Command::new("bun").arg("--version").output().is_ok_and(|o| o.status.success())
-}
-
-/// Run the Bun pipeline on a fixture (into the fixture's own dist/, which
-/// the TS cli always uses) and copy it aside.
-fn build_legacy(fixture: &str, out: &Path) {
-    let root = fixtures_root().join(fixture);
-    let cli = root.join("../../../src/cli.ts").canonicalize().unwrap();
-    let status = Command::new("bun")
-        .arg("run")
-        .arg(&cli)
-        .arg(&root)
-        // Fixture configs may declare r2 sources whose endpoints come from
-        // env; the CLI registers adapters eagerly, so satisfy it with stubs.
-        .env("FIXTURE_R2_ENDPOINT", "http://localhost:1")
-        .env("AWS_ACCESS_KEY_ID", "stub")
-        .env("AWS_SECRET_ACCESS_KEY", "stub")
-        .status()
-        .expect("spawning bun");
-    assert!(status.success(), "legacy bun build of {fixture} failed");
-    let dist = root.join("dist");
-    copy_dir(&dist, out);
-}
-
-fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for entry in std::fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let dest = to.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir(&entry.path(), &dest);
-        } else {
-            std::fs::copy(entry.path(), &dest).unwrap();
-        }
-    }
-}
-
 #[test]
-fn static_only_builds_and_matches_legacy() {
+fn static_only_builds_manifest_and_html() {
     let tmp = tempfile::tempdir().unwrap();
     let native = tmp.path().join("native");
     let result = build_native("static-only", &native);
@@ -78,19 +38,6 @@ fn static_only_builds_and_matches_legacy() {
         serde_json::from_str(&std::fs::read_to_string(&result.manifest_path).unwrap()).unwrap();
     assert_eq!(manifest["version"], "1");
     assert_eq!(manifest["build_id"], "test-static-only");
-
-    if !bun_available() {
-        eprintln!("bun not on PATH — skipping equivalence half");
-        return;
-    }
-    let legacy = tmp.path().join("legacy");
-    build_legacy("static-only", &legacy);
-    let report = mesofact_build::diff::diff_dists(&legacy, &native).unwrap();
-    assert!(
-        report.is_equivalent(),
-        "static-only fixture diverged:\n{}",
-        report.findings.join("\n")
-    );
 }
 
 #[test]

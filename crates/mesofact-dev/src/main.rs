@@ -25,6 +25,21 @@ struct Args {
     /// Skip the initial build at startup (watch mode only).
     #[arg(long)]
     no_initial_build: bool,
+
+    /// Path to a JSON `prefix → backend base URL` map for the same-origin
+    /// reverse proxy (R513-F10), e.g.
+    /// `{"/auth": "http://127.0.0.1:8745", "/dev": "http://127.0.0.1:8745"}`.
+    /// Matching requests are forwarded to the backend before static serving so
+    /// the SPA stays single-origin (no CORS). Camp-emitted at SPA-service spawn.
+    #[arg(long, value_name = "PATH")]
+    proxy_map: Option<PathBuf>,
+
+    /// Path to a JSON file served verbatim at `/config.json` (R513-F5/F10): the
+    /// SPA's `DashboardConfig` (apiBaseUrl / authBaseUrl / env …). Injected by
+    /// the server — NOT placed in the served `dist/` — so an Option-A pipeline
+    /// serving the same bundle never inherits a stale `env:ci` config.
+    #[arg(long, value_name = "PATH")]
+    config_json: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -38,7 +53,28 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    let server = Server::from_workload(&args.workload)?;
+    let mut server = Server::from_workload(&args.workload)?;
+
+    // Same-origin reverse proxy (R513-F10): forward `/auth/*` etc. to the
+    // camp-vended backend ports so the dashboard E2E (Option B) browser stays
+    // single-origin. No map → no proxy (the Option A static path is unchanged).
+    if let Some(map_path) = &args.proxy_map {
+        let map = mesofact_dev::ProxyMap::from_json_file(map_path)?;
+        info!(
+            map = %map_path.display(),
+            routes = ?map.routes(),
+            "mesofact-dev: same-origin reverse proxy installed",
+        );
+        server = server.with_proxy(map);
+    }
+
+    // Server-injected runtime config (R513-F5/F10) served at /config.json.
+    if let Some(config_path) = &args.config_json {
+        let bytes = std::fs::read(config_path)
+            .map_err(|e| anyhow::anyhow!("reading config json {}: {e}", config_path.display()))?;
+        info!(config = %config_path.display(), "mesofact-dev: serving /config.json (R513-F10)");
+        server = server.with_config_json(bytes);
+    }
 
     // Canonicalize so the bun child's manifest read + dynamic-import use
     // absolute paths regardless of the cwd mesofact-dev was invoked from.

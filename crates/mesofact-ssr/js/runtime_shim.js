@@ -77,7 +77,7 @@ export function runInTrackCtx(fn) {
 class SourceUnavailableError extends Error {
   constructor(name, kind) {
     super(
-      `source '${name}' (${kind}) is not available during build-time SSG: the Rust-native pipeline reads declared data_inputs only. Use data_inputs / prerender.from_data, or build with --legacy-bun for source-adapter renders.`,
+      `source '${name}' (${kind}) is not available during build-time SSG: the Rust-native pipeline reads declared data_inputs only. Use data_inputs / prerender.from_data for source-adapter renders.`,
     );
     this.name = "SourceUnavailableError";
   }

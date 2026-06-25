@@ -1,12 +1,10 @@
 //! `mesofact-build` — Rust-native build CLI (W174 binary surface, build
-//! verb). `--legacy-bun` shells to the Bun pipeline; `diff` compares two
-//! dist trees for the R450 equivalence gate.
+//! verb).
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use mesofact_build::legacy::{find_bun_cli, run_legacy_bun};
 use mesofact_build::pipeline::{build, BuildOptions, InstallMode};
 
 #[derive(Parser)]
@@ -34,17 +32,9 @@ enum Command {
         /// Never run the install step (build against existing node_modules).
         #[arg(long)]
         no_install: bool,
-        /// Run the legacy Bun pipeline instead (requires bun on PATH).
-        #[arg(long)]
-        legacy_bun: bool,
-        /// Explicit path to packages/mesofact-build/src/cli.ts for --legacy-bun.
-        #[arg(long, requires = "legacy_bun")]
-        legacy_bun_cli: Option<PathBuf>,
     },
     /// Install the locked dependency closure (bun.lock) into node_modules.
     Install { project: PathBuf },
-    /// Diff two dist/ trees for behavioral equivalence (R450).
-    Diff { legacy_dist: PathBuf, native_dist: PathBuf },
 }
 
 fn main() -> Result<()> {
@@ -56,14 +46,7 @@ fn main() -> Result<()> {
             build_id,
             install,
             no_install,
-            legacy_bun,
-            legacy_bun_cli,
         } => {
-            if legacy_bun {
-                let cli_path = find_bun_cli(&project, legacy_bun_cli.as_deref())?;
-                run_legacy_bun(&project, &cli_path)?;
-                return Ok(());
-            }
             let install = if install {
                 InstallMode::Always
             } else if no_install {
@@ -98,18 +81,6 @@ fn main() -> Result<()> {
                 );
             }
             Ok(())
-        }
-        Command::Diff { legacy_dist, native_dist } => {
-            let report = mesofact_build::diff::diff_dists(&legacy_dist, &native_dist)?;
-            if report.is_equivalent() {
-                println!("dist trees are behaviorally equivalent (modulo build-id + bundle hashes)");
-                Ok(())
-            } else {
-                for f in &report.findings {
-                    eprintln!("DIFF: {f}");
-                }
-                std::process::exit(1);
-            }
         }
     }
 }

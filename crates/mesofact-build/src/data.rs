@@ -13,8 +13,8 @@ use crate::route_config::RouteEntry;
 
 /// Expand a route's `prerender` config into concrete param maps.
 /// The source-derived shape (`{from, query, param}` walking a registered R2
-/// adapter) is not supported in the Rust-native pipeline v1 — build with
-/// `--legacy-bun` for those routes (see W174 amendment).
+/// adapter) is not supported in the Rust-native pipeline — use
+/// `prerender.from_data` for those routes (see W174 amendment).
 pub fn expand_prerender_params(
     r: &RouteEntry,
     project_root: &Path,
@@ -26,7 +26,7 @@ pub fn expand_prerender_params(
             expand_from_data(&r.route, from_data, items_key, param, project_root)
         }
         Some(Prerender::SourceDerived { from, .. }) => bail!(
-            "route {}: prerender.from='{from}' (source-derived enumeration) is not supported by the Rust-native pipeline yet; use prerender.from_data or build with --legacy-bun",
+            "route {}: prerender.from='{from}' (source-derived enumeration) is not supported by the Rust-native pipeline; use prerender.from_data instead",
             r.route
         ),
     }

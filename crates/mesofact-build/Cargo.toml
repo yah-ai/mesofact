@@ -1,9 +1,9 @@
 # Rust-native mesofact build pipeline (W174 / Q445). Parallel implementation
 # of packages/mesofact-build: Rolldown bundling + LightningCSS + asset
 # pipeline + deno_core SSG, plus a minimal lockfile-driven npm installer
-# (pacquet was retired upstream — see W174 amendment). `--legacy-bun` shells
-# out to the Bun pipeline so both can be diffed for behavioral equivalence
-# (R450).
+# (pacquet was retired upstream — see W174 amendment). The Rust-native
+# pipeline is the sole build path; the Bun `--legacy-bun` escape hatch and
+# its equivalence-diff harness were removed at R450-T4.
 
 [package]
 name = "mesofact-build"
