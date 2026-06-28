@@ -1,6 +1,6 @@
 # mesofact-serve — deno_core SSR-host container (W174 pillar 4 / R449-F3).
 #
-# Replaces the `oven/bun:1` + `bun run src/ssr.ts` container that warden's
+# Replaces the `oven/bun:1` + `bun run src/ssr.ts` container that yubaba's
 # pond `ssr_runtime` slot previously ran. One V8 isolate (via deno_core) hosts
 # every `mode:"ssr"` route's Fetch handler; static fall-through is served from
 # the bind-mounted `dist/html/`.

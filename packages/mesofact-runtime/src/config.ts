@@ -1,9 +1,9 @@
-// `mesofact.config.toml` parser. Warden writes this file atomically and
+// `mesofact.config.toml` parser. Yubaba writes this file atomically and
 // SIGHUPs the proxy + Bun pool on change; mesofact reads it on boot to
-// instantiate adapters. Credentials come in via env vars (warden injects);
+// instantiate adapters. Credentials come in via env vars (yubaba injects);
 // the config carries only the env var *names*, never the secrets themselves.
 //
-// See `.yah/docs/architecture/mesofact.md` §"Warden owns config and credentials".
+// See `.yah/docs/architecture/mesofact.md` §"Yubaba owns config and credentials".
 
 import { readFileSync } from "node:fs";
 import { parse as parseToml } from "smol-toml";
@@ -16,7 +16,7 @@ export type R2SourceConfig = {
   scope: SourceScope;
   bucket: string;
   // Env var name resolved at register-time. R2's endpoint is account-scoped
-  // (`https://<account_id>.r2.cloudflarestorage.com`), so warden injects it
+  // (`https://<account_id>.r2.cloudflarestorage.com`), so yubaba injects it
   // rather than us guessing.
   endpoint_env: string;
   // Env var names for credentials. Defaults are the AWS-standard names so a

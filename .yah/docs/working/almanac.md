@@ -22,7 +22,7 @@ What an almanac is *not*:
 
 - Not user-generated content (forms, comments, sessions).
 - Not live operational data (current request, presence, ticks). That's a different surface.
-- Not the workload that produces it. The workload is owned by warden.
+- Not the workload that produces it. The workload is owned by yubaba.
 - Not coupled to a particular transport. The same artifact feeds webview and RPC.
 
 ---
@@ -45,7 +45,7 @@ Without naming it, we'd end up with N one-off scrapers each inventing schema, sc
 
 ```
 sites/<site>/almanacs/<almanac-name>/
-  almanac.toml      # source, schedule, retry, output key — warden reads
+  almanac.toml      # source, schedule, retry, output key — yubaba reads
   normalize.<lang>  # raw fetch → normalized artifact (the curation step)
   schema/           # the stable contract — ALL consumers depend on this
     types.rs        #   canonical Rust shape (when consumers cross language)
@@ -57,7 +57,7 @@ Consumers live **outside** the almanac directory and depend on `schema/`:
 ```
 sites/<site>/routes.ts             # webview surface declares `requires: almanac:<name>`
 apps/desktop/src/almanacs/<name>.rs  # typed RPC client
-crates/<other>/src/...             # CLI or warden-internal consumer
+crates/<other>/src/...             # CLI or yubaba-internal consumer
 ```
 
 The almanac directory owns *production*. Consumption is wherever the consumer lives.
@@ -74,7 +74,7 @@ This rules out designs where "the almanac is a route that happens to be cached" 
 
 ### 4.2 Schema language: canonical Rust when consumers cross the language boundary
 
-For any almanac whose consumers include desktop, warden, CLI, or another camp, the canonical schema lives in **Rust** (a tiny crate or `schema/types.rs`). TypeScript bindings are generated or hand-mirrored with a typecheck guard.
+For any almanac whose consumers include desktop, yubaba, CLI, or another camp, the canonical schema lives in **Rust** (a tiny crate or `schema/types.rs`). TypeScript bindings are generated or hand-mirrored with a typecheck guard.
 
 Webview-only almanacs (a marketing-page-scoped almanac with no native consumer) may stay TS-native. The choice is per-almanac, declared in `almanac.toml`:
 
@@ -85,17 +85,17 @@ canonical = "rust"   # or "ts"
 
 This matches yah's broader convention: cross-process types live in Rust crates (cf. `crates/yah/kg-anno`).
 
-### 4.3 Warden↔mesofact handshake is one-directional
+### 4.3 Yubaba↔mesofact handshake is one-directional
 
-Warden owns scheduling, retries, cron, secrets, observability. Mesofact owns the artifact's schema, the consumer contract, and the publisher invalidation event.
+Yubaba owns scheduling, retries, cron, secrets, observability. Mesofact owns the artifact's schema, the consumer contract, and the publisher invalidation event.
 
-**Direction: mesofact's `almanac.toml` is the source of truth; warden tooling reads it and registers a workload.** Not the reverse. Bidirectional sync rots fast.
+**Direction: mesofact's `almanac.toml` is the source of truth; yubaba tooling reads it and registers a workload.** Not the reverse. Bidirectional sync rots fast.
 
 The CLI seam (sketch):
 
 ```
-yah warden almanacs sync <site>   # scans sites/<site>/almanacs/, registers/updates workloads
-yah warden almanacs run <name>    # one-shot, for local dev or manual refresh
+yah yubaba almanacs sync <site>   # scans sites/<site>/almanacs/, registers/updates workloads
+yah yubaba almanacs run <name>    # one-shot, for local dev or manual refresh
 ```
 
 For local dev, `bun run dev` on a mesofact site invokes the same one-shot path so a developer sees fresh data without waiting for prod cron.
@@ -213,8 +213,8 @@ What the OpenRouter source teaches the pattern:
 | Deprecation grace window (§9 of source doc) | **Generic — promoted to pattern (§5)** | `almanac.toml` `freshness.deprecation_grace` |
 | Diff events (`model.added`, etc.) | Opt-in derived artifact, not core | `derive.diff_events` in `almanac.toml` |
 | Last-good cache when API is down | **Generic — promoted to pattern (§5)** | almanac-client |
-| Source rate limits | Workload concern | warden job spec |
-| ETag / `models/count` for freshness check | Workload optimization | warden job spec |
+| Source rate limits | Workload concern | yubaba job spec |
+| ETag / `models/count` for freshness check | Workload optimization | yubaba job spec |
 
 What the pricing case *doesn't* tell us, and we shouldn't invent on its behalf:
 
@@ -227,7 +227,7 @@ These wait for a second concrete case.
 
 ## 9. Open questions before this graduates to `architecture/`
 
-1. **Publisher invalidation on external writes.** Does mesofact's publisher tag-subscription fire on R2 writes that originate from a warden workload (not the publisher itself)? If not, that gap is the actual first ticket — it gates every future warden→mesofact case, not just almanacs.
+1. **Publisher invalidation on external writes.** Does mesofact's publisher tag-subscription fire on R2 writes that originate from a yubaba workload (not the publisher itself)? If not, that gap is the actual first ticket — it gates every future yubaba→mesofact case, not just almanacs.
 
 2. **Canonical client path.** Is `almanac-client` a `yah-camp` library (§6.2) or a freestanding crate consumers compose? Decision determines whether almanac becomes a real subsystem with cross-process state or stays a thin convention.
 

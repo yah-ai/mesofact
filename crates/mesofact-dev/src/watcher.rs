@@ -25,7 +25,7 @@
 //! @yah:status(review)
 //! @yah:parent(R255)
 //! @yah:next("decide on the single fact: does the almanac/runtime fetch via S3 API calls or plain CDN GET? if S3, tier-1 needs s3s-fs regardless")
-//! @yah:next("if s3s-fs: run the existing publish_to_local_sim unchanged against it so tier-1 becomes a strict subset of tier-2 (only diff: in-process s3s-fs vs containerized MinIO+Caddy+warden)")
+//! @yah:next("if s3s-fs: run the existing publish_to_local_sim unchanged against it so tier-1 becomes a strict subset of tier-2 (only diff: in-process s3s-fs vs containerized MinIO+Caddy+yubaba)")
 //! @yah:next("reject self-mock: reimplementing SigV4 + bucket-policy + error shapes drifts from MinIO and defeats the point")
 //! @yah:gotcha("license-check s3s before adopting — must be MIT/BSD/Apache-2.0/ISC (believed Apache-2.0)")
 //! @yah:assumes("tier-1 read path is plain HTTP-GET (Caddy proxies the public bucket), so serve-off-disk is faithful for reads; only the build->PUT->read publish contract is unexercised at tier 1")

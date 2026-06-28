@@ -259,7 +259,7 @@ impl Server {
             config_json: self.config_json.clone(),
         };
         let mut router = Router::new()
-            // Unambiguous readiness probe for the warden pond/cloud reconciler
+            // Unambiguous readiness probe for the yubaba pond/cloud reconciler
             // (R449-F3). SSR-only workloads have no static `/` to probe; the
             // generous "any non-5xx is alive" criterion would also accept a
             // 404, but a dedicated 200 endpoint lets `ready_path` point

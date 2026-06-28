@@ -39,7 +39,7 @@ export type WorkerOptions = {
   baseDir?: string;
   // Path to `mesofact.config.toml`. When set, adapters are registered at boot
   // so render entrypoints can reach `sqlite('db')` / `r2('assets')` at request
-  // time. Credentials come from the worker's env (warden injects them).
+  // time. Credentials come from the worker's env (yubaba injects them).
   config?: string;
 };
 

@@ -225,16 +225,16 @@ freelance integration.
 | `rpc` | HTTPS to a specific host (typically over a private mesh) | scoped data that lives on a single node with no regional replica; generation token comes from a *paired* roster source, not from the endpoint itself |
 
 That is the lane. Other backends (globally-replicated SQL, message
-queues, WS streams) are reached by other components — usually warden
+queues, WS streams) are reached by other components — usually yubaba
 out-of-band, or the SPA's own API client — not a render-time
-adapter. The "let warden own the backend connections" rule means
+adapter. The "let yubaba own the backend connections" rule means
 mesofact never opens a new *kind* of connection on its own.
 
 The `rpc` adapter is the asymmetric one: it doesn't talk to a backend
 *kind* (Postgres, R2, …), it talks to a specific host whose address
 comes from a **roster** source declared elsewhere in the config. The
 canonical case is a hosted-per-tenant service: a yah camp's
-`yah-camp` daemon, exposed by warden on a private mesh, with the
+`yah-camp` daemon, exposed by yubaba on a private mesh, with the
 tenant→host map living in R2 as a signed roster manifest. See the
 [yah case study](./mesofact-yah-case-study.md) (yah-remote-camp section).
 
@@ -250,16 +250,16 @@ TS-side interface; the appliance is the running service it talks to.
 | `r2` | R2 (object store) |
 | `sqlite` | SQLite (embedded; optionally Litestream-replicated) |
 | `pg` | Postgres |
-| `rpc` | any HTTP-API appliance (yah-camp, warden, future services) |
+| `rpc` | any HTTP-API appliance (yah-camp, yubaba, future services) |
 
 Future appliances (Redis, NATS, …) become future adapters in the
 same shape. The adapter inventory is therefore the appliance
 integration list.
 
-### Warden owns config and credentials
+### Yubaba owns config and credentials
 
 Mesofact reads its data-source config from `mesofact.config.toml`.
-Warden writes that file atomically and SIGHUPs the proxy + Bun pool
+Yubaba writes that file atomically and SIGHUPs the proxy + Bun pool
 on change:
 
 ```toml
@@ -272,7 +272,7 @@ home_region = "${WARDEN_HOME_REGION}"
 [sources.profile_pg]
 kind = "pg"
 scope = "global"
-dsn_env = "PROFILE_PG_DSN"        # warden injects the secret as env
+dsn_env = "PROFILE_PG_DSN"        # yubaba injects the secret as env
 
 [sources.assets]
 kind = "r2"
@@ -285,10 +285,10 @@ endpoint_env = "R2_ENDPOINT"
 templated on `req.project.id` / `req.user.id`; the build refuses to
 let Mode 1 routes read scoped sources.
 
-Credentials are env vars warden injects into the proxy + Bun pool's
+Credentials are env vars yubaba injects into the proxy + Bun pool's
 environment; mesofact never reads them off disk and never rotates
-them. If warden fails over a source (new PG replica, new R2 region),
-warden rewrites the config and SIGHUPs.
+them. If yubaba fails over a source (new PG replica, new R2 region),
+yubaba rewrites the config and SIGHUPs.
 
 ### Source read-set lives in the manifest
 
@@ -402,7 +402,7 @@ which the build tree-shakes out of client bundles.
 
 For Mode 3, the SPA shell mesofact emits is the JS bundle yah/ui
 already builds — once hydrated, the SPA talks to whatever API it
-wants (warden-managed service, third-party, …) and **mesofact is out
+wants (yubaba-managed service, third-party, …) and **mesofact is out
 of the request path**. Mesofact does not proxy SPA → API traffic.
 
 This is why the MVP DoD requires render-contract types to be
@@ -500,7 +500,7 @@ time. Non-parametric Mode 1 routes omit it.
 ## Adapter API surface
 
 All adapters expose the same shape; specifics vary by backend. Read-
-only by design — mesofact has no write API. Writes go through warden-
+only by design — mesofact has no write API. Writes go through yubaba-
 managed services or the FE's own client.
 
 ```ts
@@ -546,7 +546,7 @@ trait SessionResolver: Send + Sync {
 MVP ships one impl: `CookieSessionResolver` reads a configurable
 cookie name (default `mesofact_session`) and verifies the token with a
 `cheers_core::Codec` (the shared auth contract; default `PasetoV4Codec`
-— PASETO v4.local, encrypted + authenticated — keyed by a secret warden
+— PASETO v4.local, encrypted + authenticated — keyed by a secret yubaba
 injects). The verified `cheers_core::Claims` (`{sub, device, binding,
 issued_at, expires_at}`) map onto mesofact's `{id, attrs}` render shape:
 `sub` becomes `id`; the device binding + lifetimes ride through `attrs`.
@@ -570,7 +570,7 @@ User identity contributes to the cache key implicitly when
 **Cross-instance identity**: multiple mesofact instances under one
 apex domain (e.g. `yah.com` + `camp.yah.dev` under `.yah.dev`) get
 unified sessions for free by sharing the cookie name, cookie domain,
-and codec key (all warden-injected). No SSO protocol needed —
+and codec key (all yubaba-injected). No SSO protocol needed —
 `CookieSessionResolver` runs identically in each instance and they
 all decode the same cookie. This is the common shape when one org
 runs several services on shared substrate; see
@@ -661,7 +661,7 @@ one org commonly operates several instances on shared substrate
 (e.g. `yah.dev` marketing, `yah.com` platform, `camp.yah.dev`
 camps are three mesofact instances run by one team; see
 [mesofact-yah-case-study.md](./mesofact-yah-case-study.md)). The
-sharing happens at the warden/cookie-domain layer, not inside
+sharing happens at the yubaba/cookie-domain layer, not inside
 mesofact.
 
 Reasons this is the MVP posture, not per-request tenant resolution:
@@ -670,7 +670,7 @@ Reasons this is the MVP posture, not per-request tenant resolution:
   specific. Reloading per-request adds complexity for marginal gain.
 - Cache-invalidation tag namespaces scope naturally per-tenant
   when each tenant has its own instance.
-- Warden already places per-tenant workloads via raft; mesofact rides
+- Yubaba already places per-tenant workloads via raft; mesofact rides
   that placement instead of duplicating tenant routing.
 
 Per-request tenant resolution can be added later by replacing the
@@ -833,13 +833,13 @@ Seven phases, all run by `mesofact build`:
 
 Dev mode (`mesofact dev`): runs Bun directly with Vite HMR; proxy is
 out of the loop; phases 5 and 7 are skipped. Adapter calls hit the
-same warden-configured sources as prod (or pointed at fixtures via
+same yubaba-configured sources as prod (or pointed at fixtures via
 config).
 
 ## Publisher tag-subscription
 
 Where the listener runs: `mesofact-publisher` is a long-lived daemon
-co-located with the proxy (same warden-managed unit). It maintains:
+co-located with the proxy (same yubaba-managed unit). It maintains:
 
 - One Postgres `LISTEN` connection per `pg` source declared in any
   route's `source_reads`.
@@ -906,7 +906,7 @@ Rolling sequence:
 
 1. Publisher uploads new HTML + assets to `/{new_build_id}/`.
 2. Publisher uploads `manifest.json` with `build_id = new_build_id`.
-3. Warden SIGHUPs proxy (or proxy picks up via heartbeat).
+3. Yubaba SIGHUPs proxy (or proxy picks up via heartbeat).
 4. Proxy spawns N new Bun workers loading new server bundles.
 5. New traffic routes to new workers; old workers receive `drain`,
    finish in-flight requests, exit.
@@ -931,10 +931,10 @@ Tracing:
 - Trace context passes to the Bun worker as `req.ctx.trace`.
 - Adapters emit a child span per backend call (table or key in span
   name; full SQL/args not recorded, to avoid leaking scoped data).
-- Spans exported via OTLP to a warden-managed collector. No mesofact-
+- Spans exported via OTLP to a yubaba-managed collector. No mesofact-
   specific tracing UI.
 
-Metrics (Prometheus exposition at `/metrics`, scraped by warden):
+Metrics (Prometheus exposition at `/metrics`, scraped by yubaba):
 
 | Metric | Labels |
 |---|---|
@@ -1001,7 +1001,7 @@ Genuinely-deferred items the refining team should ticket as
 ### Data plane
 
 - **Data-entry shape**: typed TS adapters (`r2`, `sqlite`, `pg`,
-  `rpc`), warden-injected config + credentials. Not a GraphQL
+  `rpc`), yubaba-injected config + credentials. Not a GraphQL
   bridge. The render function imports adapters directly. See
   §"Data-source seam". The `rpc` adapter covers scoped data that
   lives on a single specific host; its generation token comes from
@@ -1069,7 +1069,7 @@ Genuinely-deferred items the refining team should ticket as
   pointer; SIGHUP + 30s heartbeat; new workers spawned then old
   drained; old build retained ≥24h.
 - **Observability**: W3C `traceparent`, OTLP export, Prometheus
-  `/metrics`, structured JSON logs. No mesofact-specific UI; warden's
+  `/metrics`, structured JSON logs. No mesofact-specific UI; yubaba's
   observability stack consumes everything.
 
 ## MVP definition of done

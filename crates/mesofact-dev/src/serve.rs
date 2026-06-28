@@ -7,13 +7,13 @@
 //! and binds a routable address (`0.0.0.0` by default) so a sibling miniflare
 //! container can proxy SSR-prefix requests to it over the pond docker bridge.
 //!
-//! Contract with warden's `pond_ssr_runtime` bring-up:
+//! Contract with yubaba's `pond_ssr_runtime` bring-up:
 //! - The workload's built tree is bind-mounted into the container (e.g. at
 //!   `/app`); the container CMD is `mesofact-serve /app --port 3000`.
 //! - Static fall-through is served from `<dir>/dist/html/`; SSR-prefix routes
 //!   (per `manifest.json`) dispatch to the isolate. A workload with no
 //!   `mode:"ssr"` routes serves static only (the isolate is never booted).
-//! - Readiness: warden probes `ready_path` (point it at `/__mesofact/health`
+//! - Readiness: yubaba probes `ready_path` (point it at `/__mesofact/health`
 //!   for SSR-only sites that have no static `/`).
 //!
 //! See the [library crate](mesofact_dev) for the shared `Server` + `ssr`
@@ -34,7 +34,7 @@ const DEFAULT_SERVE_PORT: u16 = 3000;
 #[command(version, about = "deno_core SSR-host runtime for mesofact-static workloads")]
 struct Args {
     /// Workload directory — the parent of `dist/` (with `dist/html/` and
-    /// `manifest.json`). Bind-mounted into the container by warden.
+    /// `manifest.json`). Bind-mounted into the container by yubaba.
     workload: PathBuf,
 
     /// TCP port to bind.

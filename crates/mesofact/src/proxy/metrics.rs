@@ -1,4 +1,4 @@
-//! Prometheus metrics for the proxy (`/metrics` exposition, scraped by warden).
+//! Prometheus metrics for the proxy (`/metrics` exposition, scraped by yubaba).
 //!
 //! MVP metric set from the architecture's §"Observability":
 //!

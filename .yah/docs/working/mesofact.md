@@ -575,7 +575,7 @@ least once.
   - `r2` adapter (`fetch`, `list`) with `r2:<bucket>:<key>` tag
     emission and 2000 ms default timeout.
   - Typed errors per the design.
-  - `mesofact.config.toml` parser for `[sources.*]` (warden writes,
+  - `mesofact.config.toml` parser for `[sources.*]` (yubaba writes,
     mesofact reads) — one source kind in this phase (`r2`).
 - **Verify**: a render entrypoint that reads two R2 keys returns a
   `RenderResult` whose `cache.tags` includes both `r2:<bucket>:<key>`
