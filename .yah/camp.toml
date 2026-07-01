@@ -1,4 +1,6 @@
 #:schema ./schema/camp.toml.schema.json
+relay_high_water = 445
+camp_id = "5624e052bc10"
 
 # Per-camp config for yah. Replaces the pre-R179 trio of camp.json,
 # agent-settings.json, and approval.toml.

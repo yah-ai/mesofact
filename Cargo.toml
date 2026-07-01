@@ -8,6 +8,7 @@ members = [
     "crates/mesofact-dev",
     "crates/mesofact-build",
     "crates/mesofact-ssr",
+    "crates/mesofact-app",
 ]
 resolver = "2"
 

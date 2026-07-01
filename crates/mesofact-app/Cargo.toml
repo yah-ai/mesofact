@@ -1,0 +1,27 @@
+[package]
+name = "mesofact-app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Lean Rust-native app harness — bind/serve loop + standard mesofact stack (tracing, /__mesofact/health, graceful shutdown) for services whose handlers are Rust functions. No V8/deno_core dep; companion to mesofact-dev's JS-bundle pipelines."
+
+[lib]
+name = "mesofact_app"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+
+[dev-dependencies]
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tower = { version = "0.5", features = ["util"] }

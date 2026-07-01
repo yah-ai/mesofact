@@ -2886,6 +2886,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesofact-app"
+version = "0.8.16"
+dependencies = [
+ "anyhow",
+ "axum",
+ "http-body-util",
+ "reqwest",
+ "tokio",
+ "tower",
+ "tower-http 0.6.10",
+ "tracing",
+]
+
+[[package]]
 name = "mesofact-build"
 version = "0.8.16"
 dependencies = [
