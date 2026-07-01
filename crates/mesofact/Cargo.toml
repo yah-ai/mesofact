@@ -39,8 +39,8 @@ toml = "0.8"
 # Shared auth contract: Claims + the keyless Codec trait live in cheers-core;
 # the concrete symmetric PasetoV4Codec (mint/verify) lives in cheers-server
 # after the F6 crate split. Both consumed cross-camp by path dep (R009 / P11).
-cheers-core = { path = "../../../cheers/crates/cheers-core", version = "0.8.16" }
-cheers-server = { path = "../../../cheers/crates/cheers-server", version = "0.8.16" }
+cheers-core = { path = "../../../cheers/crates/cheers-core", version = "0.8.17" }
+cheers-server = { path = "../../../cheers/crates/cheers-server", version = "0.8.17" }
 
 [dev-dependencies]
 serde_json = "1"
