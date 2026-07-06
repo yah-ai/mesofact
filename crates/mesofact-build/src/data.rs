@@ -20,19 +20,36 @@ pub fn expand_prerender_params(
     project_root: &Path,
 ) -> Result<Vec<BTreeMap<String, String>>> {
     match &r.prerender {
-        None => Ok(vec![BTreeMap::new()]),
-        Some(Prerender::Literal { params }) => Ok(params.clone()),
-        Some(Prerender::FromData { from_data, items_key, param }) => {
-            expand_from_data(&r.route, from_data, items_key, param, project_root)
-        }
-        Some(Prerender::SourceDerived { from, .. }) => bail!(
-            "route {}: prerender.from='{from}' (source-derived enumeration) is not supported by the Rust-native pipeline; use prerender.from_data instead",
-            r.route
-        ),
         // Instance-addressed route: params are minted after the build, so
         // the build prerenders zero instances (render-only entrypoint owns
         // instance production).
         Some(Prerender::Deferred { .. }) => Ok(vec![]),
+        other => expand_prerender(&r.route, other.as_ref(), project_root),
+    }
+}
+
+/// Prerender expansion shared by the build (via [`expand_prerender_params`])
+/// and the render-only entrypoint's all-instances form (which re-expands
+/// *fresh* at revalidate time). Deferred is a caller decision — the build
+/// maps it to zero instances, the render verb rejects it (instances are
+/// publish-minted, not enumerable).
+pub fn expand_prerender(
+    route: &str,
+    prerender: Option<&Prerender>,
+    project_root: &Path,
+) -> Result<Vec<BTreeMap<String, String>>> {
+    match prerender {
+        None => Ok(vec![BTreeMap::new()]),
+        Some(Prerender::Literal { params }) => Ok(params.clone()),
+        Some(Prerender::FromData { from_data, items_key, param }) => {
+            expand_from_data(route, from_data, items_key, param, project_root)
+        }
+        Some(Prerender::SourceDerived { from, .. }) => bail!(
+            "route {route}: prerender.from='{from}' (source-derived enumeration) is not supported by the Rust-native pipeline; use prerender.from_data instead"
+        ),
+        Some(Prerender::Deferred { .. }) => bail!(
+            "route {route}: prerender.deferred instances are minted at publish time and cannot be enumerated — render them one at a time with explicit params"
+        ),
     }
 }
 

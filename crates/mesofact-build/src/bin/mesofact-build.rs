@@ -45,18 +45,23 @@ enum Command {
         #[arg(long)]
         route: String,
         /// Param value for each :param segment, repeatable: --param id=42.
-        #[arg(long = "param", value_name = "KEY=VALUE")]
+        #[arg(long = "param", value_name = "KEY=VALUE", conflicts_with = "all")]
         params: Vec<String>,
         /// JSON file whose top-level object becomes req.data verbatim,
         /// overriding the route's declared data_inputs read.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "all")]
         data: Option<PathBuf>,
         /// Built output directory (default: <project>/dist).
         #[arg(long)]
         out_dir: Option<PathBuf>,
         /// Print the HTML to stdout instead of writing dist/html/<key>.html.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "all")]
         stdout: bool,
+        /// Re-expand the route's prerender params fresh and render every
+        /// instance (the revalidate verb for a data/feed change). Rejects
+        /// deferred routes — their instances are minted at publish time.
+        #[arg(long)]
+        all: bool,
     },
 }
 

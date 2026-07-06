@@ -28,4 +28,7 @@ pub mod ssr_prefix;
 pub mod tag_index;
 
 pub use pipeline::{build, BuildOptions, BuildResult, InstallMode};
-pub use render::{render_route, render_route_with, RenderOptions, RenderOutcome};
+pub use render::{
+    render_route, render_route_all, render_route_all_with, render_route_with, RenderAllOptions,
+    RenderOptions, RenderOutcome,
+};

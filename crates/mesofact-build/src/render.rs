@@ -74,65 +74,146 @@ pub fn render_route(opts: RenderOptions) -> Result<RenderOutcome> {
 }
 
 pub fn render_route_with(ssg: &SsgRuntime, opts: RenderOptions) -> Result<RenderOutcome> {
-    let project_root = opts
-        .project_root
-        .canonicalize()
-        .with_context(|| format!("project root {}", opts.project_root.display()))?;
-    let out_dir = match opts.out_dir {
-        Some(d) => d.canonicalize().with_context(|| format!("out dir {}", d.display()))?,
-        None => project_root.join("dist"),
-    };
-
-    let manifest_path = out_dir.join("manifest.json");
-    let manifest: Manifest = serde_json::from_str(
-        &std::fs::read_to_string(&manifest_path)
-            .with_context(|| format!("reading {} — run `mesofact-build build` first", manifest_path.display()))?,
-    )
-    .with_context(|| format!("parsing {}", manifest_path.display()))?;
-
-    let route = manifest
-        .routes
-        .iter()
-        .find(|r| r.route == opts.route)
-        .ok_or_else(|| {
-            let have: Vec<&str> = manifest.routes.iter().map(|r| r.route.as_str()).collect();
-            anyhow!("route {} not in manifest (routes: {})", opts.route, have.join(", "))
-        })?;
-    if route.mode == RouteMode::Ssr {
-        bail!(
-            "route {}: mode:\"ssr\" renders per-request in the SSR host; the render verb covers static/spa routes only",
-            route.route
-        );
-    }
-
+    let (project_root, out_dir) = resolve_dirs(&opts.project_root, opts.out_dir.as_deref())?;
+    let manifest = load_manifest(&out_dir)?;
+    let route = find_route(&manifest, &opts.route)?;
     let bundle_path = resolve_bundle(&out_dir, route)?;
 
     let data = match opts.data {
         Some(explicit) => Some(explicit),
-        None => match &route.data_inputs {
-            Some(inputs) if !inputs.is_empty() => Some(read_data_inputs(inputs, &project_root)?),
-            _ => None,
-        },
+        None => read_declared_data(route, &project_root)?,
     };
 
-    let url = expand_route(&route.route, &opts.params)?;
+    render_instance(
+        ssg,
+        &manifest.build_id,
+        route,
+        &bundle_path,
+        &opts.params,
+        data.as_ref(),
+        &out_dir,
+        opts.write,
+    )
+}
+
+/// All-instances form — the revalidate verb. Re-expands the route's
+/// `prerender` params **fresh** (a feed change may have added/removed
+/// instances) and re-reads `data_inputs`, then renders and writes every
+/// instance. Rejects `deferred` routes (their instances are minted at
+/// publish time, not enumerable) and `ssr` routes.
+pub struct RenderAllOptions {
+    pub project_root: PathBuf,
+    pub out_dir: Option<PathBuf>,
+    pub route: String,
+}
+
+pub fn render_route_all(opts: RenderAllOptions) -> Result<Vec<RenderOutcome>> {
+    let ssg = SsgRuntime::start()?;
+    render_route_all_with(&ssg, opts)
+}
+
+pub fn render_route_all_with(
+    ssg: &SsgRuntime,
+    opts: RenderAllOptions,
+) -> Result<Vec<RenderOutcome>> {
+    let (project_root, out_dir) = resolve_dirs(&opts.project_root, opts.out_dir.as_deref())?;
+    let manifest = load_manifest(&out_dir)?;
+    let route = find_route(&manifest, &opts.route)?;
+    let bundle_path = resolve_bundle(&out_dir, route)?;
+
+    let params_list =
+        crate::data::expand_prerender(&route.route, route.prerender.as_ref(), &project_root)?;
+    let data = read_declared_data(route, &project_root)?;
+
+    let mut outcomes = Vec::with_capacity(params_list.len());
+    for params in &params_list {
+        outcomes.push(render_instance(
+            ssg,
+            &manifest.build_id,
+            route,
+            &bundle_path,
+            params,
+            data.as_ref(),
+            &out_dir,
+            true,
+        )?);
+    }
+    Ok(outcomes)
+}
+
+fn resolve_dirs(project_root: &Path, out_dir: Option<&Path>) -> Result<(PathBuf, PathBuf)> {
+    let project_root = project_root
+        .canonicalize()
+        .with_context(|| format!("project root {}", project_root.display()))?;
+    let out_dir = match out_dir {
+        Some(d) => d.canonicalize().with_context(|| format!("out dir {}", d.display()))?,
+        None => project_root.join("dist"),
+    };
+    Ok((project_root, out_dir))
+}
+
+fn load_manifest(out_dir: &Path) -> Result<Manifest> {
+    let manifest_path = out_dir.join("manifest.json");
+    serde_json::from_str(
+        &std::fs::read_to_string(&manifest_path)
+            .with_context(|| format!("reading {} — run `mesofact-build build` first", manifest_path.display()))?,
+    )
+    .with_context(|| format!("parsing {}", manifest_path.display()))
+}
+
+fn find_route<'m>(manifest: &'m Manifest, route: &str) -> Result<&'m Route> {
+    let found = manifest.routes.iter().find(|r| r.route == route).ok_or_else(|| {
+        let have: Vec<&str> = manifest.routes.iter().map(|r| r.route.as_str()).collect();
+        anyhow!("route {} not in manifest (routes: {})", route, have.join(", "))
+    })?;
+    if found.mode == RouteMode::Ssr {
+        bail!(
+            "route {}: mode:\"ssr\" renders per-request in the SSR host; the render verb covers static/spa routes only",
+            found.route
+        );
+    }
+    Ok(found)
+}
+
+fn read_declared_data(
+    route: &Route,
+    project_root: &Path,
+) -> Result<Option<serde_json::Map<String, Value>>> {
+    match &route.data_inputs {
+        Some(inputs) if !inputs.is_empty() => Ok(Some(read_data_inputs(inputs, project_root)?)),
+        _ => Ok(None),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_instance(
+    ssg: &SsgRuntime,
+    build_id: &str,
+    route: &Route,
+    bundle_path: &Path,
+    params: &BTreeMap<String, String>,
+    data: Option<&serde_json::Map<String, Value>>,
+    out_dir: &Path,
+    write: bool,
+) -> Result<RenderOutcome> {
+    let url = expand_route(&route.route, params)?;
     let mut req = json!({
         "url": url,
-        "params": opts.params,
+        "params": params,
         "query": {},
         "headers": {},
         "cookies": {},
     });
-    if let Some(data) = &data {
+    if let Some(data) = data {
         req["data"] = Value::Object(data.clone());
     }
     let mut input = json!({ "route": route.route, "url": url, "req": req });
     if let Some(h) = &route.hydration {
-        input["hydration"] = json!({ "buildId": manifest.build_id, "script": h.script });
+        input["hydration"] = json!({ "buildId": build_id, "script": h.script });
     }
 
     let result = ssg
-        .render(&bundle_path, input)
+        .render(bundle_path, input)
         .with_context(|| format!("route {} ({url}): render failed", route.route))?;
     let html = result
         .get("html")
@@ -145,8 +226,8 @@ pub fn render_route_with(ssg: &SsgRuntime, opts: RenderOptions) -> Result<Render
         .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
         .unwrap_or_default();
 
-    let key = prerender_key(&route.route, &opts.params);
-    let html_path = if opts.write {
+    let key = prerender_key(&route.route, params);
+    let html_path = if write {
         let html_dir = out_dir.join("html");
         std::fs::create_dir_all(&html_dir)?;
         let path = html_dir.join(format!("{key}.html"));
