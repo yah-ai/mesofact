@@ -152,9 +152,20 @@ export type ErrorRoutes = {
 export type RoutesConfig = {
   routes: readonly RouteEntry[];
   error_routes?: ErrorRoutes;
+  // Origin for the manifest-derived sitemap (e.g. "https://yah.dev"), no
+  // trailing path. When set, the build emits `dist/sitemap.xml` listing every
+  // enumerable static route instance; instance-addressed (deferred) routes and
+  // `noindex` renders are excluded (W270 §4 — unlisted-by-capability means no
+  // sitemap participation). Omit to skip sitemap emission entirely.
+  site_url?: string;
 };
 
 export function defineRoutes(config: RoutesConfig): RoutesConfig {
+  if (config.site_url !== undefined && !/^https?:\/\/[^/]+/.test(config.site_url)) {
+    throw new Error(
+      `defineRoutes: site_url=${JSON.stringify(config.site_url)} must be an absolute origin like "https://yah.dev" (scheme + host, no trailing path) — the sitemap emitter joins it with each route's path`,
+    );
+  }
   for (const r of config.routes) {
     if (r.placement !== undefined && r.mode !== "ssr") {
       throw new Error(

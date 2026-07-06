@@ -56,6 +56,10 @@ pub struct RoutesConfig {
     pub routes: Vec<RouteEntry>,
     #[serde(default)]
     pub error_routes: Option<ErrorRoutes>,
+    /// Origin for the manifest-derived sitemap (e.g. "https://yah.dev"). When
+    /// present the build emits `dist/sitemap.xml`; absent skips it (W270 §4).
+    #[serde(default)]
+    pub site_url: Option<String>,
 }
 
 /// `defineRoutes` parity — every rule the TS runtime enforces at config

@@ -23,6 +23,7 @@ pub mod prerender;
 pub mod render;
 pub mod route_config;
 pub mod route_key;
+pub mod sitemap;
 pub mod source_infer;
 pub mod ssr_prefix;
 pub mod tag_index;

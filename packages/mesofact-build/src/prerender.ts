@@ -57,6 +57,7 @@ import {
   escapeJsonForScriptTag,
   runInTrackCtx,
   SPA_STATE_SCRIPT_ID,
+  weaveHead,
   type RenderRequest,
   type RenderResult,
 } from "@mesofact/runtime";
@@ -130,14 +131,17 @@ export async function prerender(
       const { value: result, ctx } = await runInTrackCtx(() => renderFn(req));
       assertRenderResult(input.route, url, result);
 
-      const html = input.hydration
-        ? injectHydration(
-            result.html,
-            input.hydration.buildId,
-            input.hydration.script,
-            result.hydration?.initial_state,
-          )
-        : result.html;
+      // Head weave first (into </head>), hydration weave second (into
+      // </body>); the two target disjoint regions of the document.
+      let html = result.head ? weaveHead(result.html, result.head) : result.html;
+      if (input.hydration) {
+        html = injectHydration(
+          html,
+          input.hydration.buildId,
+          input.hydration.script,
+          result.hydration?.initial_state,
+        );
+      }
 
       const key = prerenderKey(input.route, params);
       const htmlPath = `dist/html/${key}.html`;

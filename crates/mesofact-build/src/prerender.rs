@@ -20,6 +20,10 @@ use crate::tag_index::Emission;
 pub struct PrerenderOutcome {
     pub emissions: Vec<Emission>,
     pub html_paths: Vec<String>,
+    /// Root-relative paths eligible for the sitemap: enumerable static-route
+    /// emissions that did not render `noindex`. Deferred (instance-addressed)
+    /// routes prerender nothing and so never appear here (W270 §4).
+    pub sitemap_paths: Vec<String>,
 }
 
 pub struct RenderTarget<'a> {
