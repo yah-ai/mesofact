@@ -314,3 +314,63 @@ describe("defineRoutes — resilience validation", () => {
     expect(cfg.routes[0].resilience?.retry?.budget_ms).toBe(3_250);
   });
 });
+
+describe("defineRoutes — deferred prerender validation (instance-addressed routes)", () => {
+  const base = {
+    entrypoint: "src/c.ts",
+    cache_policy: { ttl: 60 },
+  } as const;
+
+  test("accepts deferred on a parametric static route", () => {
+    const cfg = defineRoutes({
+      routes: [{ ...base, route: "/c/:slug", mode: "static", prerender: { deferred: true } }],
+    });
+    expect(cfg.routes[0].prerender).toEqual({ deferred: true });
+  });
+
+  test("rejects deferred on ssr and spa modes", () => {
+    expect(() =>
+      defineRoutes({
+        routes: [{ ...base, route: "/c/:slug", mode: "ssr", prerender: { deferred: true } }],
+      }),
+    ).toThrow(/only valid on mode:"static"/);
+    expect(() =>
+      defineRoutes({
+        routes: [
+          {
+            ...base,
+            route: "/c/:slug",
+            mode: "spa",
+            client_entrypoint: "src/c.client.ts",
+            prerender: { deferred: true },
+          },
+        ],
+      }),
+    ).toThrow(/only valid on mode:"static"/);
+  });
+
+  test("rejects deferred on a literal (non-parametric) route", () => {
+    expect(() =>
+      defineRoutes({
+        routes: [{ ...base, route: "/about", mode: "static", prerender: { deferred: true } }],
+      }),
+    ).toThrow(/no ":param" segment/);
+  });
+
+  test("rejects deferred: false", () => {
+    expect(() =>
+      defineRoutes({
+        routes: [
+          {
+            ...base,
+            route: "/c/:slug",
+            mode: "static",
+            // @ts-expect-error — the type only admits `true`; the runtime
+            // check covers untyped callers.
+            prerender: { deferred: false },
+          },
+        ],
+      }),
+    ).toThrow(/deferred: true/);
+  });
+});

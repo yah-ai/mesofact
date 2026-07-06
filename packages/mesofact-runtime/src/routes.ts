@@ -100,10 +100,19 @@ export const DEFAULT_RESILIENCE_TIMEOUT_MS = 30_000;
 //                                   same route's `data_inputs`. Read
 //                                   synchronously, walked via `items_key` as
 //                                   a dotted/array path.
+//   - { deferred: true }            params are minted after the build
+//                                   (publish time). The build emits the
+//                                   server bundle + manifest entry and
+//                                   prerenders nothing; instances are
+//                                   produced exclusively through the
+//                                   render-only entrypoint and served per
+//                                   instance (instance-addressed route).
+//                                   mode:"static" + parametric route only.
 export type PrerenderConfig =
   | { params: ReadonlyArray<Record<string, string>> }
   | { from: string; query: string; param: string }
-  | { from_data: string; items_key: string; param: string };
+  | { from_data: string; items_key: string; param: string }
+  | { deferred: true };
 
 export type RouteEntry = {
   route: string;
@@ -157,6 +166,23 @@ export function defineRoutes(config: RoutesConfig): RoutesConfig {
       if (!declared.includes(r.prerender.from_data)) {
         throw new Error(
           `defineRoutes: route ${r.route} has prerender.from_data=${JSON.stringify(r.prerender.from_data)} but that path is not in data_inputs (${JSON.stringify(declared)}); declare the file in data_inputs first so the build reads it once`,
+        );
+      }
+    }
+    if (r.prerender && "deferred" in r.prerender) {
+      if (r.prerender.deferred !== true) {
+        throw new Error(
+          `defineRoutes: route ${r.route} has prerender.deferred=${JSON.stringify(r.prerender.deferred)} — omit prerender (render once at build) or set deferred: true`,
+        );
+      }
+      if (r.mode !== "static") {
+        throw new Error(
+          `defineRoutes: route ${r.route} has prerender.deferred but mode=${JSON.stringify(r.mode)}; deferred (publish-time) params are only valid on mode:"static" — ssr renders per request, spa shells are not instance-addressed`,
+        );
+      }
+      if (!r.route.includes(":")) {
+        throw new Error(
+          `defineRoutes: route ${r.route} has prerender.deferred but no ":param" segment — a literal route has exactly one instance, rendered at build`,
         );
       }
     }

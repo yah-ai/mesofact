@@ -92,12 +92,18 @@ pub struct ResiliencePolicy {
     pub timeout_ms: Option<u64>,
 }
 
-/// Mode 1 only. Three shapes the publisher runs at build time:
+/// Mode 1 only. Three shapes the publisher runs at build time, plus one
+/// that defers past the build entirely:
 ///   - `Literal` — explicit list of param maps
 ///   - `SourceDerived` — a registered source adapter (R2 BlobSource) walked
 ///     via async load
 ///   - `FromData` — a local JSON file declared on the same route's
 ///     `data_inputs`, walked synchronously via `items_key` (dotted path)
+///   - `Deferred` — params are minted after the build (publish time); the
+///     build emits the server bundle + manifest entry and prerenders
+///     nothing. Instances are produced exclusively through the render-only
+///     entrypoint, and serving resolves them per instance (the route is
+///     *instance-addressed* — W225 §3a publish-once / parent-camp W270 §2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Prerender {
@@ -114,6 +120,20 @@ pub enum Prerender {
         items_key: String,
         param: String,
     },
+    Deferred {
+        /// Always `true` in a well-formed config (`{ deferred: true }`);
+        /// `false` is rejected at validation.
+        deferred: bool,
+    },
+}
+
+impl Prerender {
+    /// Instance-addressed routes render after the build, one instance per
+    /// minted param set; serving resolves them through a pointer store
+    /// rather than the build-time HTML set.
+    pub fn is_deferred(&self) -> bool {
+        matches!(self, Prerender::Deferred { deferred: true })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

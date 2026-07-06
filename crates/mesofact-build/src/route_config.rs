@@ -79,6 +79,27 @@ pub fn validate_routes_config(config: &RoutesConfig) -> Result<()> {
                 );
             }
         }
+        if let Some(Prerender::Deferred { deferred }) = &r.prerender {
+            if !deferred {
+                bail!(
+                    "route {}: prerender.deferred=false is meaningless — omit prerender (render once at build) or set deferred: true",
+                    r.route
+                );
+            }
+            if r.mode != RouteMode::Static {
+                bail!(
+                    "route {} has prerender.deferred but mode={:?}; deferred (publish-time) params are only valid on mode:\"static\" — ssr renders per request, spa shells are not instance-addressed",
+                    r.route,
+                    r.mode
+                );
+            }
+            if !r.route.contains(':') {
+                bail!(
+                    "route {}: prerender.deferred requires a parametric route (a ':param' segment) — a literal route has exactly one instance, rendered at build",
+                    r.route
+                );
+            }
+        }
         if let Some(res) = &r.resilience {
             validate_resilience(r, res)?;
         }
@@ -151,4 +172,59 @@ fn validate_resilience(r: &RouteEntry, res: &ResiliencePolicy) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(routes: serde_json::Value) -> RoutesConfig {
+        serde_json::from_value(serde_json::json!({ "routes": routes })).unwrap()
+    }
+
+    #[test]
+    fn deferred_prerender_valid_on_parametric_static() {
+        let c = config(serde_json::json!([{
+            "route": "/c/:slug",
+            "mode": "static",
+            "entrypoint": "src/c.ts",
+            "cache_policy": { "ttl": 60 },
+            "prerender": { "deferred": true },
+        }]));
+        assert!(matches!(c.routes[0].prerender, Some(Prerender::Deferred { deferred: true })));
+        validate_routes_config(&c).expect("deferred on parametric static is valid");
+    }
+
+    #[test]
+    fn deferred_prerender_rejected_off_static_or_literal_or_false() {
+        let ssr = config(serde_json::json!([{
+            "route": "/c/:slug",
+            "mode": "ssr",
+            "entrypoint": "src/c.ts",
+            "cache_policy": { "ttl": 0 },
+            "prerender": { "deferred": true },
+        }]));
+        let err = validate_routes_config(&ssr).unwrap_err().to_string();
+        assert!(err.contains("only valid on mode:\"static\""), "err: {err}");
+
+        let literal = config(serde_json::json!([{
+            "route": "/about",
+            "mode": "static",
+            "entrypoint": "src/about.ts",
+            "cache_policy": { "ttl": 60 },
+            "prerender": { "deferred": true },
+        }]));
+        let err = validate_routes_config(&literal).unwrap_err().to_string();
+        assert!(err.contains("parametric route"), "err: {err}");
+
+        let falsy = config(serde_json::json!([{
+            "route": "/c/:slug",
+            "mode": "static",
+            "entrypoint": "src/c.ts",
+            "cache_policy": { "ttl": 60 },
+            "prerender": { "deferred": false },
+        }]));
+        let err = validate_routes_config(&falsy).unwrap_err().to_string();
+        assert!(err.contains("deferred=false is meaningless"), "err: {err}");
+    }
 }

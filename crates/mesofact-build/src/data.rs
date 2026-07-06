@@ -29,6 +29,10 @@ pub fn expand_prerender_params(
             "route {}: prerender.from='{from}' (source-derived enumeration) is not supported by the Rust-native pipeline; use prerender.from_data instead",
             r.route
         ),
+        // Instance-addressed route: params are minted after the build, so
+        // the build prerenders zero instances (render-only entrypoint owns
+        // instance production).
+        Some(Prerender::Deferred { .. }) => Ok(vec![]),
     }
 }
 

@@ -25,6 +25,7 @@ pub mod cdn;
 pub mod cloudflare;
 pub mod config;
 pub mod object_store;
+pub mod pointer;
 pub mod publish;
 pub mod s3;
 
@@ -32,5 +33,8 @@ pub use cdn::{CdnPurger, InMemoryPurger, PurgeError};
 pub use cloudflare::CloudflareCdnPurger;
 pub use config::{ConfigError, PublishConfig, PublishCredentials};
 pub use object_store::{InMemoryStore, ObjectMeta, ObjectStore, PutOpts, StoreError};
+pub use pointer::{
+    ObjectPointerStore, Pointer, PointerError, PointerState, PointerStore, POINTER_PREFIX,
+};
 pub use publish::{publish_dist, publish_pin, PublishError, PublishReport, TagIndex};
 pub use s3::S3Store;

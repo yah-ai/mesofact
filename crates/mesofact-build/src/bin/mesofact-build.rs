@@ -35,6 +35,29 @@ enum Command {
     },
     /// Install the locked dependency closure (bun.lock) into node_modules.
     Install { project: PathBuf },
+    /// Render one route of an already-built dist with explicit params/data
+    /// (no bundler, no install) — the revalidate / publish-once verb.
+    Render {
+        /// Project root containing mesofact.routes.ts (consulted only to
+        /// re-read declared data_inputs when --data is not given).
+        project: PathBuf,
+        /// Declared route pattern, e.g. "/releases" or "/p/:id".
+        #[arg(long)]
+        route: String,
+        /// Param value for each :param segment, repeatable: --param id=42.
+        #[arg(long = "param", value_name = "KEY=VALUE")]
+        params: Vec<String>,
+        /// JSON file whose top-level object becomes req.data verbatim,
+        /// overriding the route's declared data_inputs read.
+        #[arg(long)]
+        data: Option<PathBuf>,
+        /// Built output directory (default: <project>/dist).
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+        /// Print the HTML to stdout instead of writing dist/html/<key>.html.
+        #[arg(long)]
+        stdout: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -82,5 +105,66 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Render { project, route, params, data, out_dir, stdout } => {
+            let params = parse_params(&params)?;
+            let data = match data {
+                Some(path) => Some(read_data_file(&path)?),
+                None => None,
+            };
+            let outcome = mesofact_build::render::render_route(mesofact_build::render::RenderOptions {
+                project_root: project,
+                out_dir,
+                route,
+                params,
+                data,
+                write: !stdout,
+            })?;
+            if stdout {
+                println!("{}", outcome.html);
+            } else {
+                let path = outcome.html_path.expect("write mode emits a path");
+                println!(
+                    "mesofact render ok — {} → {}\n  key:  {}\n  tags: {}",
+                    outcome.url,
+                    path.display(),
+                    outcome.key,
+                    if outcome.tags.is_empty() { "(none)".to_string() } else { outcome.tags.join(", ") },
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn parse_params(raw: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut out = std::collections::BTreeMap::new();
+    for p in raw {
+        let (k, v) = p
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--param '{p}' is not KEY=VALUE"))?;
+        out.insert(k.to_string(), v.to_string());
+    }
+    Ok(out)
+}
+
+fn read_data_file(path: &std::path::Path) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("reading --data {}: {e}", path.display()))?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| anyhow::anyhow!("parsing --data {}: {e}", path.display()))?;
+    match parsed {
+        serde_json::Value::Object(map) => Ok(map),
+        other => anyhow::bail!(
+            "--data {} must be a JSON object at the top level (got {})",
+            path.display(),
+            match other {
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "boolean",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::String(_) => "string",
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Object(_) => unreachable!(),
+            }
+        ),
     }
 }

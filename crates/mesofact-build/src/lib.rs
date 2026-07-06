@@ -20,6 +20,7 @@ pub mod js;
 pub mod manifest_build;
 pub mod pipeline;
 pub mod prerender;
+pub mod render;
 pub mod route_config;
 pub mod route_key;
 pub mod source_infer;
@@ -27,3 +28,4 @@ pub mod ssr_prefix;
 pub mod tag_index;
 
 pub use pipeline::{build, BuildOptions, BuildResult, InstallMode};
+pub use render::{render_route, render_route_with, RenderOptions, RenderOutcome};
