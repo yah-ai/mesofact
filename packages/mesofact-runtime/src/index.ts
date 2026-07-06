@@ -81,6 +81,9 @@ export {
   hydrationScriptTag,
 } from "./hydration.js";
 
+export type { OpenGraph, TwitterCard, HeadLink, Head } from "./head.js";
+export { renderHead, weaveHead } from "./head.js";
+
 export { R2Adapter, r2, registerR2, clearR2Registry } from "./adapters/r2.js";
 export type { R2Config } from "./adapters/r2.js";
 

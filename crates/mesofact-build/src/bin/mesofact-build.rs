@@ -110,7 +110,21 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Render { project, route, params, data, out_dir, stdout } => {
+        Command::Render { project, route, params, data, out_dir, stdout, all } => {
+            if all {
+                let outcomes =
+                    mesofact_build::render::render_route_all(mesofact_build::render::RenderAllOptions {
+                        project_root: project,
+                        out_dir,
+                        route,
+                    })?;
+                println!("mesofact render ok — {} instance(s)", outcomes.len());
+                for o in &outcomes {
+                    let path = o.html_path.as_ref().expect("all-instances form always writes");
+                    println!("  {} → {}", o.url, path.display());
+                }
+                return Ok(());
+            }
             let params = parse_params(&params)?;
             let data = match data {
                 Some(path) => Some(read_data_file(&path)?),

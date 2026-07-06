@@ -3,7 +3,7 @@
 //! no rebuild, and prove the emitted bytes reflect the new inputs.
 
 use mesofact_build::pipeline::{build, BuildOptions, InstallMode};
-use mesofact_build::render::{render_route, RenderOptions};
+use mesofact_build::render::{render_route, render_route_all, RenderAllOptions, RenderOptions};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -164,6 +164,57 @@ fn deferred_route_builds_empty_and_renders_instances_at_publish_time() {
     assert!(outcome.html.contains("<h1>Hello Chat</h1>"), "html: {}", outcome.html);
     assert_eq!(outcome.tags, vec!["chat:abc123".to_string()]);
     assert!(dist.join("html/c_slug__abc123.html").exists());
+}
+
+/// The revalidate verb (`--all`): a feed change re-expands the instance set
+/// FRESH — new instances appear, all instances re-render with the new data —
+/// against the unchanged bundle. The project root at render time carries the
+/// mutated feed only; the dist came from the original build.
+#[test]
+fn render_all_reexpands_instances_from_fresh_data() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dist = tmp.path().join("native");
+    build_native("prerender-from-data", &dist);
+    assert!(dist.join("html/items_id__a.html").exists());
+    assert!(!dist.join("html/items_id__c.html").exists());
+
+    // Simulate the feed change: a re-titled, c added.
+    let fresh_root = tmp.path().join("proj");
+    std::fs::create_dir_all(fresh_root.join("data")).unwrap();
+    std::fs::write(
+        fresh_root.join("data/items.json"),
+        r#"{"items":[{"id":"a","title":"Alpha v2"},{"id":"b","title":"Bravo"},{"id":"c","title":"Charlie"}]}"#,
+    )
+    .unwrap();
+
+    let outcomes = render_route_all(RenderAllOptions {
+        project_root: fresh_root,
+        out_dir: Some(dist.clone()),
+        route: "/items/:id".to_string(),
+    })
+    .expect("all-instances revalidate render");
+
+    assert_eq!(outcomes.len(), 3);
+    let a = std::fs::read_to_string(dist.join("html/items_id__a.html")).unwrap();
+    assert!(a.contains("Alpha v2"), "a not re-rendered with fresh data: {a}");
+    let c = std::fs::read_to_string(dist.join("html/items_id__c.html")).unwrap();
+    assert!(c.contains("Charlie"), "new instance c missing: {c}");
+}
+
+/// `--all` on a deferred route is rejected — instances are publish-minted.
+#[test]
+fn render_all_rejects_deferred_routes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dist = tmp.path().join("native");
+    build_native("prerender-deferred", &dist);
+
+    let err = render_route_all(RenderAllOptions {
+        project_root: fixtures_root().join("prerender-deferred"),
+        out_dir: Some(dist),
+        route: "/c/:slug".to_string(),
+    })
+    .unwrap_err();
+    assert!(err.to_string().contains("minted at publish time"), "err: {err}");
 }
 
 #[test]

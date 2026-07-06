@@ -52,6 +52,69 @@ export function hydrationScriptTag(src) {
   return `<script type="module" src="${safeSrc}"></script>`;
 }
 
+// Port of packages/mesofact-runtime/src/head.ts (W270 §4). Keep byte-identical
+// with the TS original so both pipelines weave the same head bytes.
+function escapeHtmlText(value) {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function escapeHtmlAttr(value) {
+  return escapeHtmlText(value).replace(/"/g, "&quot;");
+}
+
+function metaTag(attr, key, content) {
+  return `<meta ${attr}="${key}" content="${escapeHtmlAttr(content)}">`;
+}
+
+export function renderHead(head) {
+  const tags = [];
+
+  if (head.title !== undefined) tags.push(`<title>${escapeHtmlText(head.title)}</title>`);
+  if (head.description !== undefined) tags.push(metaTag("name", "description", head.description));
+  if (head.canonical !== undefined) {
+    tags.push(`<link rel="canonical" href="${escapeHtmlAttr(head.canonical)}">`);
+  }
+  if (head.noindex) tags.push(`<meta name="robots" content="noindex">`);
+
+  const og = head.og;
+  if (og) {
+    if (og.title !== undefined) tags.push(metaTag("property", "og:title", og.title));
+    if (og.description !== undefined) {
+      tags.push(metaTag("property", "og:description", og.description));
+    }
+    if (og.type !== undefined) tags.push(metaTag("property", "og:type", og.type));
+    if (og.url !== undefined) tags.push(metaTag("property", "og:url", og.url));
+    if (og.image !== undefined) tags.push(metaTag("property", "og:image", og.image));
+    if (og.siteName !== undefined) tags.push(metaTag("property", "og:site_name", og.siteName));
+  }
+
+  const tw = head.twitter;
+  if (tw) {
+    if (tw.card !== undefined) tags.push(metaTag("name", "twitter:card", tw.card));
+    if (tw.title !== undefined) tags.push(metaTag("name", "twitter:title", tw.title));
+    if (tw.description !== undefined) {
+      tags.push(metaTag("name", "twitter:description", tw.description));
+    }
+    if (tw.image !== undefined) tags.push(metaTag("name", "twitter:image", tw.image));
+    if (tw.site !== undefined) tags.push(metaTag("name", "twitter:site", tw.site));
+    if (tw.creator !== undefined) tags.push(metaTag("name", "twitter:creator", tw.creator));
+  }
+
+  for (const link of head.links ?? []) {
+    tags.push(`<link rel="${escapeHtmlAttr(link.rel)}" href="${escapeHtmlAttr(link.href)}">`);
+  }
+
+  return tags.join("");
+}
+
+export function weaveHead(html, head) {
+  const markup = renderHead(head);
+  if (markup === "") return html;
+  const idx = html.toLowerCase().lastIndexOf("</head>");
+  if (idx === -1) return markup + html;
+  return html.slice(0, idx) + markup + html.slice(idx);
+}
+
 // Track-ctx: renders execute sequentially inside one V8 isolate, so a plain
 // stack stands in for AsyncLocalStorage (node:async_hooks does not exist
 // here). Adapter calls during an awaited render still see the right ctx.

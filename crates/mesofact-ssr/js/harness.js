@@ -4,7 +4,12 @@
 // here (not in Rust) so the bytes match the Bun pipeline's prerender.ts
 // exactly: same escape helper, same injection point, same error wording.
 
-import { escapeJsonForScriptTag, runInTrackCtx, SPA_STATE_SCRIPT_ID } from "@mesofact/runtime";
+import {
+  escapeJsonForScriptTag,
+  runInTrackCtx,
+  SPA_STATE_SCRIPT_ID,
+  weaveHead,
+} from "@mesofact/runtime";
 
 function pickRenderFn(mod) {
   if (typeof mod.render === "function") return mod.render;
@@ -87,16 +92,21 @@ globalThis.__mesofact = {
     const { value: result, ctx } = await runInTrackCtx(() => renderFn(input.req));
     assertRenderResult(input.route, input.url, result);
 
-    const html = input.hydration
-      ? injectHydration(
-          result.html,
-          input.hydration.buildId,
-          input.hydration.script,
-          result.hydration?.initial_state,
-        )
-      : result.html;
+    // Head weave first (into </head>), hydration weave second (into </body>);
+    // the two target disjoint regions of the document.
+    let html = result.head ? weaveHead(result.html, result.head) : result.html;
+    if (input.hydration) {
+      html = injectHydration(
+        html,
+        input.hydration.buildId,
+        input.hydration.script,
+        result.hydration?.initial_state,
+      );
+    }
 
     const combined = new Set([...(result.cache.tags ?? []), ...ctx.tags]);
-    return { html, tags: [...combined].sort() };
+    // `noindex` surfaces the head's robots directive so the SSG driver can
+    // drop this emission from the manifest-derived sitemap (W270 §4).
+    return { html, tags: [...combined].sort(), noindex: result.head?.noindex === true };
   },
 };

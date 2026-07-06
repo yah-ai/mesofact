@@ -2,6 +2,8 @@
 // See `.yah/docs/architecture/mesofact.md` §"The shared seam: one render
 // contract" and §"Request context — what Rust pre-resolves".
 
+import type { Head } from "./head.js";
+
 export type Region = string;
 
 export type User = {
@@ -71,6 +73,10 @@ export type RenderResult = {
   headers?: Record<string, string>;
   cache: CachePolicy;
   hydration?: Hydration;
+  // Typed <head> contract (W270 §4). Woven into the document head by the
+  // prerenderer / SSG dispatch; the framework owns all escaping. Optional —
+  // a render that manages its own <head> can omit it.
+  head?: Head;
 };
 
 export type RenderFn = (req: RenderRequest) => Promise<RenderResult>;
