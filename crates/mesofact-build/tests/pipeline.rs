@@ -97,6 +97,37 @@ fn static_assets_overlay_copied_and_listed() {
 }
 
 #[test]
+fn head_woven_into_shell_and_sitemap_filters_noindex_and_deferred() {
+    let tmp = tempfile::tempdir().unwrap();
+    let native = tmp.path().join("native");
+    let result = build_native("head-sitemap", &native);
+
+    // Head woven into the home shell — inside </head>, framework-escaped.
+    let home = std::fs::read_to_string(native.join("html/index.html")).unwrap();
+    let head_end = home.find("</head>").expect("home has a </head>");
+    let title_at = home.find("<title>Home &amp; &lt;friends&gt;</title>").expect("escaped title");
+    assert!(title_at < head_end, "head tags land before </head>: {home}");
+    assert!(home.contains(r#"<meta property="og:title" content="Home">"#), "og woven: {home}");
+    assert!(home.contains(r#"<link rel="canonical" href="https://example.test/">"#));
+    assert!(!home.contains("<friends>"), "raw angle brackets must not survive: {home}");
+
+    // noindex route still gets its robots meta woven.
+    let secret = std::fs::read_to_string(native.join("html/secret.html")).unwrap();
+    assert!(secret.contains(r#"<meta name="robots" content="noindex">"#));
+
+    // Sitemap: indexed static routes only.
+    let sitemap_path = result.sitemap_path.expect("site_url set → sitemap emitted");
+    assert!(sitemap_path.ends_with("sitemap.xml"), "sitemap at dist root: {sitemap_path:?}");
+    let sitemap = std::fs::read_to_string(&sitemap_path).unwrap();
+    assert!(sitemap.contains("<loc>https://example.test/</loc>"), "home in sitemap: {sitemap}");
+    assert!(sitemap.contains("<loc>https://example.test/docs</loc>"), "docs in sitemap");
+    assert!(!sitemap.contains("/secret"), "noindex route excluded: {sitemap}");
+    assert!(!sitemap.contains("/c/"), "deferred route excluded: {sitemap}");
+    // Deferred route prerendered nothing.
+    assert!(!native.join("html/c_slug.html").exists(), "deferred route emits no html");
+}
+
+#[test]
 fn ssr_broken_default_export_fails_probe() {
     let tmp = tempfile::tempdir().unwrap();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();

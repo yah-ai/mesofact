@@ -52,6 +52,8 @@ pub struct BuildResult {
     pub manifest_path: PathBuf,
     pub tag_index_path: PathBuf,
     pub html_paths: Vec<String>,
+    /// `dist/sitemap.xml` when `routes.site_url` is configured, else `None`.
+    pub sitemap_path: Option<PathBuf>,
 }
 
 pub fn default_build_id() -> String {
@@ -261,6 +263,18 @@ pub async fn build(opts: BuildOptions) -> Result<BuildResult> {
     let tag_index = build_tag_index(&build_id, &outcome.emissions);
     std::fs::write(&tag_index_path, format!("{}\n", serde_json::to_string_pretty(&tag_index)?))?;
 
+    // Sitemap: emitted only when the routes config names a `site_url` origin.
+    // Instance-addressed (deferred) routes and `noindex` renders were already
+    // filtered out when the SSG driver collected `sitemap_paths` (W270 §4).
+    let sitemap_path = match &routes_config.site_url {
+        Some(site_url) => {
+            let path = out_dir.join("sitemap.xml");
+            std::fs::write(&path, crate::sitemap::build_sitemap(site_url, &outcome.sitemap_paths))?;
+            Some(path)
+        }
+        None => None,
+    };
+
     // Scratch dir holds the routes bundle only; keep it out of dist
     // consumers' way.
     let _ = std::fs::remove_dir_all(&scratch);
@@ -271,6 +285,7 @@ pub async fn build(opts: BuildOptions) -> Result<BuildResult> {
         manifest_path,
         tag_index_path,
         html_paths: outcome.html_paths,
+        sitemap_path,
     })
 }
 

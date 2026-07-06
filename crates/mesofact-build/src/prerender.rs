@@ -44,8 +44,9 @@ pub fn prerender(
     let html_dir = out_dir.join("html");
     let mut emissions = Vec::new();
     let mut html_paths = Vec::new();
+    let mut sitemap_paths = Vec::new();
     if targets.is_empty() {
-        return Ok(PrerenderOutcome { emissions, html_paths });
+        return Ok(PrerenderOutcome { emissions, html_paths, sitemap_paths });
     }
     std::fs::create_dir_all(&html_dir)?;
 
@@ -88,15 +89,22 @@ pub fn prerender(
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
                 .unwrap_or_default();
+            let noindex = result.get("noindex").and_then(Value::as_bool).unwrap_or(false);
 
             let key = prerender_key(&r.route, &to_btree(params));
             std::fs::write(html_dir.join(format!("{key}.html")), html)
                 .with_context(|| format!("writing dist/html/{key}.html"))?;
             html_paths.push(format!("dist/html/{key}.html"));
+            // Sitemap: enumerable static routes only, honoring the render's
+            // robots directive (W270 §4). spa shells and (per is_empty above)
+            // deferred routes are excluded.
+            if r.mode == RouteMode::Static && !noindex {
+                sitemap_paths.push(url.clone());
+            }
             emissions.push(Emission { url, tags });
         }
     }
-    Ok(PrerenderOutcome { emissions, html_paths })
+    Ok(PrerenderOutcome { emissions, html_paths, sitemap_paths })
 }
 
 fn to_btree(params: &BTreeMap<String, String>) -> BTreeMap<String, String> {
