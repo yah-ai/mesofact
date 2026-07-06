@@ -10,6 +10,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./hydration": {
+      "types": "./dist/hydration.d.ts",
+      "import": "./dist/hydration.js"
     }
   },
   "files": [

@@ -9,6 +9,13 @@
 // has to know its own build_id + hashed client-script name (read from the
 // manifest at boot, or inject via env). Acceptable for the dogfood window;
 // revisit when more consumers exist.
+//
+// Also published standalone as the `@mesofact/runtime/hydration` subpath
+// export (R513-B11): this file must stay free of imports (or only import
+// other import-free, browser-safe modules) so a client bundle can read
+// `SPA_STATE_SCRIPT_ID` without dragging in the `@mesofact/runtime` barrel,
+// which re-exports server-only code (`track-ctx.ts` → `node:async_hooks`,
+// `config.ts` → `node:fs`) that rolldown can't tree-shake past.
 
 // Build-time SPA shell consumes this id; the prerender weaves it in.
 export const SPA_STATE_SCRIPT_ID = "__MESOFACT_STATE__" as const;

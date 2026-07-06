@@ -168,7 +168,13 @@ pub async fn build(opts: BuildOptions) -> Result<BuildResult> {
     // the resolved graph post-bundle. Unresolvable forbidden ids already
     // failed the bundle with the offending specifier in the error.
     for c in &client_bundles {
-        assert_no_forbidden_modules(&c.route, "client_entrypoint", &c.module_ids, browser_forbidden)?;
+        assert_no_forbidden_modules(
+            &c.route,
+            "client_entrypoint",
+            &c.module_ids,
+            &c.import_ids,
+            browser_forbidden,
+        )?;
     }
     for r in &routes_config.routes {
         if r.mode == RouteMode::Ssr && r.placement == Some(Placement::Edge) {
@@ -180,6 +186,7 @@ pub async fn build(opts: BuildOptions) -> Result<BuildResult> {
                 &r.route,
                 "ssr placement:\"edge\" entrypoint",
                 &b.module_ids,
+                &b.import_ids,
                 edge_forbidden,
             )?;
         }

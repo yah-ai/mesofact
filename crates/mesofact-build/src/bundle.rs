@@ -33,6 +33,12 @@ pub struct ServerBundle {
     pub absolute_path: PathBuf,
     /// Module ids that ended up in the bundle (for the host-lint pass).
     pub module_ids: Vec<String>,
+    /// Chunk-level `imports` (cross-chunk filenames + external module
+    /// specifiers, e.g. `node:fs`) for the host-lint pass. Rolldown
+    /// externalizes `node:*`/bare builtins rather than bundling them, and
+    /// externalized ids are NOT included in `module_ids` — this is where
+    /// they show up instead (R513-B11). See `assert_no_forbidden_modules`.
+    pub import_ids: Vec<String>,
 }
 
 pub struct ClientBundle {
@@ -42,6 +48,9 @@ pub struct ClientBundle {
     /// Code-split chunk filenames (sorted), also under `dist/hydrate/`.
     pub code_split: Vec<String>,
     pub module_ids: Vec<String>,
+    /// See `ServerBundle::import_ids` — same rationale, aggregated across
+    /// every chunk this client bundle emitted (entry + code-split).
+    pub import_ids: Vec<String>,
 }
 
 fn base_options(project_root: &Path) -> BundlerOptions {
@@ -114,6 +123,7 @@ pub async fn bundle_server_entrypoints(
             server_path: format!("dist/server/{key}.js"),
             absolute_path: server_dir.join(entry.filename.as_str()),
             module_ids: entry.module_ids.iter().map(|m| m.to_string()).collect(),
+            import_ids: entry.imports.iter().map(|m| m.to_string()).collect(),
         });
     }
     Ok(outputs)
@@ -152,9 +162,11 @@ pub async fn bundle_client_entrypoints(
         let mut script = None;
         let mut code_split = Vec::new();
         let mut module_ids = Vec::new();
+        let mut import_ids = Vec::new();
         for a in &assets {
             if let Output::Chunk(c) = a {
                 module_ids.extend(c.module_ids.iter().map(|m| m.to_string()));
+                import_ids.extend(c.imports.iter().map(|m| m.to_string()));
                 if c.is_entry {
                     script = Some(c.filename.to_string());
                 } else {
@@ -165,7 +177,7 @@ pub async fn bundle_client_entrypoints(
         code_split.sort();
         let script = script
             .ok_or_else(|| anyhow!("client bundle for route {route} produced no entry-point output"))?;
-        outputs.push(ClientBundle { route: route.clone(), script, code_split, module_ids });
+        outputs.push(ClientBundle { route: route.clone(), script, code_split, module_ids, import_ids });
     }
     Ok(outputs)
 }
@@ -217,16 +229,26 @@ pub fn edge_forbidden(module_id: &str) -> bool {
 /// ran (rolldown reports unresolved forbidden ids as bundle errors, which
 /// surface first with the same actionable specifier), and resolved-but-
 /// forbidden ids are caught here.
+///
+/// Two sources are scanned, not one (R513-B11): `module_ids` covers
+/// resolved-and-bundled files, but rolldown externalizes `node:*` and other
+/// bare builtins instead of bundling them — an externalized
+/// `import "node:fs"` never appears in `module_ids`, only in the chunk's
+/// `imports` list (`import_ids` here). A hydrate bundle that ships a
+/// side-effectful `node:*` import used to sail through this lint untouched.
 pub fn assert_no_forbidden_modules(
     route: &str,
     kind: &str,
     module_ids: &[String],
+    import_ids: &[String],
     forbidden: fn(&str) -> bool,
 ) -> Result<()> {
     // module ids are absolute paths for resolved files; bare/builtin ids
-    // stay as written (external or shimmed).
+    // stay as written (external or shimmed). import_ids mixes cross-chunk
+    // filenames (never forbidden) with external specifiers (may be).
     let offenders: BTreeMap<&str, ()> = module_ids
         .iter()
+        .chain(import_ids.iter())
         .filter(|id| forbidden(id))
         .map(|id| (id.as_str(), ()))
         .collect();
@@ -237,4 +259,65 @@ pub fn assert_no_forbidden_modules(
         "route {route}: {kind} reaches host-only module(s) {:?} (W173 server/client boundary lint)",
         offenders.keys().collect::<Vec<_>>()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn allows_clean_module_and_import_graph() {
+        let module_ids = strings(&["/proj/src/app.tsx", "/proj/src/host/browser.ts"]);
+        let import_ids = strings(&["route.chunk-abcdef.js"]);
+        assert_no_forbidden_modules("/", "client_entrypoint", &module_ids, &import_ids, browser_forbidden)
+            .expect("clean graph must pass");
+    }
+
+    #[test]
+    fn catches_forbidden_resolved_module_id() {
+        // Pre-existing behavior: a forbidden id that rolldown actually
+        // resolved and bundled shows up in `module_ids`.
+        let module_ids = strings(&["/proj/src/app.tsx", "pg"]);
+        let import_ids = strings(&[]);
+        let err = assert_no_forbidden_modules("/", "client_entrypoint", &module_ids, &import_ids, edge_forbidden)
+            .expect_err("bare `pg` import must be caught");
+        assert!(err.to_string().contains("pg"));
+    }
+
+    #[test]
+    fn catches_forbidden_id_reachable_only_via_externalized_import() {
+        // R513-B11 regression: rolldown externalizes `node:*` instead of
+        // bundling it, so the offending id never lands in `module_ids` — it
+        // only shows up in the chunk's `imports` (our `import_ids`). Before
+        // this fix, a hydrate bundle that side-effect-imported `node:fs`
+        // (transitively, via the `@mesofact/runtime` barrel) sailed through
+        // this lint because `module_ids` alone was clean.
+        let module_ids = strings(&["/proj/src/host/browser.ts"]);
+        let import_ids = strings(&["route.chunk-abcdef.js", "node:fs", "node:async_hooks"]);
+        let err =
+            assert_no_forbidden_modules("/", "client_entrypoint", &module_ids, &import_ids, browser_forbidden)
+                .expect_err("externalized node:* imports must be caught even when module_ids is clean");
+        let msg = err.to_string();
+        assert!(msg.contains("node:fs"), "expected node:fs in error, got: {msg}");
+        assert!(msg.contains("node:async_hooks"), "expected node:async_hooks in error, got: {msg}");
+    }
+
+    #[test]
+    fn edge_forbidden_also_scans_import_ids() {
+        let module_ids = strings(&[]);
+        let import_ids = strings(&["better-sqlite3"]);
+        let err = assert_no_forbidden_modules(
+            "/edge",
+            "ssr placement:\"edge\" entrypoint",
+            &module_ids,
+            &import_ids,
+            edge_forbidden,
+        )
+        .expect_err("db driver reachable only via import_ids must be caught");
+        assert!(err.to_string().contains("better-sqlite3"));
+    }
 }
