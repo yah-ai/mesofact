@@ -18,7 +18,7 @@ resolver = "2"
 strip = true
 
 [workspace.package]
-version = "0.8.18"
+version = "0.8.19"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"
