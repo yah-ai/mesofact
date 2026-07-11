@@ -2,10 +2,13 @@
 //! the server + watcher implementations.
 
 use std::path::PathBuf;
+#[cfg(feature = "ssr")]
 use std::sync::Arc;
 
 use clap::Parser;
-use mesofact_dev::{ssr, watcher, Server, SsrSpawnOptions, WatchOptions, DEFAULT_PORT};
+#[cfg(feature = "ssr")]
+use mesofact_dev::{ssr, SsrSpawnOptions};
+use mesofact_dev::{watcher, Server, WatchOptions, DEFAULT_PORT};
 use tracing::info;
 
 #[derive(Parser, Debug)]
@@ -83,24 +86,29 @@ async fn main() -> anyhow::Result<()> {
         .canonicalize()
         .unwrap_or_else(|_| args.workload.clone());
     let state_dir = workload_abs.join(".mesofact-dev");
+    #[cfg(feature = "ssr")]
     let ssr_slot = server.ssr_slot();
 
     // Attach an SSR child if the workload's manifest declares any mode:"ssr"
     // routes. ssr::spawn returns Ok(None) for static/SPA-only workloads (or
     // when no build has emitted a manifest yet); the no-bun path is preserved
-    // and the post-build hook below retries lazily.
-    let ssr_opts = SsrSpawnOptions::new(
-        workload_abs.clone(),
-        workload_abs.join("dist"),
-        state_dir.clone(),
-    );
-    match ssr::spawn(ssr_opts).await? {
-        Some(child) => {
-            info!(prefixes = ?child.prefixes(), "mesofact-dev ssr child attached");
-            ssr_slot.set(Some(Arc::new(child)));
-        }
-        None => {
-            info!("mesofact-dev: no SSR routes (or no manifest yet); static-only");
+    // and the post-build hook below retries lazily. (Compiled out entirely
+    // under --no-default-features: static/SPA/proxy serving without V8.)
+    #[cfg(feature = "ssr")]
+    {
+        let ssr_opts = SsrSpawnOptions::new(
+            workload_abs.clone(),
+            workload_abs.join("dist"),
+            state_dir.clone(),
+        );
+        match ssr::spawn(ssr_opts).await? {
+            Some(child) => {
+                info!(prefixes = ?child.prefixes(), "mesofact-dev ssr child attached");
+                ssr_slot.set(Some(Arc::new(child)));
+            }
+            None => {
+                info!("mesofact-dev: no SSR routes (or no manifest yet); static-only");
+            }
         }
     }
 
@@ -129,6 +137,8 @@ async fn main() -> anyhow::Result<()> {
     opts.initial_build = !args.no_initial_build;
     opts.build_env = dev_s3.env_vars();
 
+    let watcher_obj = mesofact_dev::Watcher::new(args.workload.clone(), pointer, opts);
+
     // Post-build hook: each successful rebuild rotates dist into
     // .mesofact-dev/gen-N/, so the SSR runtime must be re-spawned against
     // the new gen dir — V8's module cache would otherwise keep serving the
@@ -136,36 +146,37 @@ async fn main() -> anyhow::Result<()> {
     // whole SsrChild in the slot (no SIGKILL/respawn dance the bun era
     // needed); the prior Arc<SsrChild> drops, which joins the isolate
     // thread.
-    let slot_for_hook = ssr_slot.clone();
-    let workload_for_hook = workload_abs.clone();
-    let state_dir_for_hook = state_dir.clone();
-    let hook: watcher::PostBuildFn = Box::new(move |gen_dir: PathBuf| {
-        let slot = slot_for_hook.clone();
-        let workload = workload_for_hook.clone();
-        let state_dir = state_dir_for_hook.clone();
-        Box::pin(async move {
-            let opts = SsrSpawnOptions::new(workload, gen_dir, state_dir);
-            match ssr::spawn(opts).await? {
-                Some(child) => {
-                    info!(
-                        prefixes = ?child.prefixes(),
-                        "mesofact-dev ssr runtime re-spawned against new gen",
-                    );
-                    slot.set(Some(Arc::new(child)));
+    #[cfg(feature = "ssr")]
+    let watcher_obj = {
+        let slot_for_hook = ssr_slot.clone();
+        let workload_for_hook = workload_abs.clone();
+        let state_dir_for_hook = state_dir.clone();
+        let hook: watcher::PostBuildFn = Box::new(move |gen_dir: PathBuf| {
+            let slot = slot_for_hook.clone();
+            let workload = workload_for_hook.clone();
+            let state_dir = state_dir_for_hook.clone();
+            Box::pin(async move {
+                let opts = SsrSpawnOptions::new(workload, gen_dir, state_dir);
+                match ssr::spawn(opts).await? {
+                    Some(child) => {
+                        info!(
+                            prefixes = ?child.prefixes(),
+                            "mesofact-dev ssr runtime re-spawned against new gen",
+                        );
+                        slot.set(Some(Arc::new(child)));
+                    }
+                    None => {
+                        // Manifest declares no SSR routes; clear any prior child.
+                        slot.set(None);
+                    }
                 }
-                None => {
-                    // Manifest declares no SSR routes; clear any prior child.
-                    slot.set(None);
-                }
-            }
-            Ok(())
-        })
-    });
+                Ok(())
+            })
+        });
+        watcher_obj.with_post_build(hook)
+    };
 
-    let watcher_task = watcher::spawn(
-        mesofact_dev::Watcher::new(args.workload.clone(), pointer, opts)
-            .with_post_build(hook),
-    );
+    let watcher_task = watcher::spawn(watcher_obj);
 
     // Server owns the foreground; the spawned watcher continues until the
     // process exits.

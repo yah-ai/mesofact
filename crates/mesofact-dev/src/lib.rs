@@ -97,11 +97,13 @@
 
 pub mod proxy;
 pub mod s3;
+#[cfg(feature = "ssr")]
 pub mod ssr;
 pub mod watcher;
 
 pub use proxy::{ProxyMap, ProxyState};
 pub use s3::{DevS3, DEFAULT_BUCKET as DEV_S3_BUCKET};
+#[cfg(feature = "ssr")]
 pub use ssr::{
     ResiliencePolicy, RetryPolicy, SpawnOptions as SsrSpawnOptions, SsrChild, SsrSlot,
     DEFAULT_RESILIENCE_TIMEOUT_MS,
@@ -114,17 +116,21 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+#[cfg(feature = "ssr")]
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "ssr")]
+use axum::body::Body;
 use axum::{
-    body::Body,
     extract::{Request, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{any, get},
     Router,
 };
+#[cfg(feature = "ssr")]
 use futures::StreamExt;
+#[cfg(feature = "ssr")]
 use mesofact_ssr::{DispatchRequest, DispatchResponse};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
@@ -164,6 +170,7 @@ impl DistPointer {
 pub struct Server {
     workload: PathBuf,
     pointer: DistPointer,
+    #[cfg(feature = "ssr")]
     ssr: SsrSlot,
     proxy: Option<ProxyState>,
     config_json: Option<Arc<Vec<u8>>>,
@@ -172,6 +179,7 @@ pub struct Server {
 #[derive(Clone)]
 struct ServerState {
     pointer: DistPointer,
+    #[cfg(feature = "ssr")]
     ssr: SsrSlot,
     proxy: Option<ProxyState>,
     config_json: Option<Arc<Vec<u8>>>,
@@ -189,6 +197,7 @@ impl Server {
         Ok(Self {
             workload,
             pointer,
+            #[cfg(feature = "ssr")]
             ssr: SsrSlot::new(),
             proxy: None,
             config_json: None,
@@ -214,6 +223,7 @@ impl Server {
     /// Attach an SSR child. Requests whose path matches one of its prefixes
     /// are proxied to the bun subprocess; everything else falls through to
     /// the static handler. See [`ssr::spawn`] for the spawn contract.
+    #[cfg(feature = "ssr")]
     pub fn with_ssr(self, ssr: SsrChild) -> Self {
         self.ssr.set(Some(Arc::new(ssr)));
         self
@@ -245,6 +255,7 @@ impl Server {
     /// Clone of the SSR slot — hand to the watcher's post-build hook so it
     /// can swap in (or restart) the bun child on each successful rebuild.
     /// Reads via [`SsrSlot::current`] are lock-free for the request path.
+    #[cfg(feature = "ssr")]
     pub fn ssr_slot(&self) -> SsrSlot {
         self.ssr.clone()
     }
@@ -254,6 +265,7 @@ impl Server {
     pub fn router(&self) -> Router {
         let state = ServerState {
             pointer: self.pointer.clone(),
+            #[cfg(feature = "ssr")]
             ssr: self.ssr.clone(),
             proxy: self.proxy.clone(),
             config_json: self.config_json.clone(),
@@ -339,6 +351,7 @@ async fn serve_config_json(State(state): State<ServerState>) -> Response {
 
 async fn serve_dynamic(State(state): State<ServerState>, req: Request) -> Response {
     let uri_path = req.uri().path().to_string();
+    #[cfg(feature = "ssr")]
     if let Some(ssr) = state.ssr.current() {
         if ssr.matches(&uri_path) {
             let policy = ssr.policy_for(&uri_path);
@@ -363,6 +376,7 @@ async fn serve_dynamic(State(state): State<ServerState>, req: Request) -> Respon
 /// in-process SSR handler with W181 retry/timeout semantics wrapped around
 /// the call. Replaces the prior reqwest reverse-proxy hop (R434-F3) with a
 /// direct V8 dispatch — no port, no HTTP encoding, no streaming.
+#[cfg(feature = "ssr")]
 async fn dispatch_to_ssr(
     ssr: Arc<SsrChild>,
     policy: Option<ResiliencePolicy>,
@@ -490,6 +504,7 @@ async fn dispatch_to_ssr(
     (StatusCode::BAD_GATEWAY, msg).into_response()
 }
 
+#[cfg(feature = "ssr")]
 fn should_retry_status(status: u16, retry_on: &str) -> bool {
     match retry_on {
         "any" => status >= 400,
@@ -498,6 +513,7 @@ fn should_retry_status(status: u16, retry_on: &str) -> bool {
     }
 }
 
+#[cfg(feature = "ssr")]
 async fn collect_body(mut stream: axum::body::BodyDataStream) -> Result<Vec<u8>, axum::Error> {
     let mut buf = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -507,6 +523,7 @@ async fn collect_body(mut stream: axum::body::BodyDataStream) -> Result<Vec<u8>,
     Ok(buf)
 }
 
+#[cfg(feature = "ssr")]
 fn emit_telemetry(route: &str, attempts: u32, outcome: &str, latency: Duration) {
     info!(
         target: "mesofact_dev::resilience",
@@ -518,6 +535,7 @@ fn emit_telemetry(route: &str, attempts: u32, outcome: &str, latency: Duration) 
     );
 }
 
+#[cfg(feature = "ssr")]
 fn forward_response(resp: DispatchResponse) -> Response {
     let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut builder = Response::builder().status(status);
@@ -904,8 +922,10 @@ mod tests {
     // mock dispatch closure (no V8, no axum mock origin) and exercise the
     // router → SsrChild → handler chain end-to-end.
 
+    #[cfg(feature = "ssr")]
     use mesofact_ssr::DispatchResponse;
 
+    #[cfg(feature = "ssr")]
     fn mock_dispatch_resp(
         status: u16,
         body: &str,
@@ -923,6 +943,7 @@ mod tests {
 
     /// Verify item #1: an SSR-prefixed request reaches the in-process
     /// handler and its Response is forwarded back to the client.
+    #[cfg(feature = "ssr")]
     #[tokio::test]
     async fn ssr_proxied_path_returns_handler_response() {
         let workload = workload_with(&[("index.html", "<h1>static</h1>")]);
@@ -948,6 +969,7 @@ mod tests {
     }
 
     /// Verify item #2: with SSR wired, static routes still serve from disk.
+    #[cfg(feature = "ssr")]
     #[tokio::test]
     async fn ssr_does_not_swallow_static_routes() {
         let workload = workload_with(&[("index.html", "<h1>static</h1>")]);
@@ -970,6 +992,7 @@ mod tests {
     /// Verify item #5: segment-aware prefix matching at the router layer.
     /// `/api/health` (SSR) is dispatched; `/api/healthcheck` (no SSR match)
     /// falls through to static, which 404s on missing path.
+    #[cfg(feature = "ssr")]
     #[tokio::test]
     async fn ssr_segment_boundary_not_naive_starts_with() {
         let workload = workload_with(&[("404.html", "static-404")]);
@@ -1124,6 +1147,7 @@ mod tests {
 
     /// Parametric prefix coverage: /api/users/ matches /api/users/42 and the
     /// full pathname reaches the dispatch closure so it can decode the :id.
+    #[cfg(feature = "ssr")]
     #[tokio::test]
     async fn ssr_parametric_prefix_forwards_full_path() {
         let workload = workload_with(&[]);
@@ -1160,6 +1184,7 @@ mod tests {
 
     // ── W181 resilience tests ────────────────────────────────────────────
 
+    #[cfg(feature = "ssr")]
     fn retry_policy(attempts: u32, backoff_ms: Vec<u64>, retry_on: &str) -> ResiliencePolicy {
         ResiliencePolicy {
             retry: Some(RetryPolicy {
@@ -1176,6 +1201,7 @@ mod tests {
     /// Counter-backed flaky dispatch: returns 500 the first `ok_after` calls,
     /// then 201. Closure form lets resilience tests run without spinning up
     /// any axum mock origin.
+    #[cfg(feature = "ssr")]
     fn flaky_dispatch(
         ok_after: usize,
     ) -> (
@@ -1208,6 +1234,7 @@ mod tests {
     }
 
     /// Retry on 5xx: 3 attempts, dispatch returns 500/500/201 → 201.
+    #[cfg(feature = "ssr")]
     #[tokio::test]
     async fn resilience_retry_on_5xx_succeeds_on_third_attempt() {
         let workload = workload_with(&[]);
@@ -1236,6 +1263,7 @@ mod tests {
 
     /// `retry_on:"connection"` does NOT retry HTTP 5xx.
     /// Dispatch returns 500 once → proxy returns 500 verbatim, no retry.
+    #[cfg(feature = "ssr")]
     #[tokio::test]
     async fn resilience_no_retry_on_5xx_when_retry_on_connection() {
         let workload = workload_with(&[]);
@@ -1264,6 +1292,7 @@ mod tests {
 
     /// Per-attempt timeout fires: dispatch sleeps past `timeout_ms`,
     /// `tokio::time::timeout` cancels and treats it as a connection failure.
+    #[cfg(feature = "ssr")]
     #[tokio::test]
     async fn resilience_per_attempt_timeout_aborts_slow_dispatch() {
         let workload = workload_with(&[]);
@@ -1281,6 +1310,7 @@ mod tests {
     }
 
     /// No `resilience` block declared → single attempt, no retry on 5xx.
+    #[cfg(feature = "ssr")]
     #[tokio::test]
     async fn resilience_absent_falls_back_to_single_attempt() {
         let workload = workload_with(&[]);

@@ -18,6 +18,19 @@ path = "src/main.rs"
 [[bin]]
 name = "mesofact-serve"
 path = "src/serve.rs"
+required-features = ["ssr"]
+
+# `ssr` (default on) carries the in-process V8 runtime (mesofact-ssr →
+# deno_core → prebuilt librusty_v8). Static/SPA-only consumers can build with
+# `--no-default-features` and skip the V8 toolchain entirely — the same
+# posture the bun era guaranteed ("static/SPA-only workloads must keep
+# working without Bun installed"), carried over to the V8 era. Without `ssr`
+# the `mesofact-serve` container bin is not built and `mode:"ssr"` routes are
+# not dispatchable; static serving, the SPA hydrate path, the same-origin
+# reverse proxy, the watcher, and the dev S3 surface are all unaffected.
+[features]
+default = ["ssr"]
+ssr = ["dep:mesofact-ssr"]
 
 [dependencies]
 axum = { version = "0.7", default-features = false, features = ["http1", "tokio"] }
@@ -39,7 +52,7 @@ notify = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-mesofact-ssr = { path = "../mesofact-ssr" }
+mesofact-ssr = { path = "../mesofact-ssr", optional = true }
 futures = "0.3"
 # HTTP client for the same-origin reverse proxy (R513-F10) and the dev S3
 # round-trip test. Loopback http://127.0.0.1 only — no TLS feature.
