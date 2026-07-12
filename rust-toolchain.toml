@@ -1,0 +1,18 @@
+# R560-T2: oxc_transformer (pulled in transitively via rolldown -> oxc,
+# currently pinned at 0.137.0 in Cargo.lock) uses `if let` match-arm guards
+# (rust-lang/rust#51114) in crates/oxc_transformer/src/typescript/class.rs.
+# That feature was E0658-gated on every stable rustc up to 1.96 and only
+# stabilized in 1.97.0 (released 2026-07-07) — oxc-project/oxc's own
+# rust-toolchain.toml already pins channel = "1.97.0" for the same reason.
+#
+# This is a STABLE channel pin, not nightly: bumping oxc_transformer forward
+# doesn't help (0.138.0/0.139.0, the latest published versions as of
+# 2026-07-11, still use the same pattern), and no oxc_transformer version
+# since 0.92.0 avoids it, so downgrading far enough to dodge it would be
+# incompatible with the rolldown 1.1.2 version mesofact-build depends on.
+# Pinning here keeps the fix scoped to this independent workspace — it does
+# not affect the yah root workspace or other oss/* workspaces (none of them
+# depend on oxc/rolldown; see Cargo.lock greps in R560-T2).
+[toolchain]
+channel = "1.97.0"
+profile = "minimal"
