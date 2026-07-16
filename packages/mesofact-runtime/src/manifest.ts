@@ -32,7 +32,12 @@ export type ManifestHydration = {
 export type ManifestPrerender =
   | { params: ReadonlyArray<Record<string, string>> }
   | { from: string; query: string; param: string }
-  | { from_data: string; items_key: string; param: string };
+  | { from_data: string; items_key: string; param: string }
+  // Instance-addressed: params are minted after the build (publish time); the
+  // build emits the server bundle + manifest entry and prerenders nothing.
+  // Serving resolves each instance through the pointer store (W270 §2). Mirrors
+  // `Prerender::Deferred` in `crates/mesofact/src/manifest.rs`.
+  | { deferred: true };
 
 export type ManifestRoute = {
   route: string;

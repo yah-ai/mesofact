@@ -29,7 +29,7 @@
 //! @yah:verify("cargo test -p mesofact --test proxy")
 //! @yah:verify("cargo check --workspace")
 
-use crate::manifest::{Manifest, Requires, Route, RouteMode};
+use crate::manifest::{ErrorRoutes, Manifest, Requires, Route, RouteMode};
 use crate::proxy::cache::{cache_window, compose_key, CacheEntry, CacheState, KeyInputs, ResponseCache};
 use crate::proxy::metrics::Metrics;
 use crate::proxy::session::{SessionResolver, User};
@@ -184,11 +184,18 @@ pub async fn handle(State(state): State<SharedState>, req: Request) -> Response 
         Ssr(Box<SsrCall>),
     }
 
-    let (route_label, mode_label, metrics, plan) = {
+    let (route_label, mode_label, metrics, error_pages, plan) = {
         let st = state.read().await;
         let metrics = st.metrics.clone();
+        let error_pages = ErrorPages::from_state(&st);
         match st.matcher.at(&path) {
-            Err(_) => ("<unmatched>".to_string(), "none", metrics, Plan::NotFound),
+            Err(_) => (
+                "<unmatched>".to_string(),
+                "none",
+                metrics,
+                error_pages,
+                Plan::NotFound,
+            ),
             Ok(m) => {
                 let idx = *m.value;
                 let params = m
@@ -223,14 +230,16 @@ pub async fn handle(State(state): State<SharedState>, req: Request) -> Response 
                         trace: trace.header_value(),
                     })),
                 };
-                (route_label, mode_label, metrics, plan)
+                (route_label, mode_label, metrics, error_pages, plan)
             }
         }
     };
 
     let mut resp = match plan {
-        Plan::NotFound => not_found(),
-        Plan::Static { cdn, fallback } => dispatch_static(&path, cdn, fallback).await,
+        Plan::NotFound => error_pages.not_found().await,
+        Plan::Static { cdn, fallback } => {
+            dispatch_static(&path, cdn, fallback, &error_pages).await
+        }
         Plan::Ssr(call) => dispatch_ssr(*call).await,
     };
 
@@ -269,7 +278,12 @@ fn mode_str(mode: &RouteMode) -> &'static str {
 
 // ─── Mode 1 ───────────────────────────────────────────────────────────────
 
-async fn dispatch_static(path: &str, cdn: Option<String>, fallback: Option<PathBuf>) -> Response {
+async fn dispatch_static(
+    path: &str,
+    cdn: Option<String>,
+    fallback: Option<PathBuf>,
+    error_pages: &ErrorPages,
+) -> Response {
     // CDN redirect takes priority over local fallback.
     if let Some(cdn) = cdn {
         let target = format!("{cdn}{path}");
@@ -281,7 +295,7 @@ async fn dispatch_static(path: &str, cdn: Option<String>, fallback: Option<PathB
     }
 
     if let Some(dir) = fallback {
-        return serve_local(path, &dir).await;
+        return serve_local(path, &dir, error_pages).await;
     }
 
     // Neither CDN nor fallback configured — return 502.
@@ -295,7 +309,7 @@ async fn dispatch_static(path: &str, cdn: Option<String>, fallback: Option<PathB
 ///
 /// Path mapping: `/` → `index.html`, `/about` → `about.html`,
 /// then falls back to `{path}/index.html` for directory-style routes.
-async fn serve_local(path: &str, dir: &PathBuf) -> Response {
+async fn serve_local(path: &str, dir: &PathBuf, error_pages: &ErrorPages) -> Response {
     let relative = path.trim_start_matches('/');
 
     let candidates: Vec<PathBuf> = if relative.is_empty() {
@@ -321,12 +335,12 @@ async fn serve_local(path: &str, dir: &PathBuf) -> Response {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 tracing::error!("fallback read error for {}: {e}", candidate.display());
-                return internal_error();
+                return error_pages.internal_error().await;
             }
         }
     }
 
-    not_found()
+    error_pages.not_found().await
 }
 
 // ─── Mode 2 ───────────────────────────────────────────────────────────────
@@ -629,18 +643,94 @@ fn service_unavailable(retry_after: Duration) -> Response {
         .unwrap()
 }
 
-fn not_found() -> Response {
-    Response::builder()
-        .status(StatusCode::NOT_FOUND)
-        .body(Body::from("404 Not Found"))
-        .unwrap()
+/// Renders the manifest's `error_routes` pages (W270 §3, R595-T5), retiring the
+/// old hardcoded plaintext 404. Snapshotted from [`AppState`] under the read
+/// guard so the error builders can run after it is dropped.
+///
+/// `error_routes` values are ROUTE PATHS (e.g. `"/404"` → the `/404` static
+/// route), not asset keys — each is resolved to its prerendered asset in the
+/// local fallback dir exactly like a normal static request (`/404` →
+/// `404.html`). CDN-only deployments (no `fallback_dir`) fall back to plaintext:
+/// in prod the always-up edge (`@mesofact/edge`) serves the branded page, and
+/// this proxy sits behind it.
+#[derive(Clone)]
+struct ErrorPages {
+    routes: Option<ErrorRoutes>,
+    fallback_dir: Option<PathBuf>,
 }
 
-fn internal_error() -> Response {
-    Response::builder()
-        .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .body(Body::from("500 Internal Server Error"))
-        .unwrap()
+impl ErrorPages {
+    fn from_state(st: &AppState) -> Self {
+        Self {
+            routes: st.manifest.error_routes.clone(),
+            fallback_dir: st.fallback_dir.clone(),
+        }
+    }
+
+    async fn not_found(&self) -> Response {
+        self.render(StatusCode::NOT_FOUND, "404 Not Found").await
+    }
+
+    async fn internal_error(&self) -> Response {
+        self.render(StatusCode::INTERNAL_SERVER_ERROR, "500 Internal Server Error")
+            .await
+    }
+
+    /// Serve the branded error page for `status` from the fallback dir, or the
+    /// plaintext `default_text` when unconfigured / no fallback dir / page
+    /// missing on disk. Served *with* `status`.
+    async fn render(&self, status: StatusCode, default_text: &'static str) -> Response {
+        if let Some(dir) = &self.fallback_dir {
+            if let Some(route) = self
+                .routes
+                .as_ref()
+                .and_then(|r| error_route_for(r, status))
+            {
+                for candidate in route_to_candidates(route) {
+                    if let Ok(bytes) = tokio::fs::read(dir.join(&candidate)).await {
+                        return Response::builder()
+                            .status(status)
+                            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                            .body(Body::from(bytes))
+                            .unwrap();
+                    }
+                }
+            }
+        }
+        Response::builder()
+            .status(status)
+            .body(Body::from(default_text))
+            .unwrap()
+    }
+}
+
+/// The configured error route for an HTTP status class: 5xx → `5xx`, 404 → `404`.
+fn error_route_for(routes: &ErrorRoutes, status: StatusCode) -> Option<&str> {
+    if status.as_u16() >= 500 {
+        routes.server_error.as_deref()
+    } else if status == StatusCode::NOT_FOUND {
+        routes.not_found.as_deref()
+    } else {
+        None
+    }
+}
+
+/// A route path (`/404`) → the ordered relative asset candidates a prerendered
+/// static route emits — the same clean-URL rule [`serve_local`] uses.
+fn route_to_candidates(route: &str) -> Vec<PathBuf> {
+    let rel = route.trim_start_matches('/');
+    if rel.is_empty() {
+        return vec![PathBuf::from("index.html")];
+    }
+    let last = rel.rsplit('/').next().unwrap_or(rel);
+    if last.contains('.') {
+        vec![PathBuf::from(rel)]
+    } else {
+        vec![
+            PathBuf::from(format!("{rel}.html")),
+            PathBuf::from(rel).join("index.html"),
+        ]
+    }
 }
 
 // ─── small parsers ──────────────────────────────────────────────────────────

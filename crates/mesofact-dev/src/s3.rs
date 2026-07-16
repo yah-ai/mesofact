@@ -31,6 +31,12 @@ use tokio::net::TcpListener;
 /// Default dev bucket name. Workloads point `[sources.r2] bucket` here in dev.
 pub const DEFAULT_BUCKET: &str = "dev";
 
+/// Dummy credentials the surface accepts. SigV4-signing clients (the publisher's
+/// `S3Store`, the JS `R2Adapter`) sign with these; s3s verifies the signature
+/// against them. Handed to consumers verbatim via [`DevS3::env_vars`].
+const DEV_ACCESS_KEY: &str = "dev";
+const DEV_SECRET_KEY: &str = "dev";
+
 /// Coordinates of a running dev S3 surface, handed to consumers (build-child
 /// env, discovery file) so they can point an S3 client at it.
 #[derive(Debug, Clone)]
@@ -79,19 +85,42 @@ impl DevS3 {
         vec![
             ("R2_ENDPOINT".to_string(), self.endpoint.clone()),
             ("R2_BUCKET".to_string(), self.bucket.clone()),
-            ("R2_ACCESS_KEY_ID".to_string(), "dev".to_string()),
-            ("R2_SECRET_ACCESS_KEY".to_string(), "dev".to_string()),
+            ("R2_ACCESS_KEY_ID".to_string(), DEV_ACCESS_KEY.to_string()),
+            ("R2_SECRET_ACCESS_KEY".to_string(), DEV_SECRET_KEY.to_string()),
         ]
     }
 }
 
+/// Permissive access layer: allow every request, authenticated or not. s3s only
+/// consults `S3Access` when an auth provider is configured, so pairing this with
+/// [`SimpleAuth`](s3s::auth::SimpleAuth) means signed `dev/dev` requests verify
+/// AND unsigned loopback requests still pass — preserving the anonymous
+/// dev-appliance contract while unblocking SigV4 clients.
+struct AllowAllAccess;
+
+#[async_trait::async_trait]
+impl s3s::access::S3Access for AllowAllAccess {
+    async fn check(&self, _cx: &mut s3s::access::S3AccessContext<'_>) -> s3s::S3Result<()> {
+        Ok(())
+    }
+}
+
 fn build_service(root: &Path) -> Result<s3s::service::S3Service> {
+    use s3s::auth::SimpleAuth;
     use s3s::service::S3ServiceBuilder;
     // s3s_fs::Error doesn't impl std::error::Error, so map it by Display.
     let fs = s3s_fs::FileSystem::new(root)
         .map_err(|e| anyhow::anyhow!("opening s3s-fs at {}: {e:?}", root.display()))?;
-    // No `set_auth`: anonymous, single-tenant, loopback-only dev surface.
-    Ok(S3ServiceBuilder::new(fs).build())
+    let mut builder = S3ServiceBuilder::new(fs);
+    // Accept SigV4-signed requests. Without ANY auth provider s3s answers 501
+    // ("no authentication provider") to every *signed* request — which breaks
+    // the `S3Store`-based pointer/content reads the local publish→view loop
+    // needs (W270 §9), and the R2Adapter signs too. SimpleAuth verifies the
+    // dev/dev signature; AllowAllAccess keeps anonymous loopback access working,
+    // so the surface stays the single-tenant dev appliance it was.
+    builder.set_auth(SimpleAuth::from_single(DEV_ACCESS_KEY, DEV_SECRET_KEY));
+    builder.set_access(AllowAllAccess);
+    Ok(builder.build())
 }
 
 async fn serve_loop(listener: TcpListener, service: s3s::service::S3Service) {

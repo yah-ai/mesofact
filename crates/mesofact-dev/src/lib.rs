@@ -98,7 +98,11 @@
 pub mod proxy;
 pub mod s3;
 #[cfg(feature = "ssr")]
+pub mod revalidate;
+#[cfg(feature = "ssr")]
 pub mod ssr;
+#[cfg(feature = "ssr")]
+pub mod tenants;
 pub mod watcher;
 
 pub use proxy::{ProxyMap, ProxyState};
@@ -131,12 +135,20 @@ use axum::{
 #[cfg(feature = "ssr")]
 use futures::StreamExt;
 #[cfg(feature = "ssr")]
+use mesofact_publisher::ObjectStore;
+#[cfg(feature = "ssr")]
 use mesofact_ssr::{DispatchRequest, DispatchResponse};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
 /// Default port for the local-static provider slot.
 pub const DEFAULT_PORT: u16 = 4321;
+
+/// Cache-Control for content-addressed instance bytes (W270 §9), byte-parallel
+/// with the `@mesofact/edge` worker's `IMMUTABLE_CACHE_CONTROL`: a published
+/// instance page is immutable, the pointer is the only mutable object.
+#[cfg(feature = "ssr")]
+const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
 /// Shared, atomically-swappable pointer to the currently-served `html/`
 /// directory. Cheap to clone; reads take a short read-lock.
@@ -166,6 +178,18 @@ impl DistPointer {
     }
 }
 
+/// Logical identity of a running mesofact-dev: the `(service, component)` the
+/// camp/reconciler spawned it for. Served verbatim at `/__mesofact/info` so an
+/// adopter can confirm a listener on a given port is *its* dev server before
+/// adopting it, rather than blindly hijacking whatever holds the port (a
+/// cross-service host-port collision would otherwise silently serve the wrong
+/// site — R602-B4).
+#[derive(Clone, serde::Serialize)]
+pub struct Identity {
+    pub service: String,
+    pub component: String,
+}
+
 /// Static-file dev server for one `mesofact-static` workload.
 pub struct Server {
     workload: PathBuf,
@@ -174,6 +198,19 @@ pub struct Server {
     ssr: SsrSlot,
     proxy: Option<ProxyState>,
     config_json: Option<Arc<Vec<u8>>>,
+    /// `(service, component)` this dev server was spawned to serve, surfaced at
+    /// `/__mesofact/info` for the adopt identity-check (R602-B4). `None` when
+    /// the server was launched without an explicit identity (e.g. a hand-run
+    /// `mesofact-dev` from a terminal) — `/__mesofact/info` then 404s, and an
+    /// identity-checking adopter refuses to adopt it.
+    identity: Option<Identity>,
+    /// Object store for instance-addressed (deferred) route resolution
+    /// (W270 §9). Set → a static miss on a path matching a `prerender:
+    /// { deferred: true }` route in the manifest resolves through the pointer
+    /// store against this store, exactly as the `@mesofact/edge` worker
+    /// resolves against R2. `None` → deferred routes fall to the 404 page.
+    #[cfg(feature = "ssr")]
+    instance_store: Option<Arc<dyn ObjectStore>>,
 }
 
 #[derive(Clone)]
@@ -183,6 +220,9 @@ struct ServerState {
     ssr: SsrSlot,
     proxy: Option<ProxyState>,
     config_json: Option<Arc<Vec<u8>>>,
+    identity: Option<Arc<Identity>>,
+    #[cfg(feature = "ssr")]
+    instance_store: Option<Arc<dyn ObjectStore>>,
 }
 
 impl Server {
@@ -201,7 +241,20 @@ impl Server {
             ssr: SsrSlot::new(),
             proxy: None,
             config_json: None,
+            identity: None,
+            #[cfg(feature = "ssr")]
+            instance_store: None,
         })
+    }
+
+    /// Stamp this server with its logical `(service, component)` identity,
+    /// exposed at `/__mesofact/info` for the adopt identity-check (R602-B4).
+    pub fn with_identity(mut self, service: impl Into<String>, component: impl Into<String>) -> Self {
+        self.identity = Some(Identity {
+            service: service.into(),
+            component: component.into(),
+        });
+        self
     }
 
     pub fn workload(&self) -> &Path {
@@ -241,6 +294,18 @@ impl Server {
         self
     }
 
+    /// Attach the object store that backs instance-addressed (deferred) route
+    /// resolution (W270 §9). In dev this is an [`S3Store`](mesofact_publisher::S3Store)
+    /// pointed at the local dev-S3 surface ([`DevS3`]) — the same store the
+    /// publisher flips pointers and writes render-root bytes into, so the local
+    /// `publish → view` loop resolves a `/<slug>` the way the edge worker does
+    /// against R2. Absent → deferred routes fall through to the 404 page.
+    #[cfg(feature = "ssr")]
+    pub fn with_instance_store(mut self, store: Arc<dyn ObjectStore>) -> Self {
+        self.instance_store = Some(store);
+        self
+    }
+
     /// Serve `bytes` verbatim at `/config.json` (R513-F10, the F5 config seam).
     /// This is *runtime* config the camp emits at SPA-service spawn — NOT a
     /// build artifact, so it is injected by the server rather than dropped into
@@ -269,6 +334,9 @@ impl Server {
             ssr: self.ssr.clone(),
             proxy: self.proxy.clone(),
             config_json: self.config_json.clone(),
+            identity: self.identity.clone().map(Arc::new),
+            #[cfg(feature = "ssr")]
+            instance_store: self.instance_store.clone(),
         };
         let mut router = Router::new()
             // Unambiguous readiness probe for the yubaba pond/cloud reconciler
@@ -277,7 +345,13 @@ impl Server {
             // 404, but a dedicated 200 endpoint lets `ready_path` point
             // somewhere that means "the isolate booted" rather than "the
             // process is listening". Reserved path; never a route key.
-            .route("/__mesofact/health", get(health));
+            .route("/__mesofact/health", get(health))
+            // Logical-identity probe for the adopt path (R602-B4). Returns the
+            // `(service, component)` this dev server was spawned for so an
+            // adopter can confirm a port holds *its* server before adopting it,
+            // instead of blindly hijacking a colliding foreign listener. 404s
+            // when no identity was stamped. Reserved path; never a route key.
+            .route("/__mesofact/info", get(serve_info));
         // Server-injected runtime config (R513-F10). A dedicated route wins over
         // the catch-all only when config was supplied; otherwise `/config.json`
         // falls through to `serve_dynamic` (static 404 / SPA), so no stale
@@ -334,6 +408,22 @@ async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
+/// Logical-identity endpoint (R602-B4). Returns `{"service","component"}` as
+/// JSON when the server was stamped via [`Server::with_identity`]; 404
+/// otherwise so an identity-checking adopter refuses to adopt an unstamped (or
+/// foreign) listener rather than guessing.
+async fn serve_info(State(state): State<ServerState>) -> Response {
+    match state.identity {
+        Some(identity) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_vec(&*identity).unwrap_or_default(),
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// Serve the camp-emitted runtime config at `/config.json` (R513-F10). Only
 /// registered when `--config-json` was supplied; the bytes are served verbatim
 /// as `application/json`.
@@ -369,7 +459,26 @@ async fn serve_dynamic(State(state): State<ServerState>, req: Request) -> Respon
         }
     }
     let dist = state.pointer.current();
-    serve_from(&dist, &uri_path).await
+
+    // Static disk resolution first (the common hit). `None` = a normal-path
+    // miss, eligible for instance-addressed resolution then the error page.
+    if let Some(resp) = serve_static(&dist, &uri_path).await {
+        return resp;
+    }
+
+    // Static miss (W270 §9): consult the manifest once — a path matching an
+    // instance-addressed (`prerender: { deferred: true }`) route resolves
+    // through the pointer store against the local object store, mirroring the
+    // `@mesofact/edge` worker's resolution against R2. Everything else (and any
+    // build with no instance store wired) falls to the branded 404 page.
+    #[cfg(feature = "ssr")]
+    if let Some(store) = &state.instance_store {
+        if let Some(resp) = serve_instance(&dist, &uri_path, store.clone()).await {
+            return resp;
+        }
+    }
+
+    serve_error_page(&dist, StatusCode::NOT_FOUND).await
 }
 
 /// Materialise the axum Request into a `DispatchRequest`, then invoke the
@@ -561,9 +670,13 @@ fn forward_response(resp: DispatchResponse) -> Response {
         .unwrap_or_else(|_| (StatusCode::BAD_GATEWAY, "response build failed").into_response())
 }
 
-async fn serve_from(dist: &Path, uri_path: &str) -> Response {
+/// Resolve a request against the on-disk static tree. Returns `Some(response)`
+/// for a hit, a bad request, or a hydrate-bundle outcome (all terminal); `None`
+/// for a normal-path miss, which [`serve_dynamic`] resolves as an
+/// instance-addressed route (W270 §9) then the error page.
+async fn serve_static(dist: &Path, uri_path: &str) -> Option<Response> {
     let Some(rel) = sanitize(uri_path) else {
-        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+        return Some((StatusCode::BAD_REQUEST, "invalid path").into_response());
     };
 
     // Hydrate bundles live at <dist>/../hydrate/ (peer of html/).
@@ -574,18 +687,11 @@ async fn serve_from(dist: &Path, uri_path: &str) -> Response {
         let target = hydrate_dir.join(&hydrate_rel);
         if let Ok(bytes) = tokio::fs::read(&target).await {
             let mime = mime_for(&target);
-            return ([(header::CONTENT_TYPE, mime)], bytes).into_response();
+            return Some(([(header::CONTENT_TYPE, mime)], bytes).into_response());
         }
-        let not_found = dist.join("404.html");
-        if let Ok(bytes) = tokio::fs::read(&not_found).await {
-            return (
-                StatusCode::NOT_FOUND,
-                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                bytes,
-            )
-                .into_response();
-        }
-        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+        // A hydrate-bundle miss is an asset 404, not an instance-addressed
+        // route — resolve the error page directly (terminal).
+        return Some(serve_error_page(dist, StatusCode::NOT_FOUND).await);
     }
 
     let mut target = if rel.as_os_str().is_empty() {
@@ -599,7 +705,7 @@ async fn serve_from(dist: &Path, uri_path: &str) -> Response {
 
     if let Ok(bytes) = tokio::fs::read(&target).await {
         let mime = mime_for(&target);
-        return ([(header::CONTENT_TYPE, mime)], bytes).into_response();
+        return Some(([(header::CONTENT_TYPE, mime)], bytes).into_response());
     }
 
     // Clean-URL fallback: `/releases` → `releases.html`. Mirrors what the CDN
@@ -609,20 +715,203 @@ async fn serve_from(dist: &Path, uri_path: &str) -> Response {
         let with_html = target.with_extension("html");
         if let Ok(bytes) = tokio::fs::read(&with_html).await {
             let mime = mime_for(&with_html);
-            return ([(header::CONTENT_TYPE, mime)], bytes).into_response();
+            return Some(([(header::CONTENT_TYPE, mime)], bytes).into_response());
         }
     }
 
-    let not_found = dist.join("404.html");
-    if let Ok(bytes) = tokio::fs::read(&not_found).await {
-        return (
-            StatusCode::NOT_FOUND,
-            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-            bytes,
-        )
-            .into_response();
+    None
+}
+
+/// Resolve an instance-addressed (deferred) route (W270 §9), mirroring the
+/// `@mesofact/edge` worker's `serveInstance`. Returns `None` when the path is
+/// not an instance-addressed route (the manifest is absent, or no
+/// `prerender: { deferred: true }` route matches) so the caller falls through
+/// to the 404 page. When it matches, the pointer key is the request path minus
+/// its leading slash (`/c/abc` → `c/abc`) — the same key the publisher flipped:
+/// present → the render-root bytes (immutable cache); deleted → 410; absent or
+/// pointer-names-missing-bytes → 404; malformed record → 5xx.
+#[cfg(feature = "ssr")]
+async fn serve_instance(
+    dist: &Path,
+    uri_path: &str,
+    store: Arc<dyn ObjectStore>,
+) -> Option<Response> {
+    use mesofact_publisher::{ObjectPointerStore, PointerError, PointerState, PointerStore};
+
+    if !matches_deferred_route(dist, uri_path).await {
+        return None;
     }
-    (StatusCode::NOT_FOUND, "Not Found").into_response()
+
+    let key = uri_path.trim_start_matches('/');
+    let pointers = ObjectPointerStore::new(store.clone());
+    let resp = match pointers.resolve(key).await {
+        Ok(PointerState::Present(ptr)) => match store.get(&ptr.content_root).await {
+            Ok(Some(bytes)) => (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, mime_for(Path::new(&ptr.content_root))),
+                    (header::CACHE_CONTROL, IMMUTABLE_CACHE_CONTROL),
+                ],
+                bytes.to_vec(),
+            )
+                .into_response(),
+            // Pointer names bytes that aren't there — treat as not found.
+            Ok(None) => serve_error_page(dist, StatusCode::NOT_FOUND).await,
+            Err(_) => serve_error_page(dist, StatusCode::INTERNAL_SERVER_ERROR).await,
+        },
+        // Published then unpublished — 410 Gone, distinct from a never-existed 404.
+        Ok(PointerState::Deleted) => serve_error_page(dist, StatusCode::GONE).await,
+        Ok(PointerState::Absent) => serve_error_page(dist, StatusCode::NOT_FOUND).await,
+        // An un-mintable key never named a pointer → 404 (matches the worker,
+        // whose validateKey miss resolves `absent`).
+        Err(PointerError::InvalidKey(..)) => serve_error_page(dist, StatusCode::NOT_FOUND).await,
+        // Malformed record / unknown version → 5xx, never a guess.
+        Err(e) => {
+            warn!(key, error = %e, "instance pointer resolve failed");
+            serve_error_page(dist, StatusCode::INTERNAL_SERVER_ERROR).await
+        }
+    };
+    Some(resp)
+}
+
+/// True when `uri_path` matches an instance-addressed (`prerender:
+/// { deferred: true }`) route in the manifest beside the served dist dir.
+/// Mirrors the worker's `matchesDeferredRoute`; a lenient local slice keeps the
+/// read independent of the full [`mesofact::manifest::Manifest`] shape.
+#[cfg(feature = "ssr")]
+async fn matches_deferred_route(dist: &Path, uri_path: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct RoutesSlice {
+        #[serde(default)]
+        routes: Vec<RouteSlice>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RouteSlice {
+        route: String,
+        #[serde(default)]
+        prerender: Option<PrerenderSlice>,
+    }
+    #[derive(serde::Deserialize)]
+    struct PrerenderSlice {
+        #[serde(default)]
+        deferred: Option<bool>,
+    }
+
+    let Some(dir) = dist.parent() else {
+        return false;
+    };
+    let Ok(bytes) = tokio::fs::read(dir.join("manifest.json")).await else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_slice::<RoutesSlice>(&bytes) else {
+        return false;
+    };
+    manifest.routes.iter().any(|r| {
+        r.prerender.as_ref().and_then(|p| p.deferred).unwrap_or(false)
+            && match_route_pattern(&r.route, uri_path)
+    })
+}
+
+/// Segment-aware match of a route pattern (`/c/:slug`) against a concrete path
+/// (`/c/abc123`) — byte-parallel with the worker's `matchRoutePattern`. A
+/// `:param` segment matches any single non-empty segment; segment counts must
+/// be equal, so a trailing `:param` never swallows extra segments.
+#[cfg(feature = "ssr")]
+fn match_route_pattern(pattern: &str, pathname: &str) -> bool {
+    let pat: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
+    let path: Vec<&str> = pathname.split('/').filter(|s| !s.is_empty()).collect();
+    if pat.len() != path.len() {
+        return false;
+    }
+    pat.iter().zip(path.iter()).all(|(seg, actual)| {
+        if seg.starts_with(':') {
+            !actual.is_empty()
+        } else {
+            seg == actual
+        }
+    })
+}
+
+/// Serve the manifest's branded error page for `status` (W270 §3, R595-T5/T6),
+/// for parity with `mesofact-serve` and the `@mesofact/edge` worker's
+/// `errorResponse`. The manifest's `error_routes` values are ROUTE PATHS (e.g.
+/// `"/404"`) resolved to their prerendered asset the same way a normal static
+/// request resolves (`/404` → `404.html`). 5xx statuses draw from
+/// `error_routes."5xx"`; 4xx (incl. a 410 `Gone`, which uses the 404 page under
+/// its own status) draw from `error_routes."404"` then the conventional
+/// `404.html`. Falls back to plaintext. `dist` is the served html dir; the
+/// manifest sits beside it (`<dist>/../manifest.json`).
+async fn serve_error_page(dist: &Path, status: StatusCode) -> Response {
+    let is_server_error = status.is_server_error();
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(route) = read_error_route(dist, is_server_error).await {
+        let rel = route.trim_start_matches('/');
+        if rel.is_empty() {
+            candidates.push(PathBuf::from("index.html"));
+        } else if rel.rsplit('/').next().is_some_and(|s| s.contains('.')) {
+            candidates.push(PathBuf::from(rel));
+        } else {
+            candidates.push(PathBuf::from(format!("{rel}.html")));
+            candidates.push(PathBuf::from(rel).join("index.html"));
+        }
+    }
+    if !is_server_error {
+        // Conventional default — also the effective target of the common `/404`
+        // route, so unconfigured workloads keep serving `404.html` unchanged.
+        // Not used for 5xx (a 404 page is the wrong page for a server error).
+        candidates.push(PathBuf::from("404.html"));
+    }
+
+    for cand in &candidates {
+        if let Ok(bytes) = tokio::fs::read(dist.join(cand)).await {
+            return (
+                status,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                bytes,
+            )
+                .into_response();
+        }
+    }
+    (status, default_status_text(status)).into_response()
+}
+
+/// Plaintext fallback body when no branded error page resolves — mirrors the
+/// worker's `defaultStatusText`.
+fn default_status_text(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::GONE => "Gone",
+        s if s.is_server_error() => "Internal Server Error",
+        _ => "Not Found",
+    }
+}
+
+/// Read `error_routes."404"` (or `."5xx"` when `server_error`) from the manifest
+/// beside the served dist dir. Best-effort — a missing or unparseable manifest
+/// yields `None` (the conventional `404.html` default then applies for 4xx).
+/// Deliberately a minimal local slice so the static-serving path never depends
+/// on the optional `mesofact` crate (only the `ssr` feature pulls it in).
+async fn read_error_route(dist: &Path, server_error: bool) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct ManifestSlice {
+        error_routes: Option<ErrorRoutesSlice>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ErrorRoutesSlice {
+        #[serde(rename = "404")]
+        not_found: Option<String>,
+        #[serde(rename = "5xx")]
+        server_error: Option<String>,
+    }
+
+    let manifest_path = dist.parent()?.join("manifest.json");
+    let bytes = tokio::fs::read(&manifest_path).await.ok()?;
+    let manifest: ManifestSlice = serde_json::from_slice(&bytes).ok()?;
+    let routes = manifest.error_routes?;
+    if server_error {
+        routes.server_error
+    } else {
+        routes.not_found
+    }
 }
 
 /// Reject any URI path that would escape `dist/` or carry a NUL byte. Does
@@ -763,6 +1052,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn info_endpoint_returns_identity_when_stamped() {
+        // R602-B4: /__mesofact/info surfaces the (service, component) an adopter
+        // matches against before adopting the port.
+        let workload = workload_with(&[]);
+        let app = Server::from_workload(workload.path())
+            .unwrap()
+            .with_identity("scrabcake", "site")
+            .router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/__mesofact/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["service"], "scrabcake");
+        assert_eq!(body["component"], "site");
+    }
+
+    #[tokio::test]
+    async fn info_endpoint_404s_without_identity() {
+        // No identity stamped → 404, so an identity-checking adopter refuses to
+        // adopt an unstamped (or foreign) listener rather than guessing.
+        let workload = workload_with(&[]);
+        let app = Server::from_workload(workload.path()).unwrap().router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/__mesofact/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn serves_named_file() {
         let workload = workload_with(&[("404.html", "<h1>oops</h1>")]);
         let app = Server::from_workload(workload.path()).unwrap().router();
@@ -853,6 +1185,296 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(body_string(response).await.contains("Not Found"));
+    }
+
+    /// W270 §3 / R595-T5: a miss serves the manifest's `error_routes."404"`
+    /// route (`/custom-nf` → `custom-nf.html`) in preference to the default
+    /// `404.html`, for parity with mesofact-serve and the edge worker.
+    #[tokio::test]
+    async fn missing_path_uses_error_routes_from_manifest() {
+        let dir = tempdir().unwrap();
+        let dist = dir.path().join("dist");
+        let html = dist.join("html");
+        std::fs::create_dir_all(&html).unwrap();
+        std::fs::write(html.join("custom-nf.html"), "<h1>custom nf</h1>").unwrap();
+        std::fs::write(html.join("404.html"), "<h1>default 404</h1>").unwrap();
+        std::fs::write(
+            dist.join("manifest.json"),
+            r#"{"version":"1","build_id":"b","routes":[],"error_routes":{"404":"/custom-nf"}}"#,
+        )
+        .unwrap();
+
+        let app = Server::from_workload(dir.path()).unwrap().router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/does-not-exist")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(body_string(response).await.contains("custom nf"));
+    }
+
+    // ── Instance-addressed (deferred) route resolution (W270 §9, R595-T6) ────
+    //
+    // mesofact-dev resolves `prerender: { deferred: true }` routes through the
+    // PointerStore against the local object store, mirroring the @mesofact/edge
+    // worker's resolution against R2. These tests wire an InMemoryStore (the
+    // dev/prod S3Store is exercised E2E against the dev-S3 surface).
+
+    /// Build a workload whose manifest declares one deferred route (`/c/:slug`).
+    #[cfg(feature = "ssr")]
+    fn deferred_workload(extra_html: &[(&str, &str)], error_routes_json: &str) -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        let dist = dir.path().join("dist");
+        let html = dist.join("html");
+        std::fs::create_dir_all(&html).unwrap();
+        for (name, body) in extra_html {
+            std::fs::write(html.join(name), body).unwrap();
+        }
+        std::fs::write(
+            dist.join("manifest.json"),
+            format!(
+                r#"{{"version":"1","build_id":"b","routes":[{{"route":"/c/:slug","mode":"static","render_entrypoint":"dist/server/c_slug.js","cache_policy":{{"ttl":0}},"prerender":{{"deferred":true}}}}]{error_routes_json}}}"#
+            ),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[cfg(feature = "ssr")]
+    fn mem_store() -> std::sync::Arc<dyn ObjectStore> {
+        std::sync::Arc::new(mesofact_publisher::InMemoryStore::new())
+    }
+
+    #[cfg(feature = "ssr")]
+    async fn flip_instance(store: &std::sync::Arc<dyn ObjectStore>, key: &str, content_root: &str) {
+        use mesofact_publisher::{ObjectPointerStore, Pointer, PointerStore};
+        ObjectPointerStore::new(store.clone())
+            .flip(
+                key,
+                Pointer { content_root: content_root.into(), source_root: None, published_at: None },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "ssr")]
+    async fn put_bytes(store: &std::sync::Arc<dyn ObjectStore>, key: &str, body: &'static [u8]) {
+        use mesofact_publisher::PutOpts;
+        store
+            .put(
+                key,
+                axum::body::Bytes::from_static(body),
+                PutOpts { content_type: "text/html".into(), content_hash: "h".into(), cache_control: None },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Present pointer → the render-root bytes, immutable cache, html mime.
+    #[cfg(feature = "ssr")]
+    #[tokio::test]
+    async fn deferred_route_present_serves_instance_bytes() {
+        let dir = deferred_workload(&[], "");
+        let store = mem_store();
+        flip_instance(&store, "c/abc", "content/abc.html").await;
+        put_bytes(&store, "content/abc.html", b"<h1>chat abc</h1>").await;
+
+        let app = Server::from_workload(dir.path())
+            .unwrap()
+            .with_instance_store(store)
+            .router();
+        let response = app
+            .oneshot(Request::builder().uri("/c/abc").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("cache-control").unwrap(),
+            "public, max-age=31536000, immutable"
+        );
+        assert!(response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("text/html"));
+        assert!(body_string(response).await.contains("chat abc"));
+    }
+
+    /// Deleted pointer (tombstone) → 410 Gone, distinct from a never-existed 404;
+    /// the branded 404 page is served under the 410 status.
+    #[cfg(feature = "ssr")]
+    #[tokio::test]
+    async fn deferred_route_deleted_returns_410() {
+        use mesofact_publisher::{ObjectPointerStore, PointerStore};
+        let dir = deferred_workload(&[("404.html", "<h1>gone-page</h1>")], "");
+        let store = mem_store();
+        flip_instance(&store, "c/abc", "content/abc.html").await;
+        ObjectPointerStore::new(store.clone())
+            .delete("c/abc", Some("2026-07-14T00:00:00Z".into()))
+            .await
+            .unwrap();
+
+        let app = Server::from_workload(dir.path())
+            .unwrap()
+            .with_instance_store(store)
+            .router();
+        let response = app
+            .oneshot(Request::builder().uri("/c/abc").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GONE);
+        assert!(body_string(response).await.contains("gone-page"));
+    }
+
+    /// Absent pointer on a deferred-route path → 404 branded page.
+    #[cfg(feature = "ssr")]
+    #[tokio::test]
+    async fn deferred_route_absent_returns_404() {
+        let dir = deferred_workload(&[("404.html", "<h1>nf</h1>")], "");
+        let store = mem_store();
+        let app = Server::from_workload(dir.path())
+            .unwrap()
+            .with_instance_store(store)
+            .router();
+        let response = app
+            .oneshot(Request::builder().uri("/c/never").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(body_string(response).await.contains("nf"));
+    }
+
+    /// A path that does NOT match the deferred route pattern is never routed
+    /// through the pointer store — it 404s as an ordinary static miss even with
+    /// an instance store wired (segment-count guard: `/c/a/b` ≠ `/c/:slug`).
+    #[cfg(feature = "ssr")]
+    #[tokio::test]
+    async fn non_deferred_path_not_routed_through_pointer_store() {
+        let dir = deferred_workload(&[("404.html", "<h1>nf</h1>")], "");
+        let store = mem_store();
+        // A pointer exists at this exact key, but the path has an extra segment
+        // so it must not match `/c/:slug` — the store is never consulted.
+        flip_instance(&store, "c/a/b", "content/ab.html").await;
+        put_bytes(&store, "content/ab.html", b"<h1>should not serve</h1>").await;
+
+        let app = Server::from_workload(dir.path())
+            .unwrap()
+            .with_instance_store(store)
+            .router();
+        let response = app
+            .oneshot(Request::builder().uri("/c/a/b").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(body_string(response).await.contains("nf"));
+    }
+
+    /// Malformed pointer record (unknown version) → 5xx, drawing the branded
+    /// `error_routes."5xx"` page (never the 404 page).
+    #[cfg(feature = "ssr")]
+    #[tokio::test]
+    async fn deferred_route_malformed_record_returns_5xx() {
+        let dir = deferred_workload(
+            &[("5xx.html", "<h1>boom</h1>"), ("404.html", "<h1>nf</h1>")],
+            r#","error_routes":{"5xx":"/5xx"}"#,
+        );
+        let store = mem_store();
+        // Write a raw record the resolver can't read (version 99).
+        put_bytes(
+            &store,
+            "p/c/bad",
+            br#"{"v":99,"pointer":{"content_root":"x"}}"#,
+        )
+        .await;
+
+        let app = Server::from_workload(dir.path())
+            .unwrap()
+            .with_instance_store(store)
+            .router();
+        let response = app
+            .oneshot(Request::builder().uri("/c/bad").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body_string(response).await.contains("boom"));
+    }
+
+    /// Deferred resolution requires an instance store — without one wired, a
+    /// deferred-route path is an ordinary 404 (the reconciler / prod worker owns
+    /// resolution there, not this static path).
+    #[cfg(feature = "ssr")]
+    #[tokio::test]
+    async fn deferred_route_without_store_is_404() {
+        let dir = deferred_workload(&[("404.html", "<h1>nf</h1>")], "");
+        let app = Server::from_workload(dir.path()).unwrap().router();
+        let response = app
+            .oneshot(Request::builder().uri("/c/abc").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(body_string(response).await.contains("nf"));
+    }
+
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn match_route_pattern_is_segment_aware() {
+        assert!(match_route_pattern("/c/:slug", "/c/abc"));
+        assert!(match_route_pattern("/a/:x/b/:y", "/a/1/b/2"));
+        assert!(match_route_pattern("/about", "/about"));
+        assert!(match_route_pattern("/", "/"));
+        // Trailing :param does not swallow extra segments.
+        assert!(!match_route_pattern("/c/:slug", "/c/abc/def"));
+        // Segment counts must be equal.
+        assert!(!match_route_pattern("/c/:slug", "/c"));
+        // Literal mismatch.
+        assert!(!match_route_pattern("/about", "/abou"));
+    }
+
+    /// Real-path smoke (W270 §9): resolve a deferred route through an
+    /// [`S3Store`](mesofact_publisher::S3Store) pointed at the live dev-S3
+    /// surface — the exact wiring `main.rs` uses. Proves the SigV4-signed
+    /// requests are accepted by the anonymous `s3s-fs` surface, so the local
+    /// `publish → view` loop resolves over real HTTP, not just the
+    /// InMemoryStore the other tests use.
+    #[cfg(feature = "ssr")]
+    #[tokio::test]
+    async fn deferred_route_resolves_through_dev_s3_store() {
+        use mesofact_publisher::{ObjectStore, S3Store};
+
+        let dir = deferred_workload(&[], "");
+        let dev = DevS3::start(dir.path().join("s3-surface"), DEV_S3_BUCKET)
+            .await
+            .unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(
+            S3Store::new(dev.endpoint.clone(), dev.bucket.clone(), "auto", "dev", "dev").unwrap(),
+        );
+
+        // Publisher-side: flip the pointer + write the render-root bytes, both
+        // through the S3Store (the same store the server resolves against).
+        flip_instance(&store, "c/xyz", "content/xyz.html").await;
+        put_bytes(&store, "content/xyz.html", b"<h1>via dev s3</h1>").await;
+
+        let app = Server::from_workload(dir.path())
+            .unwrap()
+            .with_instance_store(store)
+            .router();
+        let response = app
+            .oneshot(Request::builder().uri("/c/xyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("cache-control").unwrap(),
+            "public, max-age=31536000, immutable"
+        );
+        assert!(body_string(response).await.contains("via dev s3"));
     }
 
     #[tokio::test]

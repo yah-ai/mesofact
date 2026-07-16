@@ -631,6 +631,58 @@ async fn unregistered_path_returns_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// W270 §3 / R595-T5: an unmatched path renders the manifest's `error_routes`
+/// page from the local fallback dir instead of the old plaintext 404. The
+/// `error_routes."404"` value is a ROUTE PATH (`/404`) resolved to its
+/// prerendered asset (`404.html`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn not_found_renders_error_routes_page_from_route_path() {
+    if !bun_available() {
+        eprintln!("skipping: bun not on PATH");
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("404.html"), "<h1>branded 404</h1>").unwrap();
+
+    let mut manifest = static_manifest("/hello");
+    manifest.error_routes = Some(mesofact::manifest::ErrorRoutes {
+        not_found: Some("/404".to_string()),
+        server_error: None,
+    });
+
+    let (app, _) = make_app_no_pool(manifest, None, Some(dir.path().to_path_buf())).await;
+    let resp = app
+        .oneshot(Request::builder().uri("/nope").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("branded 404"));
+}
+
+/// No fallback dir (CDN-only prod) → the proxy can't read a page, so it falls
+/// back to plaintext; the always-up edge serves the branded page in prod.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn not_found_without_fallback_dir_is_plaintext() {
+    if !bun_available() {
+        eprintln!("skipping: bun not on PATH");
+        return;
+    }
+    let mut manifest = static_manifest("/hello");
+    manifest.error_routes = Some(mesofact::manifest::ErrorRoutes {
+        not_found: Some("/404".to_string()),
+        server_error: None,
+    });
+    let (app, _) = make_app_no_pool(manifest, None, None).await;
+    let resp = app
+        .oneshot(Request::builder().uri("/nope").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&body), "404 Not Found");
+}
+
 // ─── Manifest reload test ────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
