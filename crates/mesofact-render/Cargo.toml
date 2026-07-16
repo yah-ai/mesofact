@@ -1,0 +1,24 @@
+# Bundler-free render path (data → HTML against a prebuilt dist/), extracted
+# from mesofact-build (W225 §2/§3) so lean serve / revalidate-receiver
+# consumers can link render + SsgRuntime WITHOUT pulling the bundler
+# (rolldown / lightningcss). Mirrors the earlier extraction of mesofact-ssr.
+# The crate boundary — not a feature gate — is deliberate: feature unification
+# across a build graph could re-link the bundler into a lean binary; a separate
+# crate makes rolldown physically unreachable from `serve`.
+
+[package]
+name = "mesofact-render"
+description = "Bundler-free render path (data → HTML against a prebuilt dist) — extracted from mesofact-build so lean serve/receiver consumers link render without rolldown/lightningcss (W225 §2/§3)."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mesofact = { path = "../mesofact", version = "0.8.19" }
+mesofact-ssr = { path = "../mesofact-ssr", version = "0.8.19" }
+
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }

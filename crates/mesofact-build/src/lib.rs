@@ -14,22 +14,23 @@ pub mod assets;
 pub mod bundle;
 pub mod config;
 pub mod css;
-pub mod data;
 pub mod install;
-pub mod js;
 pub mod manifest_build;
 pub mod pipeline;
 pub mod prerender;
-pub mod render;
-pub mod route_config;
-pub mod route_key;
 pub mod sitemap;
 pub mod source_infer;
 pub mod ssr_prefix;
 pub mod tag_index;
 
-pub use pipeline::{build, BuildOptions, BuildResult, InstallMode};
-pub use render::{
+// The render path was extracted to the bundler-free `mesofact-render` crate
+// (W225 §2/§3). Re-exported here so `crate::{data,js,render,route_config,
+// route_key}` still resolve for this crate's build modules and for external
+// consumers that imported `mesofact_build::render::*` etc.
+pub use mesofact_render::{data, js, render, route_config, route_key};
+
+pub use mesofact_render::render::{
     render_route, render_route_all, render_route_all_with, render_route_with, RenderAllOptions,
     RenderOptions, RenderOutcome,
 };
+pub use pipeline::{build, BuildOptions, BuildResult, InstallMode};

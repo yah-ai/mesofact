@@ -30,7 +30,12 @@ required-features = ["ssr"]
 # reverse proxy, the watcher, and the dev S3 surface are all unaffected.
 [features]
 default = ["ssr"]
-ssr = ["dep:mesofact-ssr"]
+# `ssr` also carries the revalidate receiver (src/revalidate.rs): the
+# ephemeral render → publish path (W225 §3/§4, the mesofact-native replacement
+# for almanac-serve). It needs render (mesofact-render → V8) + publish
+# (mesofact-publisher); both are bundler-free, so the receiver never links
+# rolldown (§3).
+ssr = ["dep:mesofact-ssr", "dep:mesofact-render", "dep:mesofact-publisher", "dep:mesofact"]
 
 [dependencies]
 axum = { version = "0.7", default-features = false, features = ["http1", "tokio"] }
@@ -41,6 +46,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs"
 # camp-only — absent from mesofact-dev's tree).
 s3s = "0.13"
 s3s-fs = "0.13"
+# Impl of s3s::access::S3Access for the dev-S3 surface (async-trait method).
+async-trait = "0.1"
 hyper-util = { version = "0.1", features = ["server", "tokio", "http1"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
@@ -53,6 +60,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 mesofact-ssr = { path = "../mesofact-ssr", optional = true }
+# Revalidate receiver deps (behind `ssr`). Both are bundler-free (no rolldown /
+# lightningcss) — see mesofact-render's crate doc (W225 §2/§3).
+mesofact = { path = "../mesofact", optional = true }
+mesofact-render = { path = "../mesofact-render", optional = true }
+mesofact-publisher = { path = "../mesofact-publisher", optional = true }
 futures = "0.3"
 # HTTP client for the same-origin reverse proxy (R513-F10) and the dev S3
 # round-trip test. Loopback http://127.0.0.1 only — no TLS feature.

@@ -43,6 +43,18 @@ struct Args {
     /// serving the same bundle never inherits a stale `env:ci` config.
     #[arg(long, value_name = "PATH")]
     config_json: Option<PathBuf>,
+
+    /// Logical service this dev server serves (R602-B4). Paired with
+    /// `--component`, it's surfaced at `/__mesofact/info` so the cloud
+    /// reconciler can confirm a listener on the configured port is *this*
+    /// server before adopting it — refusing a colliding foreign listener
+    /// instead of silently hijacking it.
+    #[arg(long, requires = "component")]
+    service: Option<String>,
+
+    /// Logical component id this dev server serves (R602-B4). See `--service`.
+    #[arg(long, requires = "service")]
+    component: Option<String>,
 }
 
 #[tokio::main]
@@ -57,6 +69,15 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let mut server = Server::from_workload(&args.workload)?;
+
+    // Logical identity (R602-B4): stamp the server with the (service, component)
+    // the reconciler spawned it for so `/__mesofact/info` lets the adopt path
+    // verify the port holds *this* server. clap's `requires` couples the pair,
+    // so both-or-neither is guaranteed here.
+    if let (Some(service), Some(component)) = (&args.service, &args.component) {
+        info!(service, component, "mesofact-dev: identity stamped (R602-B4)");
+        server = server.with_identity(service.clone(), component.clone());
+    }
 
     // Same-origin reverse proxy (R513-F10): forward `/auth/*` etc. to the
     // camp-vended backend ports so the dashboard E2E (Option B) browser stays
@@ -120,6 +141,27 @@ async fn main() -> anyhow::Result<()> {
     // tracked under R490-F7.)
     let dev_s3 = mesofact_dev::DevS3::start(state_dir.join("s3"), mesofact_dev::DEV_S3_BUCKET).await?;
     info!(endpoint = %dev_s3.endpoint, bucket = %dev_s3.bucket, "dev S3 surface ready");
+
+    // Instance-addressed (deferred) route resolution (W270 §9): point an
+    // S3Store at the dev-S3 surface so a static miss on a `prerender:
+    // { deferred: true }` route resolves through the pointer store against the
+    // same local bucket the publisher flips into — the local mirror of the edge
+    // worker's R2 resolution. Region "auto" + dummy creds match R2 / the
+    // anonymous dev surface (s3s skips signature verification).
+    #[cfg(feature = "ssr")]
+    {
+        use mesofact_publisher::{ObjectStore, S3Store};
+        match S3Store::new(dev_s3.endpoint.clone(), dev_s3.bucket.clone(), "auto", "dev", "dev") {
+            Ok(store) => {
+                server = server.with_instance_store(Arc::new(store) as Arc<dyn ObjectStore>);
+                info!("mesofact-dev: instance-addressed route resolution wired to dev S3 (W270 §9)");
+            }
+            Err(e) => {
+                info!(error = %e, "mesofact-dev: could not build dev pointer store; deferred routes 404")
+            }
+        }
+    }
+
     if let Err(e) = std::fs::write(
         state_dir.join("s3.json"),
         serde_json::json!({ "endpoint": dev_s3.endpoint, "bucket": dev_s3.bucket }).to_string(),

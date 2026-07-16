@@ -2954,6 +2954,7 @@ dependencies = [
  "flate2",
  "lightningcss",
  "mesofact",
+ "mesofact-render",
  "mesofact-ssr",
  "reqwest",
  "rolldown",
@@ -2973,10 +2974,14 @@ name = "mesofact-dev"
 version = "0.8.19"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum 0.7.9",
  "clap",
  "futures",
  "hyper-util",
+ "mesofact",
+ "mesofact-publisher",
+ "mesofact-render",
  "mesofact-ssr",
  "notify",
  "reqwest",
@@ -3013,6 +3018,17 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "mesofact-render"
+version = "0.8.19"
+dependencies = [
+ "anyhow",
+ "mesofact",
+ "mesofact-ssr",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

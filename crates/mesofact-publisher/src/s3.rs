@@ -252,10 +252,19 @@ impl S3Store {
 
         let parsed = reqwest::Url::parse(url)
             .map_err(|e| StoreError::Transport(format!("parse url {url}: {e}")))?;
-        let host = parsed
+        let host_str = parsed
             .host_str()
-            .ok_or_else(|| StoreError::Transport(format!("no host in {url}")))?
-            .to_string();
+            .ok_or_else(|| StoreError::Transport(format!("no host in {url}")))?;
+        // SigV4 must sign the exact `Host` header on the wire. reqwest includes
+        // an explicit non-default port in `Host` (e.g. a loopback dev endpoint,
+        // MinIO, localstack) but omits it for the scheme default (443/80).
+        // `Url::port()` returns `Some` only for a non-default port, so it tracks
+        // reqwest's behavior — signing bare `host_str()` here would drop the
+        // port and 403 (SignatureDoesNotMatch) against any custom-port endpoint.
+        let host = match parsed.port() {
+            Some(port) => format!("{host_str}:{port}"),
+            None => host_str.to_string(),
+        };
         let path = if parsed.path().is_empty() {
             "/".to_string()
         } else {

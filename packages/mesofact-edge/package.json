@@ -1,0 +1,27 @@
+{
+  "name": "@mesofact/edge",
+  "version": "0.1.0",
+  "description": "Manifest-driven Cloudflare Worker for mesofact sites: static / SPA / SSR routing, error_routes, and pointer-store resolution for instance-addressed routes. The versioned serving artifact yah's cloud reconciler deploys.",
+  "license": "MIT OR Apache-2.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/router.ts",
+  "exports": {
+    ".": "./src/router.ts"
+  },
+  "files": [
+    "src",
+    "dist"
+  ],
+  "scripts": {
+    "build": "bun build src/router.ts --outfile dist/router.bundle.js --format=esm --target=browser",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test tests/"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240529.0",
+    "@types/bun": "^1.1.0",
+    "miniflare": "^3.20240610.1",
+    "typescript": "^5.8.3"
+  }
+}
