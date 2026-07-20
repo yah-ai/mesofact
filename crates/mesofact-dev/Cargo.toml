@@ -59,6 +59,12 @@ notify = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+# W272 bundle-manifest types (R599-F1) for the `mesofact-serve --bundle` static
+# path (R599-F3). `default-features = false` = types-only (serde + blake3 + toml),
+# so the bundle server never drags the object-store / reqwest `store` weight —
+# and the whole static bundle path builds V8-free (no `ssr` feature). Path dep
+# across the subcamp boundary; the crate isn't published yet.
+yah-mesofact-bundle = { path = "../../../yah-base/crates/mesofact-bundle", version = "0.8.20", default-features = false }
 mesofact-ssr = { path = "../mesofact-ssr", optional = true }
 # Revalidate receiver deps (behind `ssr`). Both are bundler-free (no rolldown /
 # lightningcss) — see mesofact-render's crate doc (W225 §2/§3).

@@ -5,6 +5,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+use mesofact_build::check::{check, CheckOptions};
 use mesofact_build::pipeline::{build, BuildOptions, InstallMode};
 
 #[derive(Parser)]
@@ -35,6 +36,19 @@ enum Command {
     },
     /// Install the locked dependency closure (bun.lock) into node_modules.
     Install { project: PathBuf },
+    /// Full TypeScript semantic pass via the project's `tsc` (native 10x
+    /// checker with typescript@7). Cadence-agnostic — QED / CI / humans decide
+    /// when to fire it (W174 §Full tier).
+    Check {
+        /// Project root containing tsconfig.json.
+        project: PathBuf,
+        /// tsconfig path (default: <project>/tsconfig.json).
+        #[arg(long)]
+        tsconfig: Option<PathBuf>,
+        /// Extra args forwarded to tsc verbatim (after `--`).
+        #[arg(last = true)]
+        checker_args: Vec<String>,
+    },
     /// Render one route of an already-built dist with explicit params/data
     /// (no bundler, no install) — the revalidate / publish-once verb.
     Render {
@@ -109,6 +123,21 @@ fn main() -> Result<()> {
                 );
             }
             Ok(())
+        }
+        Command::Check { project, tsconfig, checker_args } => {
+            let outcome = check(CheckOptions {
+                project_root: project,
+                tsconfig,
+                extra_args: checker_args,
+            })?;
+            if outcome.code == 0 {
+                println!("mesofact check ok — tsc full semantic pass, no errors");
+                Ok(())
+            } else {
+                // The checker already streamed its diagnostics; mirror its
+                // exit code so QED/CI see the failure.
+                std::process::exit(outcome.code);
+            }
         }
         Command::Render { project, route, params, data, out_dir, stdout, all } => {
             if all {
