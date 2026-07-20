@@ -12,6 +12,7 @@
 
 pub mod assets;
 pub mod bundle;
+pub mod bundle_assemble;
 pub mod config;
 pub mod css;
 pub mod install;
