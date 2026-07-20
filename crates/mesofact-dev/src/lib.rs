@@ -140,6 +140,7 @@ use mesofact_publisher::ObjectStore;
 use mesofact_ssr::{DispatchRequest, DispatchResponse};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
+use yah_mesofact_bundle::BundleManifest;
 
 /// Default port for the local-static provider slot.
 pub const DEFAULT_PORT: u16 = 4321;
@@ -245,6 +246,56 @@ impl Server {
             #[cfg(feature = "ssr")]
             instance_store: None,
         })
+    }
+
+    /// Construct a server for a materialized **W272 bundle** directory
+    /// (R599-F3; canonical `@yah:` block in the parent-camp W272 doc — this is
+    /// the mesofact-subcamp implementation, so a prose pointer only).
+    ///
+    /// A bundle's `app/` subtree is structurally a workload dir — the parent of
+    /// `dist/`, which carries `dist/html/<key>.html` + `dist/manifest.json` — so
+    /// bundle serving is [`Server::from_workload`] pointed at `<bundle>/app`,
+    /// after validating the bundle's own `manifest.toml` (identity + runtime).
+    ///
+    /// v0 serves **static only** (clean-URLs + 404, no V8), which is the whole
+    /// point: this path builds and runs with the crate compiled
+    /// `--no-default-features` (no `ssr`), so it dogfoods on the current glibc
+    /// fleet ahead of the musl-static V8 runtime (W272 §5). The isolate / JIT
+    /// tiers that execute `mesofact.routes.ts` are R599-F6 follow-on.
+    ///
+    /// A `runtime = "self"` bundle carries its own `bins/<triple>/serve` and is
+    /// meant to be served by *that* binary, not the stock runtime — we still
+    /// serve its prerendered static tree, but warn, since executing its custom
+    /// runtime is out of scope here.
+    pub fn from_bundle(bundle: impl Into<PathBuf>) -> anyhow::Result<Self> {
+        let bundle = bundle.into();
+        let manifest_path = bundle.join("manifest.toml");
+        let raw = std::fs::read_to_string(&manifest_path).map_err(|e| {
+            anyhow::anyhow!(
+                "not a mesofact bundle — reading {}: {e}",
+                manifest_path.display()
+            )
+        })?;
+        let manifest = BundleManifest::from_toml_str(&raw)
+            .map_err(|e| anyhow::anyhow!("invalid bundle manifest {}: {e}", manifest_path.display()))?;
+        if manifest.runtime.is_self_contained() {
+            warn!(
+                bundle = %manifest.name,
+                "bundle declares runtime=\"self\" (carries bins/<triple>/serve) — the stock \
+                 mesofact-serve serves its static tree but does not execute its custom runtime",
+            );
+        }
+        let app = bundle.join("app");
+        let server = Self::from_workload(&app).map_err(|e| {
+            anyhow::anyhow!("bundle {} has no servable app tree: {e}", manifest.name)
+        })?;
+        info!(
+            bundle = %manifest.name,
+            runtime = %manifest.runtime.as_wire(),
+            app = %app.display(),
+            "serving mesofact bundle (static v0)",
+        );
+        Ok(server)
     }
 
     /// Stamp this server with its logical `(service, component)` identity,

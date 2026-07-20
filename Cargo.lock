@@ -2997,6 +2997,7 @@ dependencies = [
  "tower-http 0.6.10",
  "tracing",
  "tracing-subscriber",
+ "yah-mesofact-bundle",
 ]
 
 [[package]]
