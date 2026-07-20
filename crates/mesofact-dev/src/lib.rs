@@ -117,17 +117,22 @@ pub use watcher::{WatchOptions, Watcher};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicI64, AtomicU64, Ordering},
+        Arc, RwLock,
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(feature = "ssr")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(feature = "ssr")]
 use axum::body::Body;
 use axum::{
     extract::{Request, State},
     http::{header, StatusCode},
+    middleware::Next,
     response::{IntoResponse, Response},
     routing::{any, get},
     Router,
@@ -438,17 +443,141 @@ impl Server {
             );
         }
         let listener = tokio::net::TcpListener::bind(addr).await?;
+        self.serve_on_listener(listener, None).await
+    }
+
+    /// Serve on an **already-bound** listener, with an optional JIT idle-reap
+    /// (R599-F6). Two properties beyond [`serve_on`]:
+    ///
+    /// - **Adopts the given socket.** The listener may have been created by
+    ///   someone else — the on-demand ("serverless") lifecycle has kamaji's
+    ///   [`SocketCustodian`](../kamaji/socket_custody) bind + hold the listen
+    ///   socket and hand this process the fd (systemd `LISTEN_FDS`, since
+    ///   mesofact-serve is our own binary). Adopting the fd instead of binding
+    ///   fresh is what lets the socket (and its accept queue) outlive each
+    ///   forked runtime process, so no connection is dropped across a reap →
+    ///   re-fork (W272 §3).
+    /// - **Self-reaps when idle.** With `idle_ttl` set, a background watcher
+    ///   triggers graceful shutdown once no request has been in flight for that
+    ///   long. The runtime — not kamaji — owns idle detection, keeping the
+    ///   supervisor out of the data path (no-impressive-mesh); kamaji just
+    ///   re-forks on the next connection to the socket it still holds. `None`
+    ///   = keep-alive (today's resident behavior).
+    pub async fn serve_on_listener(
+        self,
+        listener: tokio::net::TcpListener,
+        idle_ttl: Option<Duration>,
+    ) -> anyhow::Result<()> {
         let local = listener.local_addr()?;
+        let idle = Arc::new(IdleTracker::default());
+        idle.touch();
+
+        let mut app = self.router();
+        if idle_ttl.is_some() {
+            // Count in-flight requests + stamp last-activity so the watcher never
+            // reaps mid-request and every request resets the idle clock.
+            app = app.layer(axum::middleware::from_fn_with_state(
+                idle.clone(),
+                track_activity,
+            ));
+        }
         info!(
             addr = %local,
             workload = %self.workload.display(),
+            idle_ttl_s = idle_ttl.map(|d| d.as_secs_f64()),
             "mesofact-dev listening",
         );
-        let app = self.router();
+
+        let shutdown = {
+            let idle = idle.clone();
+            async move {
+                match idle_ttl {
+                    Some(ttl) => {
+                        tokio::select! {
+                            _ = shutdown_signal() => {}
+                            _ = idle_reaper(idle, ttl) => {
+                                info!(idle_ttl_s = ttl.as_secs_f64(), "idle TTL elapsed — self-reaping (JIT)");
+                            }
+                        }
+                    }
+                    None => shutdown_signal().await,
+                }
+            }
+        };
+
         axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(shutdown)
             .await?;
         Ok(())
+    }
+}
+
+/// In-flight-request + last-activity bookkeeping for the JIT idle-reap
+/// (R599-F6). `last_active_ms` is epoch-millis of the most recent request
+/// boundary; `inflight` guards against reaping while a request is still being
+/// served.
+#[derive(Default)]
+struct IdleTracker {
+    inflight: AtomicI64,
+    last_active_ms: AtomicU64,
+}
+
+impl IdleTracker {
+    fn touch(&self) {
+        self.last_active_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    fn enter(&self) {
+        self.inflight.fetch_add(1, Ordering::Relaxed);
+        self.touch();
+    }
+
+    fn leave(&self) {
+        self.inflight.fetch_sub(1, Ordering::Relaxed);
+        self.touch();
+    }
+
+    /// How long the server has been idle (zero in-flight), or `None` while any
+    /// request is in flight.
+    fn idle_for(&self) -> Option<Duration> {
+        if self.inflight.load(Ordering::Relaxed) > 0 {
+            return None;
+        }
+        let last = self.last_active_ms.load(Ordering::Relaxed);
+        Some(Duration::from_millis(now_ms().saturating_sub(last)))
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Middleware that brackets each request with [`IdleTracker::enter`] /
+/// [`IdleTracker::leave`], so the idle reaper sees live traffic.
+async fn track_activity(
+    State(idle): State<Arc<IdleTracker>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    idle.enter();
+    let resp = next.run(req).await;
+    idle.leave();
+    resp
+}
+
+/// Resolve once the server has been idle for `ttl`. Polls at a fraction of the
+/// TTL (floored at 200ms) so a short TTL still reaps promptly without busy-
+/// waiting.
+async fn idle_reaper(idle: Arc<IdleTracker>, ttl: Duration) {
+    let tick = (ttl / 4).max(Duration::from_millis(200));
+    loop {
+        tokio::time::sleep(tick).await;
+        if idle.idle_for().is_some_and(|d| d >= ttl) {
+            return;
+        }
     }
 }
 
@@ -1267,6 +1396,173 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(body_string(response).await.contains("custom nf"));
+    }
+
+    // ── W272 bundle serving (R599-F3) ───────────────────────────────────────
+    //
+    // `Server::from_bundle` points the static server at a materialized W272
+    // bundle's `app/` subtree after validating its `manifest.toml`. v0 serves
+    // static only (clean-URLs + 404); these reuse the same clean-URL / 404
+    // machinery the workload path exercises above, just entered via a bundle.
+
+    /// Assemble a minimal materialized bundle: `<root>/manifest.toml` +
+    /// `<root>/app/dist/html/<files>`. `runtime` is the raw manifest value
+    /// (`"mesofact/<ver>"` or `"self"`).
+    fn bundle_with(runtime: &str, html: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        let html_dir = dir.path().join("app").join("dist").join("html");
+        std::fs::create_dir_all(&html_dir).unwrap();
+        for (name, body) in html {
+            std::fs::write(html_dir.join(name), body).unwrap();
+        }
+        std::fs::write(
+            dir.path().join("manifest.toml"),
+            format!("schema_version = 1\nname = \"test-bundle\"\nruntime = \"{runtime}\"\n"),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn serves_bundle_index_and_clean_url() {
+        let bundle = bundle_with(
+            "mesofact/0.8.20",
+            &[("index.html", "<h1>home</h1>"), ("releases.html", "<h1>rel</h1>")],
+        );
+        let app = Server::from_bundle(bundle.path()).unwrap().router();
+
+        let root = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(root.status(), StatusCode::OK);
+        assert!(body_string(root).await.contains("home"));
+
+        // Clean-URL: `/releases` → `releases.html`, same rule as the workload path.
+        let clean = app
+            .oneshot(Request::builder().uri("/releases").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(clean.status(), StatusCode::OK);
+        assert!(body_string(clean).await.contains("rel"));
+    }
+
+    #[tokio::test]
+    async fn bundle_miss_serves_404_page() {
+        let bundle = bundle_with("mesofact/0.8.20", &[("404.html", "<h1>nope</h1>")]);
+        let app = Server::from_bundle(bundle.path()).unwrap().router();
+        let response = app
+            .oneshot(Request::builder().uri("/absent").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(body_string(response).await.contains("nope"));
+    }
+
+    #[tokio::test]
+    async fn self_runtime_bundle_still_serves_static() {
+        // A `runtime = "self"` bundle warns (its custom bin isn't executed) but
+        // its prerendered static tree still serves.
+        let bundle = bundle_with("self", &[("index.html", "<h1>custom</h1>")]);
+        let app = Server::from_bundle(bundle.path()).unwrap().router();
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_string(response).await.contains("custom"));
+    }
+
+    #[test]
+    fn from_bundle_rejects_missing_manifest() {
+        // A bare dir with no manifest.toml isn't a bundle.
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("app")).unwrap();
+        let err = Server::from_bundle(dir.path()).err().unwrap().to_string();
+        assert!(err.contains("not a mesofact bundle"), "got: {err}");
+    }
+
+    #[test]
+    fn from_bundle_rejects_unknown_schema() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("app")).unwrap();
+        std::fs::write(
+            dir.path().join("manifest.toml"),
+            "schema_version = 99\nname = \"x\"\nruntime = \"mesofact/0.8.20\"\n",
+        )
+        .unwrap();
+        let err = Server::from_bundle(dir.path()).err().unwrap().to_string();
+        assert!(err.contains("invalid bundle manifest"), "got: {err}");
+    }
+
+    #[test]
+    fn from_bundle_rejects_missing_app_tree() {
+        // Valid manifest but no `app/` subtree → clear error, not a silent
+        // empty-serve.
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("manifest.toml"),
+            "schema_version = 1\nname = \"x\"\nruntime = \"mesofact/0.8.20\"\n",
+        )
+        .unwrap();
+        let err = Server::from_bundle(dir.path()).err().unwrap().to_string();
+        assert!(err.contains("no servable app tree"), "got: {err}");
+    }
+
+    // ── JIT runtime contract (R599-F6): adopt a handed-over socket + idle-reap ─
+    //
+    // The on-demand ("serverless") tier has kamaji's SocketCustodian bind+hold
+    // the listen socket and hand this process the fd, and the runtime self-exit
+    // once idle so kamaji stays out of the data path. These drive
+    // `serve_on_listener` directly (the lib seam); the binary-level LISTEN_FDS
+    // env dance is a thin adapter over the same call.
+
+    #[tokio::test]
+    async fn serve_on_listener_adopts_the_given_socket() {
+        // A pre-bound listener (the fd kamaji's custodian would hand over) is
+        // adopted rather than re-bound — the server serves on THAT socket.
+        let std_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = std_l.local_addr().unwrap().port();
+        std_l.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(std_l).unwrap();
+
+        let bundle = bundle_with("mesofact/0.8.20", &[("index.html", "<h1>adopted</h1>")]);
+        let server = Server::from_bundle(bundle.path()).unwrap();
+        let serve = tokio::spawn(async move { server.serve_on_listener(listener, None).await });
+
+        let resp = reqwest::get(format!("http://127.0.0.1:{port}/")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(resp.text().await.unwrap().contains("adopted"));
+        serve.abort();
+    }
+
+    #[tokio::test]
+    async fn jit_idle_ttl_self_reaps_after_last_request() {
+        // With an idle TTL set, the server serves requests and then self-exits
+        // (serve future returns Ok) once no request has been in flight for the
+        // TTL — kamaji re-forks on the next connection.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let bundle = bundle_with("mesofact/0.8.20", &[("index.html", "<h1>hi</h1>")]);
+        let server = Server::from_bundle(bundle.path()).unwrap();
+        let serve = tokio::spawn(async move {
+            server
+                .serve_on_listener(listener, Some(Duration::from_millis(300)))
+                .await
+        });
+
+        // Serve at least one request first (also proves the idle clock resets).
+        let resp = reqwest::get(format!("http://127.0.0.1:{port}/")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // Within a few TTLs the idle reaper fires and the serve future returns.
+        let out = tokio::time::timeout(Duration::from_secs(3), serve)
+            .await
+            .expect("server should self-reap within the timeout")
+            .expect("serve task panicked");
+        out.expect("serve returned an error");
     }
 
     // ── Instance-addressed (deferred) route resolution (W270 §9, R595-T6) ────
