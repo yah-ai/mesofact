@@ -19,6 +19,11 @@ mesofact = { path = "../mesofact", version = "0.8.20" }
 mesofact-ssr = { path = "../mesofact-ssr", version = "0.8.20" }
 mesofact-render = { path = "../mesofact-render", version = "0.8.20" }
 
+# W272 bundle-manifest types (R599-F1), across the yah-base workspace boundary.
+# default-features = false keeps this to serde+blake3+toml types only — the
+# object-store `store` feature is for cloud/kamaji, not the build side.
+yah-mesofact-bundle = { path = "../../../yah-base/crates/mesofact-bundle", default-features = false }
+
 rolldown = "1.1"
 rolldown_common = "1.1"
 lightningcss = "1.0.0-alpha.71"
