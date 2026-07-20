@@ -35,6 +35,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 use mesofact_dev::Server;
@@ -64,9 +65,18 @@ struct Args {
     bundle: Option<PathBuf>,
 
     /// Full bind address (`host:port`), the W272 §3 form. When set it wins over
-    /// `--host` / `--port`.
+    /// `--host` / `--port`. Ignored when the process was handed a listen socket
+    /// via `LISTEN_FDS` (socket-activation) — it then adopts that fd instead.
     #[arg(long)]
     listen: Option<SocketAddr>,
+
+    /// On-demand ("serverless") JIT idle TTL, in seconds (R599-F6, bundle mode).
+    /// After this long with no in-flight request the runtime self-exits; kamaji
+    /// holds the listen socket and re-forks on the next connection. `0` / unset
+    /// = keep-alive (resident). Meant to be set by kamaji from the bundle's
+    /// `BundleLifecycle::OnDemand { idle_ttl }`.
+    #[arg(long)]
+    idle_ttl: Option<u64>,
 
     /// TCP port to bind (when `--listen` is not given).
     #[arg(long, default_value_t = DEFAULT_SERVE_PORT)]
@@ -124,16 +134,72 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Bundle mode (R599-F3): the v0 static tier. Always available — no V8 — so
-    // it is checked before any `ssr`-gated branch.
+    // it is checked before any `ssr`-gated branch. R599-F6 layers the JIT
+    // lifecycle here: adopt a handed-over listen socket + self-reap on idle.
     if let Some(bundle) = args.bundle.as_ref() {
         let bundle_abs = bundle.canonicalize().unwrap_or_else(|_| bundle.clone());
         let server = Server::from_bundle(&bundle_abs)?;
-        let addr = args.bind_addr();
-        info!(%addr, bundle = %bundle_abs.display(), "mesofact-serve listening (bundle, static v0)");
-        return server.serve_on(addr).await;
+        let idle_ttl = args.idle_ttl.filter(|s| *s > 0).map(Duration::from_secs);
+
+        // Prefer an inherited socket-activation fd (kamaji's custodian handoff,
+        // R599-F6/F9) over binding fresh, so the socket outlives this process.
+        let listener = match socket_activation_listener()? {
+            Some(l) => {
+                info!(bundle = %bundle_abs.display(), "mesofact-serve serving bundle on inherited LISTEN_FDS socket");
+                l
+            }
+            None => {
+                let addr = args.bind_addr();
+                info!(%addr, bundle = %bundle_abs.display(), "mesofact-serve listening (bundle, static v0)");
+                tokio::net::TcpListener::bind(addr).await?
+            }
+        };
+        return server.serve_on_listener(listener, idle_ttl).await;
     }
 
     run_workload_modes(args).await
+}
+
+/// Adopt a listening socket handed over via the systemd socket-activation
+/// convention (`LISTEN_FDS` + `LISTEN_PID`; first fd is `SD_LISTEN_FDS_START`
+/// = 3). This is how kamaji's JIT custodian (R599-F6/F9) hands mesofact-serve
+/// the socket it binds+holds — plain `LISTEN_FDS` inheritance, since
+/// mesofact-serve is our own binary (no pingora upgrade-socket dance). Returns
+/// `None` when no fd was passed (the normal `--listen`/bind path).
+#[cfg(unix)]
+fn socket_activation_listener() -> anyhow::Result<Option<tokio::net::TcpListener>> {
+    use std::os::fd::FromRawFd;
+
+    let n_fds: i32 = std::env::var("LISTEN_FDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if n_fds < 1 {
+        return Ok(None);
+    }
+    // If LISTEN_PID names a process, honor it — the fd was for that pid, and a
+    // grandchild fork shouldn't accidentally adopt a socket meant for its parent.
+    if let Ok(pid) = std::env::var("LISTEN_PID") {
+        if pid.parse::<u32>().ok() != Some(std::process::id()) {
+            return Ok(None);
+        }
+    }
+    const SD_LISTEN_FDS_START: i32 = 3;
+    // SAFETY: the socket-activation contract guarantees fd 3.. are the passed
+    // listening sockets and that we are their sole owner; we take exclusive
+    // ownership of exactly one and never touch fd 3 again.
+    let std_listener = unsafe { std::net::TcpListener::from_raw_fd(SD_LISTEN_FDS_START) };
+    std_listener
+        .set_nonblocking(true)
+        .map_err(|e| anyhow::anyhow!("set_nonblocking on inherited LISTEN_FDS socket: {e}"))?;
+    let listener = tokio::net::TcpListener::from_std(std_listener)
+        .map_err(|e| anyhow::anyhow!("adopting inherited LISTEN_FDS socket: {e}"))?;
+    Ok(Some(listener))
+}
+
+#[cfg(not(unix))]
+fn socket_activation_listener() -> anyhow::Result<Option<tokio::net::TcpListener>> {
+    Ok(None)
 }
 
 /// The V8-backed modes (SSR host + revalidate/tenants receivers). Compiled only

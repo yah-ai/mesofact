@@ -18,7 +18,8 @@ path = "src/main.rs"
 [[bin]]
 name = "mesofact-serve"
 path = "src/serve.rs"
-required-features = ["ssr"]
+# No `required-features`: the `--bundle` static tier (R599-F3) builds V8-free.
+# The SSR-host + revalidate/tenants modes inside are `#[cfg(feature = "ssr")]`.
 
 # `ssr` (default on) carries the in-process V8 runtime (mesofact-ssr →
 # deno_core → prebuilt librusty_v8). Static/SPA-only consumers can build with
@@ -53,7 +54,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 notify = "8"
 serde = { version = "1", features = ["derive"] }
