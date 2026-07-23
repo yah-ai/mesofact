@@ -339,7 +339,7 @@ impl Server {
     /// Install a same-origin reverse proxy. Requests whose path matches one of
     /// the map's prefixes (`/auth/*`, `/dev/*`, `/api/*` …) are forwarded to the
     /// mapped backend port *before* static serving; everything else falls
-    /// through to the SPA. A no-op when the map is empty. See [`proxy`] and
+    /// through to the SPA. A no-op when the map is empty. See [`crate::proxy`] and
     /// W207 Gap #1 (R513-F10).
     pub fn with_proxy(mut self, map: ProxyMap) -> Self {
         if !map.is_empty() {
@@ -399,7 +399,7 @@ impl Server {
             // 404, but a dedicated 200 endpoint lets `ready_path` point
             // somewhere that means "the isolate booted" rather than "the
             // process is listening". Reserved path; never a route key.
-            .route("/__mesofact/health", get(health))
+            .route(crate::HEALTH_PATH, get(crate::default_health))
             // Logical-identity probe for the adopt path (R602-B4). Returns the
             // `(service, component)` this dev server was spawned for so an
             // adopter can confirm a port holds *its* server before adopting it,
@@ -492,13 +492,13 @@ impl Server {
                 match idle_ttl {
                     Some(ttl) => {
                         tokio::select! {
-                            _ = shutdown_signal() => {}
+                            _ = crate::shutdown_signal() => {}
                             _ = idle_reaper(idle, ttl) => {
                                 info!(idle_ttl_s = ttl.as_secs_f64(), "idle TTL elapsed — self-reaping (JIT)");
                             }
                         }
                     }
-                    None => shutdown_signal().await,
+                    None => crate::shutdown_signal().await,
                 }
             }
         };
@@ -582,9 +582,6 @@ async fn idle_reaper(idle: Arc<IdleTracker>, ttl: Duration) {
 /// Liveness/readiness endpoint. Returns 200 once the server is listening and
 /// (for SSR workloads) the isolate has booted — `with_ssr` is set before the
 /// listener binds, so a successful bind implies the handlers are registered.
-async fn health() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
-}
 
 /// Logical-identity endpoint (R602-B4). Returns `{"service","component"}` as
 /// JSON when the server was stamped via [`Server::with_identity`]; 404
@@ -1152,28 +1149,6 @@ fn mime_for(path: &Path) -> &'static str {
     }
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            warn!(?err, "failed to install Ctrl+C handler");
-        }
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        use tokio::signal::unix::{signal, SignalKind};
-        if let Ok(mut s) = signal(SignalKind::terminate()) {
-            s.recv().await;
-        }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
-    info!("shutdown signal received");
-}
 
 #[cfg(test)]
 mod tests {

@@ -1,32 +1,47 @@
-//! `mesofact-app` — the lean Rust-native app harness.
+//! `mesofact` — the Rust-native web framework facade.
 //!
-//! Continues the "replacing bun with rust-native SSR" arc (R448 rolldown →
-//! R449 deno_core SSR → R450 default-flip): this is the next step where a
-//! service's **handlers are Rust functions** rather than JS bundles run in
-//! a V8 isolate. The dogfood is yah's cloud-admin dashboard (parent camp
-//! R568-T4), which builds its `axum::Router` in Rust and hands it here.
+//! **This is the one crate consumers depend on.** Subsystems are selected by
+//! feature rather than by picking crate names out of a 7-crate workspace
+//! (bevy-style). Two distribution strategies, one crate:
 //!
-//! Why a separate crate from `mesofact-dev`: mesofact-dev pulls in
-//! `mesofact-ssr` → deno_core → V8 (~75 MB of release binary). Pure-Rust
-//! services don't need any of that. This crate is the minimum framework
-//! seam: bind + serve + the standard mesofact middleware stack (tracing,
-//! `/__mesofact/health`, graceful shutdown). mesofact-dev can later
-//! delegate its own bind/serve to this crate; that refactor is out of
-//! scope for the dogfood landing.
+//! - **Prebuilt binary / container** — we build the `mesofact-serve` bin with
+//!   the `deploy` preset, arch-native per libc, and kamaji fetches it. The
+//!   consumer's project compiles zero Rust, only their TypeScript — the Node.js
+//!   model.
+//! - **Crate dependency** — the same crate from crates.io, where a consumer
+//!   picks features and builds a bespoke binary. What Node can't offer, because
+//!   it's Rust-native all the way down instead of C++ addons.
 //!
-//! What "standard mesofact stack" means today:
+//! They are the same crate at two lifecycle stages; the shared `deploy` feature
+//! preset is what keeps them honest. See W225 §2a.
 //!
-//! - `GET /__mesofact/health` → 200 — the same reserved path mesofact-dev
-//!   exposes (lib.rs:268). yubaba's pond/cloud reconciler probes this.
-//! - `TraceLayer::new_for_http()` — tower-http span per request, parity
-//!   with mesofact-dev (lib.rs:280).
-//! - Ctrl-C + SIGTERM (unix) → graceful shutdown — parity with
-//!   mesofact-dev's `shutdown_signal` (lib.rs:670).
+//! # Feature tiers
 //!
-//! Cache / session / resilience layers live in `mesofact::core::proxy::*` today
-//! and are bundle-shaped; lifting them into `mesofact-app` as
-//! caller-composable `tower::Layer`s is a follow-up once a second
-//! Rust-handler service needs them.
+//! - `default` — the lean, **V8-free** Rust-handler harness: [`serve_app`] /
+//!   [`wrap`] + the standard stack ([`HEALTH_PATH`], `TraceLayer`, graceful
+//!   shutdown). For services whose handlers are Rust functions; the dogfood is
+//!   yah's cloud-admin dashboard. Continues the "replacing bun with Rust-native
+//!   SSR" arc (R448 rolldown → R449 deno_core → R450 default-flip).
+//! - `ssr` — the SSR serving tier: the [`Server`] engine's V8 dispatch plus the
+//!   revalidate receiver. Links the *prebuilt* `librusty_v8.a` (a CDN download,
+//!   not a from-source compile).
+//! - `build` — adds the bundler (rolldown + lightningcss), the one genuinely
+//!   uncached from-source compile. Its own crate so a stray feature flip can't
+//!   drag it into a lean consumer.
+//!
+//! # What lives here vs. `mesofact-dev`
+//!
+//! The prod serving engine ([`server`], [`proxy`], and under `ssr` the `ssr`,
+//! `revalidate` and `tenants` modules) lives **here**. `mesofact-dev` holds only
+//! the dev affordances — the file watcher and the local S3 surface — and depends
+//! on this crate. That direction is load-bearing: it is what keeps a prod binary
+//! from linking dev code (W225 §2), and it is enforced by the dependency graph
+//! rather than by dead-stripping. Do not add a dev affordance to this crate, and
+//! do not add a prod-serving bin to `mesofact-dev`.
+//!
+//! Cache / session / resilience layers live in `mesofact_core::proxy` today and are
+//! bundle-shaped; lifting them here as caller-composable `tower::Layer`s is a
+//! follow-up once a second Rust-handler service needs them.
 //!
 //! @yah:relay(R445, "mesofact-app: lean Rust-native app harness for Rust-handler services (continues R448/R449/R450 'replacing bun with rust-native SSR' arc; dogfooded by yah parent R568-T4)")
 //! @yah:at(2026-06-30T07:22:46Z)
@@ -39,7 +54,7 @@
 //! @yah:verify("cargo test -p mesofact-app  # 3 passed")
 //! @yah:gotcha("Tier: Cleric -- discovery+replicate. Mirrored mesofact-dev's health/shutdown_signal shape so probes are drop-in compatible across JS-bundle and Rust-handler services.")
 //! @yah:gotcha("wrap() panics if the caller already registered HEALTH_PATH (axum::Router::merge rejects overlapping method routes regardless of order). Constraint is documented + pinned by a should_panic test; richer-probe services must bypass wrap.")
-//! @yah:gotcha("mesofact-dev refactor to delegate its bind/serve to mesofact-app is deferred -- doable but out of scope for the dogfood landing (R568-T4).")
+//! @yah:gotcha("RESOLVED 2026-07-23 (W225 §2a) -- was: 'mesofact-dev refactor to delegate its bind/serve to mesofact-app is deferred'. The whole serving engine moved INTO this crate and mesofact-dev now depends on it, so the delegation is structural rather than deferred. Server's router now uses this crate's HEALTH_PATH + default_health + shutdown_signal instead of the byte-identical copies it carried in mesofact-dev.")
 
 // ── Facade re-exports ────────────────────────────────────────────────────
 // Subsystems are namespaced (not glob-flattened) on purpose — consumers reach
@@ -94,10 +109,11 @@ use axum::{routing::get, Router};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
-/// Reserved liveness/readiness path. Same convention mesofact-dev uses
-/// (`oss/mesofact/crates/mesofact-dev/src/lib.rs:268`) so the pond/cloud
-/// reconciler's `ready_path` works uniformly across JS-bundle and
-/// Rust-handler services.
+/// Reserved liveness/readiness path, so the pond/cloud reconciler's
+/// `ready_path` works uniformly across JS-bundle and Rust-handler services.
+///
+/// This is now the single definition: [`server::Server`]'s router registers
+/// this same const (it used to hardcode the literal in `mesofact-dev`).
 pub const HEALTH_PATH: &str = "/__mesofact/health";
 
 /// Wrap a caller's [`Router`] with the standard mesofact middleware stack
@@ -133,10 +149,12 @@ pub async fn serve_app(app: Router, addr: SocketAddr) -> Result<()> {
         .context("axum::serve")
 }
 
-/// Default `HEALTH_PATH` handler — returns `200 ok`. Same shape as
+/// Default `HEALTH_PATH` handler — returns `200 ok`. Shared with
+/// [`server::Server`]'s router, which used to carry its own byte-identical copy
+/// back when the engine lived in `mesofact-dev` (W225 §2a collapse). Same shape as
 /// mesofact-dev's `health()` (lib.rs:321) so probes stay drop-in
 /// compatible between service flavors.
-async fn default_health() -> &'static str {
+pub(crate) async fn default_health() -> &'static str {
     "ok"
 }
 
