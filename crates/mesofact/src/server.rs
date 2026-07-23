@@ -285,7 +285,7 @@ impl Server {
             warn!(
                 bundle = %manifest.name,
                 "bundle declares runtime=\"self\" (carries bins/<triple>/serve) — the stock \
-                 mesofact-serve serves its static tree but does not execute its custom runtime",
+                 `mesofact serve` serves its static tree but does not execute its custom runtime",
             );
         }
         let app = bundle.join("app");
@@ -451,7 +451,7 @@ impl Server {
     ///   someone else — the on-demand ("serverless") lifecycle has kamaji's
     ///   [`SocketCustodian`](../kamaji/socket_custody) bind + hold the listen
     ///   socket and hand this process the fd (systemd `LISTEN_FDS`, since
-    ///   mesofact-serve is our own binary). Adopting the fd instead of binding
+    ///   the mesofact binary is our own). Adopting the fd instead of binding
     ///   fresh is what lets the socket (and its accept queue) outlive each
     ///   forked runtime process, so no connection is dropped across a reap →
     ///   re-fork (W272 §3).
@@ -1008,7 +1008,7 @@ fn match_route_pattern(pattern: &str, pathname: &str) -> bool {
 }
 
 /// Serve the manifest's branded error page for `status` (W270 §3, R595-T5/T6),
-/// for parity with `mesofact-serve` and the `@mesofact/edge` worker's
+/// for parity with `mesofact serve` and the `@mesofact/edge` worker's
 /// `errorResponse`. The manifest's `error_routes` values are ROUTE PATHS (e.g.
 /// `"/404"`) resolved to their prerendered asset the same way a normal static
 /// request resolves (`/404` → `404.html`). 5xx statuses draw from
@@ -1342,7 +1342,7 @@ mod tests {
 
     /// W270 §3 / R595-T5: a miss serves the manifest's `error_routes."404"`
     /// route (`/custom-nf` → `custom-nf.html`) in preference to the default
-    /// `404.html`, for parity with mesofact-serve and the edge worker.
+    /// `404.html`, for parity with `mesofact serve` and the edge worker.
     #[tokio::test]
     async fn missing_path_uses_error_routes_from_manifest() {
         let dir = tempdir().unwrap();

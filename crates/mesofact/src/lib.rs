@@ -4,7 +4,7 @@
 //! feature rather than by picking crate names out of a 7-crate workspace
 //! (bevy-style). Two distribution strategies, one crate:
 //!
-//! - **Prebuilt binary / container** — we build the `mesofact-serve` bin with
+//! - **Prebuilt binary / container** — we build the `mesofact` bin with
 //!   the `deploy` preset, arch-native per libc, and kamaji fetches it. The
 //!   consumer's project compiles zero Rust, only their TypeScript — the Node.js
 //!   model.
@@ -65,7 +65,6 @@
 // on 0.8); that skew is now RESOLVED — everything is axum 0.8 — and the
 // namespacing is kept deliberately, bevy-style, so each subsystem keeps its own
 // namespace instead of flattening hundreds of items into the crate root.
-#[cfg(feature = "ssr")]
 pub use mesofact_core as core;
 // NB: re-exported as `ssr_runtime`, not `ssr` — the `ssr` name at this crate
 // root belongs to the SSR *dispatch* module moved in from mesofact-dev below.
@@ -85,6 +84,7 @@ pub use mesofact_publisher as publisher;
 // the file watcher and the dev S3 surface — breaking the dev/prod crate
 // boundary W225 §2 claims. `mesofact-dev` now depends on THIS crate and holds
 // only `watcher` + `s3` + the dev bin, so that boundary finally holds.
+pub mod cli;
 pub mod proxy;
 pub mod server;
 #[cfg(feature = "ssr")]

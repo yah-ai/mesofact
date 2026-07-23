@@ -5,11 +5,16 @@
 // binary now loads `mesofact.config.toml`. Missing config or missing
 // credentials exits 2 with a precise hint (vs. silently trying to publish).
 
+#![cfg(feature = "publish")]
+//! Moved here from mesofact-publisher when the three prod bins consolidated
+//! into the single `mesofact` binary — the test follows the binary it drives.
+//! Gated on `publish`: without that feature the subcommand does not exist.
+
 use std::path::Path;
 use std::process::Command;
 use tempfile::tempdir;
 
-const BIN: &str = env!("CARGO_BIN_EXE_mesofact-publish");
+const BIN: &str = env!("CARGO_BIN_EXE_mesofact");
 const BUILD_ID: &str = "2026-05-15T17-00-00Z";
 
 fn write_minimal_dist(dir: &Path) {
@@ -40,13 +45,14 @@ fn in_memory_flag_publishes_ok() {
     write_minimal_dist(dir.path());
 
     let out = Command::new(BIN)
+        .arg("publish")
         .arg(dir.path())
         .arg("--in-memory")
         .output()
-        .expect("spawn mesofact-publish");
+        .expect("spawn mesofact publish");
     assert!(
         out.status.success(),
-        "mesofact-publish failed: status={:?}\nstdout={}\nstderr={}",
+        "mesofact publish failed: status={:?}\nstdout={}\nstderr={}",
         out.status,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
@@ -62,11 +68,12 @@ fn missing_config_without_in_memory_exits_with_hint() {
     write_minimal_dist(dir.path());
 
     let out = Command::new(BIN)
+        .arg("publish")
         .arg(dir.path())
         .arg("--config")
         .arg(dir.path().join("does-not-exist.toml"))
         .output()
-        .expect("spawn mesofact-publish");
+        .expect("spawn mesofact publish");
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -86,11 +93,12 @@ fn missing_publish_block_exits_with_hint() {
     )
     .unwrap();
     let out = Command::new(BIN)
+        .arg("publish")
         .arg(dir.path())
         .arg("--config")
         .arg(&cfg)
         .output()
-        .expect("spawn mesofact-publish");
+        .expect("spawn mesofact publish");
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("[publish]"), "stderr: {stderr}");
@@ -115,6 +123,7 @@ api_token_env = "MESOFACT_TEST_NEVER_SET_TOKEN"
     )
     .unwrap();
     let out = Command::new(BIN)
+        .arg("publish")
         .arg(dir.path())
         .arg("--config")
         .arg(&cfg)
@@ -122,7 +131,7 @@ api_token_env = "MESOFACT_TEST_NEVER_SET_TOKEN"
         .env_remove("MESOFACT_TEST_NEVER_SET_SECRET")
         .env_remove("MESOFACT_TEST_NEVER_SET_TOKEN")
         .output()
-        .expect("spawn mesofact-publish");
+        .expect("spawn mesofact publish");
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -135,10 +144,11 @@ api_token_env = "MESOFACT_TEST_NEVER_SET_TOKEN"
 fn missing_manifest_exits_nonzero() {
     let dir = tempdir().unwrap();
     let out = Command::new(BIN)
+        .arg("publish")
         .arg(dir.path())
         .arg("--in-memory")
         .output()
-        .expect("spawn mesofact-publish");
+        .expect("spawn mesofact publish");
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("manifest.json"), "stderr: {stderr}");

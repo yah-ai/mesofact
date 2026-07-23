@@ -7,7 +7,7 @@
 //!
 //! [`crate::revalidate::serve`] hosts **one** workload dir + publish config on a
 //! process. The cloud-tier runner hosts **many** surfaces (yah.dev's releases
-//! page today; more tenants later) on one `mesofact-serve --revalidate`
+//! page today; more tenants later) on one `mesofact serve --revalidate`
 //! process. Each tenant has its own revalidate identity (a bearer the receiver
 //! checks) and its own render/publish target (its built workload + its publish
 //! config). This module routes an inbound poke to the right tenant by bearer,
@@ -262,7 +262,7 @@ pub async fn serve(
 ) -> Result<()> {
     info!(
         tenants = registry.len(),
-        "mesofact-serve revalidate receiver starting (multi-tenant, ephemeral render → publish)",
+        "mesofact serve revalidate receiver starting (multi-tenant, ephemeral render → publish)",
     );
 
     let (tx, mut rx) = mpsc::channel::<TenantJob>(16);

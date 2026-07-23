@@ -14,9 +14,9 @@ categories = ["web-programming"]
 name = "mesofact_publisher"
 path = "src/lib.rs"
 
-[[bin]]
-name = "mesofact-publish"
-path = "src/bin/mesofact-publish.rs"
+# The `mesofact-publish` bin moved into the `mesofact` facade as the
+# `mesofact publish` subcommand (W174 §Binary surface consolidation). Library
+# only now; the publish API stays fully public for programmatic callers.
 
 [dependencies]
 mesofact-core = { path = "../mesofact-core", version = "0.8.21" }

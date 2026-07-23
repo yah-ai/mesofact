@@ -18,9 +18,10 @@ categories = ["web-programming::http-server"]
 name = "mesofact_core"
 path = "src/lib.rs"
 
-[[bin]]
-name = "mesofact-proxy"
-path = "src/bin/mesofact-proxy.rs"
+# The `mesofact-proxy` bin moved into the `mesofact` facade as the
+# `mesofact proxy` subcommand (W174 §Binary surface consolidation). This crate
+# is a library only — it is the foundation every other mesofact crate builds on,
+# and shipping a CLI from it duplicated the facade's entry point.
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

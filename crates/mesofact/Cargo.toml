@@ -32,7 +32,11 @@ default = []
 # engine moved here, and is why it is not a thin "just the runtime" flag.
 # Everything here links the *prebuilt* librusty_v8 archive (a CDN download, not
 # a from-source compile); none of it links the bundler.
-ssr = ["dep:mesofact-ssr", "dep:mesofact-render", "dep:mesofact-publisher", "dep:mesofact-core"]
+# Depends on the `publish` FEATURE, not the raw dep: pulling `dep:mesofact-publisher`
+# alone would link the crate without setting `cfg(feature = "publish")`, so the
+# `mesofact::publisher` re-export and the `publish` subcommand would vanish under
+# `ssr` even though the dependency was present. Keep deps and cfg flags in lockstep.
+ssr = ["dep:mesofact-ssr", "dep:mesofact-render", "publish"]
 render = ["ssr"]
 # Publish path (build → R2 → manifest swap → CDN purge).
 publish = ["dep:mesofact-publisher"]
@@ -85,19 +89,25 @@ yah-mesofact-bundle = { path = "../../../yah-base/crates/mesofact-bundle", versi
 # re-exports below stay **namespaced** (`mesofact::core::…`) by choice, not
 # workaround — a bevy-style facade keeps subsystem namespaces rather than
 # flattening a few hundred items into one root.
-mesofact-core = { path = "../mesofact-core", version = "0.8.21", optional = true }
+# Non-optional: the facade's manifest types, proxy primitives and validate all
+# come from here, and the `mesofact proxy` subcommand needs it unconditionally.
+# Cheap to carry — core is V8-free, so the lean default stays lean.
+mesofact-core = { path = "../mesofact-core", version = "0.8.21" }
 mesofact-ssr = { path = "../mesofact-ssr", version = "0.8.21", optional = true }
 mesofact-render = { path = "../mesofact-render", version = "0.8.21", optional = true }
 mesofact-build = { path = "../mesofact-build", version = "0.8.21", optional = true }
 mesofact-publisher = { path = "../mesofact-publisher", version = "0.8.21", optional = true }
 
 [[bin]]
-# The prod serving binary — Strategy A's artifact. Moved here from
-# mesofact-dev (where its presence was what broke the dev/prod boundary).
+# THE prod binary — Strategy A's artifact, subcommand-driven (W174 §Binary
+# surface). Replaces the old mesofact-serve / mesofact-proxy / mesofact-publish
+# trio: `mesofact serve|proxy|publish`. The dev binary deliberately stays
+# separate in `mesofact-dev` — folding it in here would put dev affordances in
+# the prod binary and undo the W225 §2 boundary.
 # No `required-features`: the `--bundle` static tier (R599-F3) builds V8-free;
 # the SSR-host + revalidate/tenants modes inside are `#[cfg(feature = "ssr")]`.
-name = "mesofact-serve"
-path = "src/bin/mesofact-serve.rs"
+name = "mesofact"
+path = "src/bin/mesofact.rs"
 
 [dev-dependencies]
 http-body-util = "0.1"

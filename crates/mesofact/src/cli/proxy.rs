@@ -5,7 +5,6 @@ use axum::{
     routing::{any, get},
     Router,
 };
-use clap::Parser;
 use mesofact_core::proxy::cache::ResponseCache;
 use mesofact_core::proxy::config::Config;
 use mesofact_core::proxy::manifest_loader::{load_from_file, watch_manifest};
@@ -20,13 +19,11 @@ use tokio::sync::{watch, RwLock};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub async fn run(cfg: Config) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let cfg = Config::parse();
 
     let manifest = Arc::new(load_from_file(&cfg.manifest).await?);
     info!(

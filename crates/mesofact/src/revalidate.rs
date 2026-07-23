@@ -8,12 +8,12 @@
 //! bundle*, no recompilation). This module is the revalidate half: on an
 //! invalidation poke it re-runs the render path against fresh data and
 //! republishes to the CDN. Per §4 the receiver is "a route mesofact mounts,"
-//! not its own service binary — so it ships as a **mode of `mesofact-serve`**
-//! (`mesofact-serve <workload> --revalidate`), not a separate executable.
+//! not its own service binary — so it ships as a **mode of `mesofact serve`**
+//! (`mesofact serve <workload> --revalidate`), not a separate executable.
 //!
 //! ## Why it is ephemeral (the memory-footprint property)
 //!
-//! Unlike `mesofact-serve`'s SSR-serving mode — which boots a **resident** V8
+//! Unlike `mesofact serve`'s SSR-serving mode — which boots a **resident** V8
 //! isolate and holds it for the process lifetime — the receiver spins V8 up
 //! **per poke** and drops it (`render_route_all` calls `SsgRuntime::start()`
 //! then discards it). Resident cost is just axum + config; V8 memory is spent
@@ -80,7 +80,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-/// Runtime configuration for the receiver. Built by the `mesofact-serve`
+/// Runtime configuration for the receiver. Built by the `mesofact serve`
 /// binary from CLI flags / env.
 #[derive(Debug, Clone)]
 pub struct RevalidateConfig {
@@ -174,7 +174,7 @@ fn eligible_routes(workload: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Publish half — reuse the exact `mesofact-publish` construction path:
+/// Publish half — reuse the exact `mesofact publish` construction path:
 /// load `[publish]`, resolve env creds, build the S3 + Cloudflare adapters,
 /// and run the idempotent `publish_dist` (content-hash skip + tag purge).
 async fn publish_built(workload: &Path, config_path: &Path) -> Result<PublishReport> {
@@ -265,7 +265,7 @@ pub async fn serve(cfg: RevalidateConfig, host: std::net::IpAddr, port: u16) -> 
         workload = %cfg.workload.display(),
         publish_config = %cfg.publish_config.display(),
         mirror_key = cfg.mirror_key.is_some(),
-        "mesofact-serve revalidate receiver starting (ephemeral render → publish)",
+        "mesofact serve revalidate receiver starting (ephemeral render → publish)",
     );
 
     let (tx, mut rx) = mpsc::channel::<Job>(16);

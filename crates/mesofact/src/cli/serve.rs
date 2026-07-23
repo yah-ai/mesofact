@@ -1,5 +1,5 @@
-//! `mesofact-serve` — the stock mesofact runtime binary: the W272 serve-bin
-//! kamaji forks to serve a **bundle** (`mesofact-serve --bundle <dir> --listen
+//! `mesofact serve` — the stock mesofact runtime subcommand: the W272 serve-bin
+//! kamaji forks to serve a **bundle** (`mesofact serve --bundle <dir> --listen
 //! <addr>`), plus the legacy pond/cloud SSR-host container mode.
 //!
 //! Two things this binary does NOT do (like `mesofact-dev`, unlike a full
@@ -7,7 +7,7 @@
 //!
 //! ## Bundle mode (R599-F3, W272 §3) — the v0 static tier
 //!
-//! `mesofact-serve --bundle <cache-dir> --listen <addr>` serves a materialized
+//! `mesofact serve --bundle <cache-dir> --listen <addr>` serves a materialized
 //! W272 bundle: `<bundle>/manifest.toml` + `<bundle>/app/dist/{html,manifest.json}`.
 //! v0 is **static only** — clean-URLs + 404, no V8 — so it builds and runs with
 //! the crate compiled `--no-default-features` (the `ssr` feature off), which is
@@ -17,7 +17,7 @@
 //!
 //! ## SSR-host mode (R449-F3, behind the `ssr` feature)
 //!
-//! `mesofact-serve <workload> --port 3000` binds a routable address
+//! `mesofact serve <workload> --port 3000` binds a routable address
 //! (`0.0.0.0` by default) and boots an in-process deno_core isolate for the
 //! workload's `mode:"ssr"` routes; static fall-through serves from
 //! `<workload>/dist/html/`. Also carries the `--revalidate` / `--tenants`
@@ -28,7 +28,7 @@
 //! Part of R599-F3 — the canonical `@yah:ticket(R599-F3, …)` annotation lives
 //! in the parent-camp W272 doc (one block per ID; a second `@yah:` block in this
 //! subcamp file would register a parent-camp R599 id against the mesofact board
-//! scanner). See [`mesofact::Server::from_bundle`].
+//! scanner). See [`crate::Server::from_bundle`].
 //!
 //! See the [library crate](crate) for the shared `Server` + `ssr`
 //! machinery this binary composes.
@@ -37,8 +37,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::Parser;
-use mesofact::Server;
+use crate::Server;
 use tracing::info;
 #[cfg(feature = "ssr")]
 use tracing::warn;
@@ -47,9 +46,8 @@ use tracing::warn;
 /// `local_driver::pond_ssr_runtime::DEFAULT_SSR_CONTAINER_PORT`.
 const DEFAULT_SERVE_PORT: u16 = 3000;
 
-#[derive(Parser, Debug)]
-#[command(version, about = "mesofact runtime: serve a W272 bundle (static v0) or host SSR routes")]
-struct Args {
+#[derive(clap::Args, Debug)]
+pub struct ServeArgs {
     /// Workload directory — the parent of `dist/` (with `dist/html/` and
     /// `manifest.json`). Bind-mounted into the container by yubaba. Used by the
     /// SSR-host and single-tenant `--revalidate` paths. Ignored when `--bundle`
@@ -58,7 +56,7 @@ struct Args {
 
     /// Serve a materialized **W272 bundle** directory (`manifest.toml` +
     /// `app/dist/…`) as a static site — clean-URLs + 404, no V8 (R599-F3). This
-    /// is the stock runtime's v0 tier; kamaji forks `mesofact-serve --bundle
+    /// is the stock runtime's v0 tier; kamaji forks `mesofact serve --bundle
     /// <cache-dir> --listen <addr>` per W272 §3. Takes precedence over a
     /// positional `workload`.
     #[arg(long)]
@@ -113,7 +111,7 @@ struct Args {
     tenants: Option<PathBuf>,
 }
 
-impl Args {
+impl ServeArgs {
     /// Resolve the bind address: `--listen` wins, else `host:port`.
     fn bind_addr(&self) -> SocketAddr {
         self.listen
@@ -121,8 +119,7 @@ impl Args {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -131,7 +128,6 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let args = Args::parse();
 
     // Bundle mode (R599-F3): the v0 static tier. Always available — no V8 — so
     // it is checked before any `ssr`-gated branch. R599-F6 layers the JIT
@@ -145,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
         // R599-F6/F9) over binding fresh, so the socket outlives this process.
         let listener = match socket_activation_listener()? {
             Some(l) => {
-                info!(bundle = %bundle_abs.display(), "mesofact-serve serving bundle on inherited LISTEN_FDS socket");
+                info!(bundle = %bundle_abs.display(), "mesofact serve: serving bundle on inherited LISTEN_FDS socket");
                 l
             }
             None => {
@@ -206,8 +202,8 @@ fn socket_activation_listener() -> anyhow::Result<Option<tokio::net::TcpListener
 /// with the `ssr` feature; without it, any of these invocations is a clear
 /// error instead of a silent static fallthrough.
 #[cfg(feature = "ssr")]
-async fn run_workload_modes(args: Args) -> anyhow::Result<()> {
-    use mesofact::{revalidate, ssr, tenants, SsrSpawnOptions};
+async fn run_workload_modes(args: ServeArgs) -> anyhow::Result<()> {
+    use crate::{revalidate, ssr, tenants, SsrSpawnOptions};
 
     // Multi-tenant receiver (R446): a tenants/<id>.toml registry, one process
     // hosting many surfaces. Each poke's mirror_key selects its tenant. Takes
@@ -282,7 +278,7 @@ async fn run_workload_modes(args: Args) -> anyhow::Result<()> {
 /// workload's static tree; the V8-only flags are a hard error rather than a
 /// silent no-op.
 #[cfg(not(feature = "ssr"))]
-async fn run_workload_modes(args: Args) -> anyhow::Result<()> {
+async fn run_workload_modes(args: ServeArgs) -> anyhow::Result<()> {
     if args.revalidate || args.tenants.is_some() {
         anyhow::bail!(
             "--revalidate / --tenants need the `ssr` build feature (V8); this is a static-only build"

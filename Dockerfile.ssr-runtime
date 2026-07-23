@@ -40,14 +40,17 @@ COPY . .
 # hosting the prod bin in the dev crate is what dragged the file watcher + dev S3
 # surface into this image. Building `-p mesofact` keeps those out by
 # construction. A feature is required — the facade defaults to the lean V8-free
-# harness, and this image is the SSR host. The bin NAME is unchanged, so the
-# ENTRYPOINT and every kamaji/pond spec that invokes `mesofact-serve` still works
-# untouched.
+# harness, and this image is the SSR host.
+#
+# The bin is now `mesofact` with subcommands (was `mesofact-serve`). Any external
+# caller that invoked `mesofact-serve <args>` must become `mesofact serve <args>`
+# — this is a deliberate breaking rename, safe because the whole fleet redeploys
+# on 0.8.21.
 #
 # Build the `deploy` PRESET, never a hand-listed feature set: `deploy` is the
 # single definition of what ships, shared with the arch×libc release matrix, so
 # this image and a from-source consumer build can't drift (W225 §2a).
-RUN cargo build --release -p mesofact --bin mesofact-serve --features deploy
+RUN cargo build --release -p mesofact --bin mesofact --features deploy
 
 # ── runtime ────────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
@@ -58,11 +61,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/mesofact-serve /usr/local/bin/mesofact-serve
+COPY --from=builder /build/target/release/mesofact /usr/local/bin/mesofact
 
 # Workload tree is bind-mounted here at runtime (pond) or COPY'd in (cloud).
 WORKDIR /app
 
 EXPOSE 3000
-ENTRYPOINT ["mesofact-serve"]
-CMD ["/app", "--port", "3000"]
+# Subcommand-driven now (the mesofact-serve/-proxy/-publish trio collapsed into
+# one binary). `serve` is in CMD rather than baked into ENTRYPOINT so an operator
+# can still reach `mesofact proxy` / `mesofact publish` in this image.
+ENTRYPOINT ["mesofact"]
+CMD ["serve", "/app", "--port", "3000"]

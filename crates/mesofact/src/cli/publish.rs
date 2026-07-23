@@ -12,7 +12,6 @@
 //   [`S3Store`] + [`CloudflareCdnPurger`]. CI smoke wires the env vars from
 //   secrets; local runs without creds fall back to a precise error.
 
-use clap::Parser;
 use mesofact_publisher::{
     publish_dist, publish_pin, CloudflareCdnPurger, ConfigError, InMemoryPurger, InMemoryStore,
     PublishConfig, PublishReport, S3Store,
@@ -20,12 +19,8 @@ use mesofact_publisher::{
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-#[derive(Debug, Parser)]
-#[command(
-    name = "mesofact-publish",
-    about = "Upload a built dist/ tree, atomically swap the manifest pointer, purge CDN tags."
-)]
-struct Args {
+#[derive(Debug, clap::Args)]
+pub struct PublishArgs {
     /// Path to the build output directory (must contain manifest.json + tag-index.json).
     #[arg(default_value = "dist")]
     dist: PathBuf,
@@ -55,9 +50,7 @@ struct Args {
     zone: Option<String>,
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
-    let args = Args::parse();
+pub async fn run(args: PublishArgs) -> ExitCode {
 
     if args.in_memory {
         return run_in_memory(args).await;
@@ -65,14 +58,14 @@ async fn main() -> ExitCode {
     run_real(args).await
 }
 
-async fn run_in_memory(args: Args) -> ExitCode {
+async fn run_in_memory(args: PublishArgs) -> ExitCode {
     let store = InMemoryStore::new();
     let purger = InMemoryPurger::new();
     let result = dispatch(&args, &store, &purger).await;
     report(result)
 }
 
-async fn run_real(args: Args) -> ExitCode {
+async fn run_real(args: PublishArgs) -> ExitCode {
     let cfg = match PublishConfig::load(&args.config).await {
         Ok(cfg) => cfg.with_overrides(args.bucket.clone(), args.endpoint.clone(), args.zone.clone()),
         Err(ConfigError::NotFound(path)) => {
@@ -126,7 +119,7 @@ async fn run_real(args: Args) -> ExitCode {
 }
 
 async fn dispatch(
-    args: &Args,
+    args: &PublishArgs,
     store: &dyn mesofact_publisher::ObjectStore,
     purger: &dyn mesofact_publisher::CdnPurger,
 ) -> Result<PublishReport, mesofact_publisher::PublishError> {
