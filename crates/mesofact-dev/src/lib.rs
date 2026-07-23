@@ -957,7 +957,7 @@ async fn serve_instance(
 /// True when `uri_path` matches an instance-addressed (`prerender:
 /// { deferred: true }`) route in the manifest beside the served dist dir.
 /// Mirrors the worker's `matchesDeferredRoute`; a lenient local slice keeps the
-/// read independent of the full [`mesofact::manifest::Manifest`] shape.
+/// read independent of the full [`mesofact_core::manifest::Manifest`] shape.
 #[cfg(feature = "ssr")]
 async fn matches_deferred_route(dist: &Path, uri_path: &str) -> bool {
     #[derive(serde::Deserialize)]

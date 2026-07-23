@@ -54,7 +54,7 @@ pub struct RouteEntry {
     pub resilience: Option<ResiliencePolicy>,
 }
 
-/// W181 v1 — schema mirror of `mesofact::manifest::ResiliencePolicy`.
+/// W181 v1 — schema mirror of `mesofact_core::manifest::ResiliencePolicy`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ResiliencePolicy {
     #[serde(default)]

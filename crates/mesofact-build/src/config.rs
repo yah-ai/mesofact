@@ -4,7 +4,7 @@
 //! Rust-native pipeline only needs names + scopes.
 
 use anyhow::{bail, Context, Result};
-use mesofact::validate::{SourceCatalog, SourceScope};
+use mesofact_core::validate::{SourceCatalog, SourceScope};
 use std::path::Path;
 
 pub struct BuildConfig {

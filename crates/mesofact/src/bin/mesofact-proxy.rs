@@ -6,14 +6,14 @@ use axum::{
     Router,
 };
 use clap::Parser;
-use mesofact::proxy::cache::ResponseCache;
-use mesofact::proxy::config::Config;
-use mesofact::proxy::manifest_loader::{load_from_file, watch_manifest};
-use mesofact::proxy::metrics::Metrics;
-use mesofact::proxy::router::{handle, metrics_handler, AppState, SharedState};
-use mesofact::proxy::session::{CookieSessionResolver, SessionResolver};
-use mesofact::proxy::source_gen::Generations;
-use mesofact::proxy::worker_pool::WorkerPool;
+use mesofact_core::proxy::cache::ResponseCache;
+use mesofact_core::proxy::config::Config;
+use mesofact_core::proxy::manifest_loader::{load_from_file, watch_manifest};
+use mesofact_core::proxy::metrics::Metrics;
+use mesofact_core::proxy::router::{handle, metrics_handler, AppState, SharedState};
+use mesofact_core::proxy::session::{CookieSessionResolver, SessionResolver};
+use mesofact_core::proxy::source_gen::Generations;
+use mesofact_core::proxy::worker_pool::WorkerPool;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{watch, RwLock};
@@ -107,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
                             new_pool.clone(),
                         );
                         st.manifest = new_manifest;
-                        st.matcher = mesofact::proxy::router::build_matcher(&st.manifest);
+                        st.matcher = mesofact_core::proxy::router::build_matcher(&st.manifest);
                         drop(st);
                         tokio::spawn(old_pool.drain_all());
                         info!("rolling reload complete");

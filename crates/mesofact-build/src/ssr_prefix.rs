@@ -2,7 +2,7 @@
 //! `packages/mesofact-build/src/ssr-prefix.ts`.
 
 use crate::route_config::RouteEntry;
-use mesofact::manifest::RouteMode;
+use mesofact_core::manifest::RouteMode;
 use std::collections::BTreeSet;
 
 /// Non-parametric route → the full route. Parametric (`:foo`) or wildcard

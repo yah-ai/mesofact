@@ -1,16 +1,40 @@
 [package]
-name = "mesofact-app"
+# Flagship facade (renamed from `mesofact-app` → `mesofact`, W174). ONE crate
+# the world depends on; the subsystems below are selected by feature. The
+# `default` build is the lean, V8-free Rust-handler harness (serve_app/wrap) —
+# case #2 (DIY Rust library). Heavier layers opt in via `dep:`-gated features:
+#   render → ssr → build   (crate deps run core ← ssr ← render ← build)
+# The V8 link (render/ssr) is a prebuilt `librusty_v8.a` CDN download, so those
+# features are cheap to gate. `build` pulls rolldown/lightningcss — the only
+# from-source compile monster — so it stays its own crate behind `dep:`.
+# publish=false held while the crates.io names are in flux (W174 consolidation).
+# Directory is still crates/mesofact-app pending a cosmetic `git mv`.
+name = "mesofact"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "Lean Rust-native app harness — bind/serve loop + standard mesofact stack (tracing, /__mesofact/health, graceful shutdown) for services whose handlers are Rust functions. No V8/deno_core dep; companion to mesofact-dev's JS-bundle pipelines."
+description = "mesofact — Rust-native web framework facade. Default = lean V8-free Rust-handler harness (bind/serve + /__mesofact/health + graceful shutdown); opt into render/ssr/build via features. Re-exports mesofact-core (serve/proxy engine)."
 
 [lib]
-name = "mesofact_app"
+name = "mesofact"
 path = "src/lib.rs"
+
+[features]
+default = []
+# `render` renders data → HTML against a prebuilt dist and needs the JS runtime,
+# so it pulls `ssr` (crate dep direction: render → ssr → core). Both link the
+# prebuilt V8 archive; neither links the bundler.
+ssr = ["dep:mesofact-ssr", "dep:mesofact-core"]
+render = ["ssr", "dep:mesofact-render"]
+# `build` is the full pipeline: rolldown + lightningcss (the sole uncached
+# from-source compile). Kept a separate crate so a stray feature-flip can't
+# silently re-link the bundler into a lean consumer (W225 §2/§3 boundary).
+build = ["render", "dep:mesofact-build"]
+# Publish path (build → R2 → manifest swap → CDN purge).
+publish = ["dep:mesofact-publisher"]
 
 [dependencies]
 anyhow = "1"
@@ -19,6 +43,17 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
+
+# Re-exported subsystems. `mesofact-core` is the serve/proxy engine (pulled only
+# when a feature needs it — the bare harness above is core-free). NOTE axum-major
+# skew: core/render/ssr are axum 0.7, this facade is axum 0.8; re-exports are
+# namespaced (not flattened) so Router types don't cross majors until the axum
+# unification stage lands (W174).
+mesofact-core = { path = "../mesofact", version = "0.8.20", optional = true }
+mesofact-ssr = { path = "../mesofact-ssr", version = "0.8.20", optional = true }
+mesofact-render = { path = "../mesofact-render", version = "0.8.20", optional = true }
+mesofact-build = { path = "../mesofact-build", version = "0.8.20", optional = true }
+mesofact-publisher = { path = "../mesofact-publisher", version = "0.8.20", optional = true }
 
 [dev-dependencies]
 http-body-util = "0.1"

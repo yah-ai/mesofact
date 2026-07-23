@@ -17,7 +17,7 @@
 
 use crate::{CdnPurger, ObjectStore, PurgeError, PutOpts, StoreError};
 use bytes::Bytes;
-use mesofact::Manifest;
+use mesofact_core::Manifest;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;

@@ -23,7 +23,7 @@
 //! - Ctrl-C + SIGTERM (unix) → graceful shutdown — parity with
 //!   mesofact-dev's `shutdown_signal` (lib.rs:670).
 //!
-//! Cache / session / resilience layers live in `mesofact::proxy::*` today
+//! Cache / session / resilience layers live in `mesofact::core::proxy::*` today
 //! and are bundle-shaped; lifting them into `mesofact-app` as
 //! caller-composable `tower::Layer`s is a follow-up once a second
 //! Rust-handler service needs them.
@@ -34,12 +34,29 @@
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @arch:see(.yah/docs/working/W174-mesofact-rust-native-pipeline.md)
 //! @yah:next("yah parent camp R568-T4 consumes this via root [patch.crates-io] mesofact-app = { path = \"oss/mesofact/crates/mesofact-app\" } + a path-deferred version dep in crates/yah/cloud-admin.")
-//! @yah:next("Once a 2nd Rust-handler mesofact service exists, lift cache/session/resilience layers from mesofact::proxy::* into mesofact-app as caller-composable tower::Layers (deferred per lib doc until 2nd consumer appears).")
+//! @yah:next("Once a 2nd Rust-handler mesofact service exists, lift cache/session/resilience layers from mesofact::core::proxy::* into the mesofact facade as caller-composable tower::Layers (deferred per lib doc until 2nd consumer appears).")
 //! @yah:handoff("Landed mesofact-app crate (oss/mesofact/crates/mesofact-app, publish=false). Lean Rust-handler harness: pub HEALTH_PATH const + pub fn wrap(Router) -> Router (adds /__mesofact/health + tower-http TraceLayer) + pub async fn serve_app(Router, SocketAddr) -> Result<()> (binds, wraps, axum::serve with graceful Ctrl-C/SIGTERM) + pub async fn shutdown_signal. Companion to mesofact-dev: no mesofact-ssr/deno_core/V8 dep so pure-Rust services don't inherit the ~75MB V8 binary. Registered in oss/mesofact workspace members. 3 tests pass (health auto-add, serve_app round-trip, documented panic guard on duplicate health route). Continues R448/R449/R450 arc (replacing bun with Rust-native SSR) -- this is the next milestone after R449 swapped the engine, taking handlers from JS to Rust.")
 //! @yah:verify("cargo test -p mesofact-app  # 3 passed")
 //! @yah:gotcha("Tier: Cleric -- discovery+replicate. Mirrored mesofact-dev's health/shutdown_signal shape so probes are drop-in compatible across JS-bundle and Rust-handler services.")
 //! @yah:gotcha("wrap() panics if the caller already registered HEALTH_PATH (axum::Router::merge rejects overlapping method routes regardless of order). Constraint is documented + pinned by a should_panic test; richer-probe services must bypass wrap.")
 //! @yah:gotcha("mesofact-dev refactor to delegate its bind/serve to mesofact-app is deferred -- doable but out of scope for the dogfood landing (R568-T4).")
+
+// ── Facade re-exports ────────────────────────────────────────────────────
+// The subsystems are namespaced (not glob-flattened) on purpose: `mesofact-core`
+// and the render/ssr layers are still axum 0.7 while this facade is axum 0.8, so
+// flattening would collide Router/handler types across majors. Consumers reach
+// them as `mesofact::core::…`, `mesofact::render::…`, etc. Each is gated on the
+// feature that pulls the corresponding crate (see Cargo.toml `[features]`).
+#[cfg(feature = "ssr")]
+pub use mesofact_core as core;
+#[cfg(feature = "ssr")]
+pub use mesofact_ssr as ssr;
+#[cfg(feature = "render")]
+pub use mesofact_render as render;
+#[cfg(feature = "build")]
+pub use mesofact_build as build;
+#[cfg(feature = "publish")]
+pub use mesofact_publisher as publisher;
 
 use std::net::SocketAddr;
 

@@ -5,7 +5,7 @@
 //! build-failure semantics, different (earlier-vs-later) error site.
 
 use anyhow::{bail, Result};
-use mesofact::manifest::{
+use mesofact_core::manifest::{
     CachePolicy, Prerender, Requires, ResiliencePolicy, RouteMode,
     DEFAULT_RESILIENCE_TIMEOUT_MS,
 };

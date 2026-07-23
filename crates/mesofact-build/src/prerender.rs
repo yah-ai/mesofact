@@ -6,7 +6,7 @@
 //! `dist/html/<key>.html`.
 
 use anyhow::{anyhow, Context, Result};
-use mesofact::manifest::RouteMode;
+use mesofact_core::manifest::RouteMode;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::Path;
