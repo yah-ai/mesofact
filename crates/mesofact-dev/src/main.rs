@@ -7,8 +7,9 @@ use std::sync::Arc;
 
 use clap::Parser;
 #[cfg(feature = "ssr")]
-use mesofact_dev::{ssr, SsrSpawnOptions};
-use mesofact_dev::{watcher, Server, WatchOptions, DEFAULT_PORT};
+use mesofact::{ssr, SsrSpawnOptions};
+use mesofact::{Server, DEFAULT_PORT};
+use mesofact_dev::{watcher, WatchOptions};
 use tracing::info;
 
 #[derive(Parser, Debug)]
@@ -83,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
     // camp-vended backend ports so the dashboard E2E (Option B) browser stays
     // single-origin. No map → no proxy (the Option A static path is unchanged).
     if let Some(map_path) = &args.proxy_map {
-        let map = mesofact_dev::ProxyMap::from_json_file(map_path)?;
+        let map = mesofact::ProxyMap::from_json_file(map_path)?;
         info!(
             map = %map_path.display(),
             routes = ?map.routes(),

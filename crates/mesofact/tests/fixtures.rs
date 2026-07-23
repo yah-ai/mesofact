@@ -2,7 +2,7 @@
 //! the TS validator) and asserts the Rust validator's verdict matches the
 //! fixture's `expect` field.
 
-use mesofact::{validate, Manifest, SourceCatalog, SourceScope};
+use mesofact_core::{validate, Manifest, SourceCatalog, SourceScope};
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

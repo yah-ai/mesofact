@@ -11,11 +11,11 @@ use axum::http::{Request, StatusCode};
 use axum::response::Response;
 use axum::Router;
 use axum::routing::{any, get};
-use mesofact::manifest::{CachePolicy, Manifest, Requires, Route, RouteMode, MANIFEST_VERSION};
-use mesofact::proxy::router::{handle, metrics_handler, AppState, SharedState};
-use mesofact::proxy::session::{CookieSessionResolver, SessionResolver};
-use mesofact::proxy::source_gen::Generations;
-use mesofact::proxy::worker_pool::WorkerPool;
+use mesofact_core::manifest::{CachePolicy, Manifest, Requires, Route, RouteMode, MANIFEST_VERSION};
+use mesofact_core::proxy::router::{handle, metrics_handler, AppState, SharedState};
+use mesofact_core::proxy::session::{CookieSessionResolver, SessionResolver};
+use mesofact_core::proxy::source_gen::Generations;
+use mesofact_core::proxy::worker_pool::WorkerPool;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -96,7 +96,7 @@ async fn make_ssr_app(
     }
     let state: SharedState = Arc::new(RwLock::new(st));
     let app = Router::new()
-        .route("/*path", any(handle))
+        .route("/{*path}", any(handle))
         .route("/", any(handle))
         .with_state(state.clone());
     (app, state)
@@ -183,7 +183,7 @@ async fn make_app_no_pool(
         fallback_dir,
     )));
     let app = Router::new()
-        .route("/*path", any(handle))
+        .route("/{*path}", any(handle))
         .route("/", any(handle))
         .with_state(state.clone());
     (app, state)
@@ -571,7 +571,7 @@ async fn mode2_sqlite_generation_bump_invalidates() {
         AppState::new(Arc::new(manifest), pool, None, None).with_generations(generations),
     ));
     let app = Router::new()
-        .route("/*path", any(handle))
+        .route("/{*path}", any(handle))
         .route("/", any(handle))
         .with_state(state);
 
@@ -645,7 +645,7 @@ async fn not_found_renders_error_routes_page_from_route_path() {
     std::fs::write(dir.path().join("404.html"), "<h1>branded 404</h1>").unwrap();
 
     let mut manifest = static_manifest("/hello");
-    manifest.error_routes = Some(mesofact::manifest::ErrorRoutes {
+    manifest.error_routes = Some(mesofact_core::manifest::ErrorRoutes {
         not_found: Some("/404".to_string()),
         server_error: None,
     });
@@ -669,7 +669,7 @@ async fn not_found_without_fallback_dir_is_plaintext() {
         return;
     }
     let mut manifest = static_manifest("/hello");
-    manifest.error_routes = Some(mesofact::manifest::ErrorRoutes {
+    manifest.error_routes = Some(mesofact_core::manifest::ErrorRoutes {
         not_found: Some("/404".to_string()),
         server_error: None,
     });
@@ -689,7 +689,7 @@ async fn not_found_without_fallback_dir_is_plaintext() {
 async fn bad_manifest_keeps_old_live() {
     // Tests the manifest_loader::reload_once() behavior:
     // a bad manifest file does NOT replace the current manifest in the watch channel.
-    use mesofact::proxy::manifest_loader::reload_once;
+    use mesofact_core::proxy::manifest_loader::reload_once;
     use tokio::sync::watch;
 
     let original = Arc::new(static_manifest("/original"));
@@ -706,7 +706,7 @@ async fn bad_manifest_keeps_old_live() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn good_manifest_replaces_old() {
-    use mesofact::proxy::manifest_loader::reload_once;
+    use mesofact_core::proxy::manifest_loader::reload_once;
     use tokio::sync::watch;
 
     let original = Arc::new(static_manifest("/original"));
@@ -775,7 +775,7 @@ async fn worker_pool_spawns_and_pings() {
 fn with_metrics_route(state: SharedState) -> Router {
     Router::new()
         .route("/metrics", get(metrics_handler))
-        .route("/*path", any(handle))
+        .route("/{*path}", any(handle))
         .route("/", any(handle))
         .with_state(state)
 }

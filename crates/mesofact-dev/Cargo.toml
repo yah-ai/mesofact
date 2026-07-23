@@ -6,7 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "Local dev server for mesofact-static workloads — axum + dist/html/ + 404.html fallback. Backs the local-static provider slot; reusable by the cloud reconciler and downstream consumers."
+description = "Dev-tier affordances for mesofact workloads — rebuild-on-change watcher + a local S3 surface standing in for R2, plus the `mesofact-dev` binary. The serving engine lives in the `mesofact` facade; this crate must never be in a prod binary's dependency closure (W225 §2)."
 
 [lib]
 path = "src/lib.rs"
@@ -15,31 +15,26 @@ path = "src/lib.rs"
 name = "mesofact-dev"
 path = "src/main.rs"
 
-[[bin]]
-name = "mesofact-serve"
-path = "src/serve.rs"
-# No `required-features`: the `--bundle` static tier (R599-F3) builds V8-free.
-# The SSR-host + revalidate/tenants modes inside are `#[cfg(feature = "ssr")]`.
+# NOTE: the prod `mesofact-serve` bin used to live here. It moved to the
+# `mesofact` facade — its presence in this crate is exactly what forced the prod
+# binary to link the watcher + dev S3 surface, breaking W225 §2's dev/prod
+# boundary. Do not reintroduce a prod-serving bin in this crate.
 
 # `ssr` (default on) carries the in-process V8 runtime (mesofact-ssr →
-# deno_core → prebuilt librusty_v8). Static/SPA-only consumers can build with
-# `--no-default-features` and skip the V8 toolchain entirely — the same
-# posture the bun era guaranteed ("static/SPA-only workloads must keep
-# working without Bun installed"), carried over to the V8 era. Without `ssr`
-# the `mesofact-serve` container bin is not built and `mode:"ssr"` routes are
-# not dispatchable; static serving, the SPA hydrate path, the same-origin
-# reverse proxy, the watcher, and the dev S3 surface are all unaffected.
+# deno_core → prebuilt librusty_v8), forwarded to the facade. Static/SPA-only
+# consumers can build with `--no-default-features` and skip the V8 toolchain
+# entirely — the same posture the bun era guaranteed, carried over to the V8
+# era. Without `ssr`, `mode:"ssr"` routes are not dispatchable; static serving,
+# the SPA hydrate path, the same-origin reverse proxy, the watcher, and the dev
+# S3 surface are all unaffected.
 [features]
 default = ["ssr"]
-# `ssr` also carries the revalidate receiver (src/revalidate.rs): the
-# ephemeral render → publish path (W225 §3/§4, the mesofact-native replacement
-# for almanac-serve). It needs render (mesofact-render → V8) + publish
-# (mesofact-publisher); both are bundler-free, so the receiver never links
-# rolldown (§3).
-ssr = ["dep:mesofact-ssr", "dep:mesofact-render", "dep:mesofact-publisher", "dep:mesofact-core"]
+# Forwards to the facade's `ssr` tier (runtime + revalidate receiver). The
+# publisher dep stays direct: the dev S3 smoke test drives S3Store itself.
+ssr = ["mesofact/ssr", "dep:mesofact-publisher"]
 
 [dependencies]
-axum = { version = "0.7", default-features = false, features = ["http1", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "process", "time", "sync", "io-util", "net"] }
 # Dev-tier S3 surface (R490-F7): FS-backed s3s-fs so a workload's
 # @mesofact/runtime R2Adapter resolves against a local bucket in `bun run dev`.
@@ -60,21 +55,12 @@ notify = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-# W272 bundle-manifest types (R599-F1) for the `mesofact-serve --bundle` static
-# path (R599-F3). `default-features = false` = types-only (serde + blake3 + toml),
-# so the bundle server never drags the object-store / reqwest `store` weight —
-# and the whole static bundle path builds V8-free (no `ssr` feature). Path dep
-# across the subcamp boundary; the crate isn't published yet.
-yah-mesofact-bundle = { path = "../../../yah-base/crates/mesofact-bundle", version = "0.8.21", default-features = false }
-mesofact-ssr = { path = "../mesofact-ssr", optional = true }
-# Revalidate receiver deps (behind `ssr`). Both are bundler-free (no rolldown /
-# lightningcss) — see mesofact-render's crate doc (W225 §2/§3).
-mesofact-core = { path = "../mesofact", optional = true }
-mesofact-render = { path = "../mesofact-render", optional = true }
+# The serving engine. This crate is now a thin dev-affordance layer ON TOP of
+# the facade rather than the crate that owned the engine (W225 §2a).
+mesofact = { path = "../mesofact-app", version = "0.8.21", default-features = false }
+# Direct publisher dep for the dev-S3 round-trip test (drives S3Store itself).
 mesofact-publisher = { path = "../mesofact-publisher", optional = true }
-futures = "0.3"
-# HTTP client for the same-origin reverse proxy (R513-F10) and the dev S3
-# round-trip test. Loopback http://127.0.0.1 only — no TLS feature.
+# HTTP client for the dev S3 round-trip. Loopback http://127.0.0.1 only — no TLS.
 reqwest = { version = "0.12", default-features = false }
 
 [dev-dependencies]

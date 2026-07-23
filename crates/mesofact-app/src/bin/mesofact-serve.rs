@@ -28,9 +28,9 @@
 //! Part of R599-F3 — the canonical `@yah:ticket(R599-F3, …)` annotation lives
 //! in the parent-camp W272 doc (one block per ID; a second `@yah:` block in this
 //! subcamp file would register a parent-camp R599 id against the mesofact board
-//! scanner). See [`mesofact_dev::Server::from_bundle`].
+//! scanner). See [`mesofact::Server::from_bundle`].
 //!
-//! See the [library crate](mesofact_dev) for the shared `Server` + `ssr`
+//! See the [library crate](crate) for the shared `Server` + `ssr`
 //! machinery this binary composes.
 
 use std::net::{IpAddr, SocketAddr};
@@ -38,7 +38,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
-use mesofact_dev::Server;
+use mesofact::Server;
 use tracing::info;
 #[cfg(feature = "ssr")]
 use tracing::warn;
@@ -207,7 +207,7 @@ fn socket_activation_listener() -> anyhow::Result<Option<tokio::net::TcpListener
 /// error instead of a silent static fallthrough.
 #[cfg(feature = "ssr")]
 async fn run_workload_modes(args: Args) -> anyhow::Result<()> {
-    use mesofact_dev::{revalidate, ssr, tenants, SsrSpawnOptions};
+    use mesofact::{revalidate, ssr, tenants, SsrSpawnOptions};
 
     // Multi-tenant receiver (R446): a tenants/<id>.toml registry, one process
     // hosting many surfaces. Each poke's mirror_key selects its tenant. Takes

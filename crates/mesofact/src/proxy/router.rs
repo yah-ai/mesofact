@@ -133,12 +133,37 @@ impl AppState {
     }
 }
 
+/// Translate a mesofact route pattern into matchit 0.8 syntax.
+///
+/// mesofact's manifest format is Express-style `:param` (and, defensively,
+/// `*rest`) — which is exactly what matchit **0.7** accepted, so this used to be
+/// a no-op. matchit **0.8** switched to brace syntax (`{param}` / `{*rest}`) and
+/// now treats `:` and `*` as ordinary literal characters. That makes the failure
+/// silent rather than loud: an untranslated `/c/:slug` *inserts successfully*
+/// (so the `Err` warning below never fires) but then only ever matches the
+/// literal path `/c/:slug`, so every parameterized route 404s.
+///
+/// Translating here keeps the public manifest format stable while speaking 0.8
+/// to matchit. Segments with an empty name (a bare `:` or `*`) are passed
+/// through untouched so matchit reports them as the malformed patterns they are.
+fn to_matchit_pattern(route: &str) -> String {
+    route
+        .split('/')
+        .map(|seg| match seg.split_at_checked(1) {
+            Some((":", name)) if !name.is_empty() => format!("{{{name}}}"),
+            Some(("*", name)) if !name.is_empty() => format!("{{*{name}}}"),
+            _ => seg.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Build a matchit router from manifest routes (route pattern → route index).
 pub fn build_matcher(manifest: &Manifest) -> matchit::Router<usize> {
     let mut router = matchit::Router::new();
     for (i, route) in manifest.routes.iter().enumerate() {
-        // matchit uses `:param` syntax, which matches the mesofact route format.
-        if let Err(e) = router.insert(&route.route, i) {
+        let pattern = to_matchit_pattern(&route.route);
+        if let Err(e) = router.insert(&pattern, i) {
             tracing::warn!("failed to register route '{}': {e}", route.route);
         }
     }
@@ -784,4 +809,50 @@ fn percent_encode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod matchit_pattern_tests {
+    use super::to_matchit_pattern;
+
+    #[test]
+    fn translates_colon_params_and_star_wildcards() {
+        assert_eq!(to_matchit_pattern("/c/:slug"), "/c/{slug}");
+        assert_eq!(to_matchit_pattern("/api/users/:id"), "/api/users/{id}");
+        assert_eq!(to_matchit_pattern("/x/:a/y/:b"), "/x/{a}/y/{b}");
+        assert_eq!(to_matchit_pattern("/assets/*rest"), "/assets/{*rest}");
+        // Static routes and malformed bare markers pass through untouched.
+        assert_eq!(to_matchit_pattern("/about"), "/about");
+        assert_eq!(to_matchit_pattern("/"), "/");
+        assert_eq!(to_matchit_pattern("/c/:"), "/c/:");
+    }
+
+    /// Regression guard for the matchit 0.7→0.8 syntax break: `:param` inserts
+    /// *successfully* under 0.8 (so no warning fires) but matches nothing,
+    /// silently 404-ing every parameterized route. Pin real matching behavior.
+    #[test]
+    fn translated_params_match_real_segments_and_bind_by_name() {
+        let mut r = matchit::Router::new();
+        r.insert(to_matchit_pattern("/c/:slug"), 1usize).unwrap();
+
+        let m = r.at("/c/hello").expect(":slug must match a real segment");
+        assert_eq!(*m.value, 1);
+        assert_eq!(m.params.get("slug"), Some("hello"));
+
+        // The literal ':slug' path must NOT match once translated.
+        assert!(r.at("/c/hello/extra").is_err());
+    }
+
+    /// The untranslated form is the bug: proves the shim is load-bearing, so a
+    /// future "simplification" that drops it fails here instead of in prod.
+    #[test]
+    fn untranslated_colon_param_is_inert_under_matchit_08() {
+        let mut r = matchit::Router::new();
+        r.insert("/c/:slug", 1usize)
+            .expect("0.8 accepts ':' as a literal — this is why the bug was silent");
+        assert!(
+            r.at("/c/hello").is_err(),
+            "if this now matches, matchit restored ':' support and the shim can be revisited"
+        );
+    }
 }

@@ -122,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
-        .route("/*path", any(handle))
+        .route("/{*path}", any(handle))
         .route("/", any(handle))
         .with_state(state);
 

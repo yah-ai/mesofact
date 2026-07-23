@@ -42,21 +42,50 @@
 //! @yah:gotcha("mesofact-dev refactor to delegate its bind/serve to mesofact-app is deferred -- doable but out of scope for the dogfood landing (R568-T4).")
 
 // ── Facade re-exports ────────────────────────────────────────────────────
-// The subsystems are namespaced (not glob-flattened) on purpose: `mesofact-core`
-// and the render/ssr layers are still axum 0.7 while this facade is axum 0.8, so
-// flattening would collide Router/handler types across majors. Consumers reach
+// Subsystems are namespaced (not glob-flattened) on purpose — consumers reach
 // them as `mesofact::core::…`, `mesofact::render::…`, etc. Each is gated on the
 // feature that pulls the corresponding crate (see Cargo.toml `[features]`).
+//
+// This started as a workaround for an axum-major skew (core/dev on 0.7, facade
+// on 0.8); that skew is now RESOLVED — everything is axum 0.8 — and the
+// namespacing is kept deliberately, bevy-style, so each subsystem keeps its own
+// namespace instead of flattening hundreds of items into the crate root.
 #[cfg(feature = "ssr")]
 pub use mesofact_core as core;
+// NB: re-exported as `ssr_runtime`, not `ssr` — the `ssr` name at this crate
+// root belongs to the SSR *dispatch* module moved in from mesofact-dev below.
+// `ssr_runtime` is the raw deno_core/V8 runtime crate that dispatch drives.
 #[cfg(feature = "ssr")]
-pub use mesofact_ssr as ssr;
+pub use mesofact_ssr as ssr_runtime;
 #[cfg(feature = "render")]
 pub use mesofact_render as render;
 #[cfg(feature = "build")]
 pub use mesofact_build as build;
 #[cfg(feature = "publish")]
 pub use mesofact_publisher as publisher;
+
+// ── The serving engine (moved out of mesofact-dev, W225 §2a) ─────────────
+// These carry the prod serving path. They used to live in `mesofact-dev`, which
+// meant the prod `mesofact-serve` binary linked the dev crate — and therefore
+// the file watcher and the dev S3 surface — breaking the dev/prod crate
+// boundary W225 §2 claims. `mesofact-dev` now depends on THIS crate and holds
+// only `watcher` + `s3` + the dev bin, so that boundary finally holds.
+pub mod proxy;
+pub mod server;
+#[cfg(feature = "ssr")]
+pub mod revalidate;
+#[cfg(feature = "ssr")]
+pub mod ssr;
+#[cfg(feature = "ssr")]
+pub mod tenants;
+
+pub use proxy::{ProxyMap, ProxyState};
+pub use server::{DistPointer, Identity, Server, DEFAULT_PORT};
+#[cfg(feature = "ssr")]
+pub use ssr::{
+    ResiliencePolicy, RetryPolicy, SpawnOptions as SsrSpawnOptions, SsrChild, SsrSlot,
+    DEFAULT_RESILIENCE_TIMEOUT_MS,
+};
 
 use std::net::SocketAddr;
 
