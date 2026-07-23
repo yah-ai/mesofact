@@ -110,7 +110,18 @@ pub async fn build(opts: BuildOptions) -> Result<BuildResult> {
         InstallMode::Auto => !node_modules.exists() && project_root.join("bun.lock").exists(),
     };
     if should_install {
-        let report = install::install(&project_root)?;
+        // `install` is end-to-end blocking (reqwest::blocking + gzip/tar
+        // extraction), and `reqwest::blocking::ClientBuilder::build` builds
+        // *and drops* a private tokio runtime on the calling thread. Dropping
+        // a runtime while a future is being polled panics with "Cannot drop a
+        // runtime in a context where blocking is not allowed", which is what
+        // took out every `desktop-release` run whose isolated worktree had no
+        // node_modules yet. Hand the phase to the blocking pool, where
+        // blocking — and therefore that drop — is legal.
+        let root = project_root.clone();
+        let report = tokio::task::spawn_blocking(move || install::install(&root))
+            .await
+            .context("install phase panicked")??;
         if !report.skipped_fresh {
             tracing::info!(
                 installed = report.installed,

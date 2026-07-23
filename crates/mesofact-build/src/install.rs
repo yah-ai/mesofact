@@ -146,12 +146,17 @@ pub fn install(project_root: &Path) -> Result<InstallReport> {
     let mut installed = 0;
     let mut linked = 0;
     for pkg in &packages {
-        let dest = node_modules.join(&pkg.name);
+        let dest = dest_for(&node_modules, &pkg.name);
         // Locator forms: "<name>@<version>" | "<name>@file:<path>" — find
         // the @ separating name from source (names may start with @scope/).
         let at = pkg.locator.rfind('@').filter(|&i| i > 0).ok_or_else(|| {
             anyhow!("unparseable locator {:?} for {}", pkg.locator, pkg.name)
         })?;
+        // The *registry* name comes from the locator, never from the lock
+        // key: the key is an install path, so a nested entry keyed
+        // "@mesofact/runtime/typescript" would otherwise be fetched as a
+        // package of that name (a guaranteed 404).
+        let registry_name = &pkg.locator[..at];
         let source = &pkg.locator[at + 1..];
         if let Some(rel) = source.strip_prefix("file:") {
             let target = project_root.join(rel);
@@ -171,7 +176,7 @@ pub fn install(project_root: &Path) -> Result<InstallReport> {
                 pkg.locator
             );
         } else {
-            install_registry_package(&client, &cache_dir, &dest, &pkg.name, source, pkg.integrity.as_deref())?;
+            install_registry_package(&client, &cache_dir, &dest, registry_name, source, pkg.integrity.as_deref())?;
             installed += 1;
         }
     }
@@ -179,6 +184,42 @@ pub fn install(project_root: &Path) -> Result<InstallReport> {
     std::fs::create_dir_all(&node_modules)?;
     std::fs::write(&marker, format!("{lock_hash}\n"))?;
     Ok(InstallReport { installed, linked, skipped_fresh: false })
+}
+
+/// Split a bun.lock `packages` key into the chain of package names it encodes.
+///
+/// Keys are install *paths* relative to `node_modules`, not package names:
+/// `"typescript"` is top-level, `"@mesofact/runtime"` is one scoped package,
+/// and `"@mesofact/runtime/typescript"` is a `typescript` nested under
+/// `@mesofact/runtime` (a version conflict bun couldn't hoist). A segment
+/// starting with `@` swallows the following segment as its scope.
+fn split_lock_key(key: &str) -> Vec<String> {
+    let segs: Vec<&str> = key.split('/').collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < segs.len() {
+        if segs[i].starts_with('@') && i + 1 < segs.len() {
+            out.push(format!("{}/{}", segs[i], segs[i + 1]));
+            i += 2;
+        } else {
+            out.push(segs[i].to_string());
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Materialize a lock key as a filesystem path, interposing `node_modules/`
+/// between nesting levels the way npm/bun do on disk.
+fn dest_for(node_modules: &Path, key: &str) -> PathBuf {
+    let mut p = node_modules.to_path_buf();
+    for (i, seg) in split_lock_key(key).into_iter().enumerate() {
+        if i > 0 {
+            p.push("node_modules");
+        }
+        p.push(seg);
+    }
+    p
 }
 
 fn cache_root() -> Result<PathBuf> {
@@ -313,5 +354,33 @@ mod tests {
         assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
         assert_eq!(base64_encode(b""), "");
         assert_eq!(base64_encode(b"ab"), "YWI=");
+    }
+
+    #[test]
+    fn lock_keys_split_into_package_chains() {
+        assert_eq!(split_lock_key("typescript"), vec!["typescript"]);
+        assert_eq!(split_lock_key("@mesofact/runtime"), vec!["@mesofact/runtime"]);
+        assert_eq!(
+            split_lock_key("@mesofact/runtime/typescript"),
+            vec!["@mesofact/runtime", "typescript"]
+        );
+        assert_eq!(
+            split_lock_key("@mesofact/runtime/@types/node"),
+            vec!["@mesofact/runtime", "@types/node"]
+        );
+    }
+
+    #[test]
+    fn nested_lock_keys_get_interposed_node_modules() {
+        let nm = Path::new("/p/node_modules");
+        assert_eq!(dest_for(nm, "typescript"), Path::new("/p/node_modules/typescript"));
+        assert_eq!(
+            dest_for(nm, "@mesofact/runtime"),
+            Path::new("/p/node_modules/@mesofact/runtime")
+        );
+        assert_eq!(
+            dest_for(nm, "@mesofact/runtime/typescript"),
+            Path::new("/p/node_modules/@mesofact/runtime/node_modules/typescript")
+        );
     }
 }
