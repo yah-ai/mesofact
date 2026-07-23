@@ -15,9 +15,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-mesofact-core = { path = "../mesofact", version = "0.8.20" }
-mesofact-ssr = { path = "../mesofact-ssr", version = "0.8.20" }
-mesofact-render = { path = "../mesofact-render", version = "0.8.20" }
+mesofact-core = { path = "../mesofact", version = "0.8.21" }
+mesofact-ssr = { path = "../mesofact-ssr", version = "0.8.21" }
+mesofact-render = { path = "../mesofact-render", version = "0.8.21" }
 
 # W272 bundle-manifest types (R599-F1), across the yah-base workspace boundary.
 # default-features = false keeps this to serde+blake3+toml types only — the

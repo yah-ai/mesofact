@@ -49,11 +49,11 @@ tracing = "0.1"
 # skew: core/render/ssr are axum 0.7, this facade is axum 0.8; re-exports are
 # namespaced (not flattened) so Router types don't cross majors until the axum
 # unification stage lands (W174).
-mesofact-core = { path = "../mesofact", version = "0.8.20", optional = true }
-mesofact-ssr = { path = "../mesofact-ssr", version = "0.8.20", optional = true }
-mesofact-render = { path = "../mesofact-render", version = "0.8.20", optional = true }
-mesofact-build = { path = "../mesofact-build", version = "0.8.20", optional = true }
-mesofact-publisher = { path = "../mesofact-publisher", version = "0.8.20", optional = true }
+mesofact-core = { path = "../mesofact", version = "0.8.21", optional = true }
+mesofact-ssr = { path = "../mesofact-ssr", version = "0.8.21", optional = true }
+mesofact-render = { path = "../mesofact-render", version = "0.8.21", optional = true }
+mesofact-build = { path = "../mesofact-build", version = "0.8.21", optional = true }
+mesofact-publisher = { path = "../mesofact-publisher", version = "0.8.21", optional = true }
 
 [dev-dependencies]
 http-body-util = "0.1"
