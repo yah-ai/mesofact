@@ -1,0 +1,53 @@
+[package]
+# Renamed from `mesofact` → `mesofact-core` (W174 consolidation): this is the
+# serve/proxy engine and true foundation of the stack (0 deps, many dependents).
+# The friendly `mesofact` name now belongs to the flagship facade crate (the
+# ex-`mesofact-app`). Directory is still crates/mesofact pending a cosmetic move.
+name = "mesofact-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "mesofact serve/proxy engine — tri-mode web server core (static push-to-CDN / SSR proxy / SPA shell). Foundation crate re-exported by the `mesofact` facade."
+readme = "README.md"
+keywords = ["web", "ssr", "static-site", "axum"]
+categories = ["web-programming::http-server"]
+
+[lib]
+name = "mesofact_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mesofact-proxy"
+path = "src/bin/mesofact-proxy.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "process", "sync", "signal", "fs"] }
+tower-http = { version = "0.6", features = ["fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+matchit = "0.8"
+num_cpus = "1"
+tempfile = "3"
+anyhow = "1"
+lru = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+toml = "0.8"
+# Shared auth contract: Claims + the keyless Codec trait live in cheers-core;
+# the concrete symmetric PasetoV4Codec (mint/verify) lives in cheers-server
+# after the F6 crate split. Both consumed cross-camp by path dep (R009 / P11).
+cheers-core = { path = "../../../cheers/crates/cheers-core", version = "0.8.21" }
+cheers-server = { path = "../../../cheers/crates/cheers-server", version = "0.8.21" }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

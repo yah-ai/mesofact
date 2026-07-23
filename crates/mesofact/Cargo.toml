@@ -1,53 +1,107 @@
 [package]
-# Renamed from `mesofact` → `mesofact-core` (W174 consolidation): this is the
-# serve/proxy engine and true foundation of the stack (0 deps, many dependents).
-# The friendly `mesofact` name now belongs to the flagship facade crate (the
-# ex-`mesofact-app`). Directory is still crates/mesofact pending a cosmetic move.
-name = "mesofact-core"
+# Flagship facade (renamed from `mesofact-app` → `mesofact`, W174). ONE crate
+# the world depends on; the subsystems below are selected by feature. The
+# `default` build is the lean, V8-free Rust-handler harness (serve_app/wrap) —
+# case #2 (DIY Rust library). Heavier layers opt in via `dep:`-gated features:
+#   render → ssr → build   (crate deps run core ← ssr ← render ← build)
+# The V8 link (render/ssr) is a prebuilt `librusty_v8.a` CDN download, so those
+# features are cheap to gate. `build` pulls rolldown/lightningcss — the only
+# from-source compile monster — so it stays its own crate behind `dep:`.
+# publish=false held while the crates.io names are in flux (W174 consolidation).
+# This crate also hosts the prod serving engine (server/proxy/ssr/revalidate/
+# tenants) and the `mesofact-serve` bin, moved out of mesofact-dev so a prod
+# binary never links dev affordances (W225 §2a).
+name = "mesofact"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "mesofact serve/proxy engine — tri-mode web server core (static push-to-CDN / SSR proxy / SPA shell). Foundation crate re-exported by the `mesofact` facade."
-readme = "README.md"
-keywords = ["web", "ssr", "static-site", "axum"]
-categories = ["web-programming::http-server"]
+publish = false
+description = "mesofact — Rust-native web framework facade. Default = lean V8-free Rust-handler harness (bind/serve + /__mesofact/health + graceful shutdown); opt into render/ssr/build via features. Re-exports mesofact-core (serve/proxy engine)."
 
 [lib]
-name = "mesofact_core"
+name = "mesofact"
 path = "src/lib.rs"
 
-[[bin]]
-name = "mesofact-proxy"
-path = "src/bin/mesofact-proxy.rs"
+[features]
+default = []
+# The SSR serving tier. Carries the in-process V8 runtime AND the revalidate
+# receiver (render → publish), so it pulls render + publisher too — this
+# preserves the exact semantics mesofact-dev's `ssr` feature had before the
+# engine moved here, and is why it is not a thin "just the runtime" flag.
+# Everything here links the *prebuilt* librusty_v8 archive (a CDN download, not
+# a from-source compile); none of it links the bundler.
+ssr = ["dep:mesofact-ssr", "dep:mesofact-render", "dep:mesofact-publisher", "dep:mesofact-core"]
+render = ["ssr"]
+# Publish path (build → R2 → manifest swap → CDN purge).
+publish = ["dep:mesofact-publisher"]
+# `build` is the full pipeline: rolldown + lightningcss (the sole uncached
+# from-source compile). Kept a separate crate so a stray feature-flip can't
+# silently re-link the bundler into a lean consumer (W225 §2/§3 boundary).
+build = ["ssr", "dep:mesofact-build"]
+
+# ── The shipped-binary preset ────────────────────────────────────────────
+# THE definition of what the distributed `mesofact-serve` binary contains.
+# Strategy A (we build it arch-native per libc, cache it, kamaji fetches it) and
+# Strategy B (a consumer builds the same thing from source) are the same crate at
+# two lifecycle stages — they agree *by construction* only because both build
+# this one preset rather than re-listing features (W225 §2a).
+#
+# Deliberately NOT `build`: the shipped runtime serves an already-built bundle,
+# so it must not carry rolldown/lightningcss. Anything that changes here changes
+# what ships — Dockerfile.ssr-runtime and the arch×libc release matrix both build
+# `--features deploy`.
+deploy = ["ssr"]
 
 [dependencies]
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "process", "time", "sync", "io-util", "net"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+# Engine deps (moved in with the serving path from mesofact-dev).
+futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "2"
-axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "process", "sync", "signal", "fs"] }
-tower-http = { version = "0.6", features = ["fs"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4", features = ["derive", "env"] }
-matchit = "0.8"
-num_cpus = "1"
-tempfile = "3"
-anyhow = "1"
-lru = "0.12"
-sha2 = "0.10"
-hex = "0.4"
 toml = "0.8"
-# Shared auth contract: Claims + the keyless Codec trait live in cheers-core;
-# the concrete symmetric PasetoV4Codec (mint/verify) lives in cheers-server
-# after the F6 crate split. Both consumed cross-camp by path dep (R009 / P11).
-cheers-core = { path = "../../../cheers/crates/cheers-core", version = "0.8.21" }
-cheers-server = { path = "../../../cheers/crates/cheers-server", version = "0.8.21" }
+# HTTP client for the same-origin reverse proxy (R513-F10). Loopback only — no
+# TLS feature.
+reqwest = { version = "0.12", default-features = false }
+# CLI + logging for the prod `mesofact-serve` bin.
+clap = { version = "4", features = ["derive", "env"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# W272 bundle-manifest types (R599-F1) for the `--bundle` static path (R599-F3).
+# default-features = false = types-only (serde + blake3 + toml), so the bundle
+# server never drags the object-store / reqwest `store` weight — and the whole
+# static bundle path builds V8-free (no `ssr` feature).
+yah-mesofact-bundle = { path = "../../../yah-base/crates/mesofact-bundle", version = "0.8.21", default-features = false }
+
+# Re-exported subsystems. `mesofact-core` carries the manifest types + proxy
+# primitives (pulled only when a feature needs it — the bare harness above is
+# core-free). The axum-major skew is RESOLVED as of the 0.7→0.8 unification:
+# core, dev and this facade are all axum 0.8, so Router types now unify. The
+# re-exports below stay **namespaced** (`mesofact::core::…`) by choice, not
+# workaround — a bevy-style facade keeps subsystem namespaces rather than
+# flattening a few hundred items into one root.
+mesofact-core = { path = "../mesofact-core", version = "0.8.21", optional = true }
+mesofact-ssr = { path = "../mesofact-ssr", version = "0.8.21", optional = true }
+mesofact-render = { path = "../mesofact-render", version = "0.8.21", optional = true }
+mesofact-build = { path = "../mesofact-build", version = "0.8.21", optional = true }
+mesofact-publisher = { path = "../mesofact-publisher", version = "0.8.21", optional = true }
+
+[[bin]]
+# The prod serving binary — Strategy A's artifact. Moved here from
+# mesofact-dev (where its presence was what broke the dev/prod boundary).
+# No `required-features`: the `--bundle` static tier (R599-F3) builds V8-free;
+# the SSR-host + revalidate/tenants modes inside are `#[cfg(feature = "ssr")]`.
+name = "mesofact-serve"
+path = "src/bin/mesofact-serve.rs"
 
 [dev-dependencies]
-serde_json = "1"
+http-body-util = "0.1"
 tempfile = "3"
+reqwest = { version = "0.12", default-features = false }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tower = { version = "0.5", features = ["util"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

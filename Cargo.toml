@@ -3,13 +3,13 @@
 # excludes `external/`, so this tree carries independent git history.
 [workspace]
 members = [
-    "crates/mesofact",
+    "crates/mesofact-core",
     "crates/mesofact-publisher",
     "crates/mesofact-dev",
     "crates/mesofact-build",
     "crates/mesofact-render",
     "crates/mesofact-ssr",
-    "crates/mesofact-app",
+    "crates/mesofact",
 ]
 resolver = "2"
 

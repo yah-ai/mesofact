@@ -35,7 +35,19 @@ COPY . .
 
 # Release build keeps the V8-dominated binary as small as the static link allows
 # (~50MB target, R449-T4).
-RUN cargo build --release -p mesofact-dev --bin mesofact-serve
+#
+# `mesofact-serve` moved from `mesofact-dev` to the `mesofact` facade (W225 §2a):
+# hosting the prod bin in the dev crate is what dragged the file watcher + dev S3
+# surface into this image. Building `-p mesofact` keeps those out by
+# construction. A feature is required — the facade defaults to the lean V8-free
+# harness, and this image is the SSR host. The bin NAME is unchanged, so the
+# ENTRYPOINT and every kamaji/pond spec that invokes `mesofact-serve` still works
+# untouched.
+#
+# Build the `deploy` PRESET, never a hand-listed feature set: `deploy` is the
+# single definition of what ships, shared with the arch×libc release matrix, so
+# this image and a from-source consumer build can't drift (W225 §2a).
+RUN cargo build --release -p mesofact --bin mesofact-serve --features deploy
 
 # ── runtime ────────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
