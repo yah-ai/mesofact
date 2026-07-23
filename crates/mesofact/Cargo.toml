@@ -1,17 +1,21 @@
 [package]
-name = "mesofact"
+# Renamed from `mesofact` → `mesofact-core` (W174 consolidation): this is the
+# serve/proxy engine and true foundation of the stack (0 deps, many dependents).
+# The friendly `mesofact` name now belongs to the flagship facade crate (the
+# ex-`mesofact-app`). Directory is still crates/mesofact pending a cosmetic move.
+name = "mesofact-core"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Tri-mode web server: static (push-to-CDN) / SSR (Bun render pool behind a Rust proxy) / SPA shell"
+description = "mesofact serve/proxy engine — tri-mode web server core (static push-to-CDN / SSR proxy / SPA shell). Foundation crate re-exported by the `mesofact` facade."
 readme = "README.md"
 keywords = ["web", "ssr", "static-site", "axum"]
 categories = ["web-programming::http-server"]
 
 [lib]
-name = "mesofact"
+name = "mesofact_core"
 path = "src/lib.rs"
 
 [[bin]]

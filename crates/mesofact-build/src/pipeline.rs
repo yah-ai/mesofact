@@ -14,7 +14,7 @@
 //! 10. manifest + tag-index emission
 
 use anyhow::{anyhow, bail, Context, Result};
-use mesofact::manifest::{Hydration, RouteMode};
+use mesofact_core::manifest::{Hydration, RouteMode};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 

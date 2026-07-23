@@ -1,13 +1,13 @@
 //! Manifest assembly — port of `packages/mesofact-build/src/manifest-build.ts`.
-//! Builds the `mesofact::manifest::Manifest` from the authored routes +
+//! Builds the `mesofact_core::manifest::Manifest` from the authored routes +
 //! bundle outputs, then runs the crate validator (same R1/R2 rules the TS
 //! validate() applies).
 
 use anyhow::{anyhow, bail, Result};
-use mesofact::manifest::{
+use mesofact_core::manifest::{
     Hydration, Manifest, Route, RouteMode, StaticAsset, MANIFEST_VERSION,
 };
-use mesofact::validate::SourceCatalog;
+use mesofact_core::validate::SourceCatalog;
 use std::collections::BTreeMap;
 
 use crate::route_config::{ErrorRoutes, Placement, RouteEntry, RoutesConfig};
@@ -42,7 +42,7 @@ pub fn assemble_manifest(input: AssembleInput<'_>) -> Result<Manifest> {
         ssr_prefixes: (!ssr_prefixes.is_empty()).then_some(ssr_prefixes),
     };
 
-    if let Err(errors) = mesofact::validate::validate(&manifest, input.catalog) {
+    if let Err(errors) = mesofact_core::validate::validate(&manifest, input.catalog) {
         let detail = errors
             .iter()
             .map(|e| format!("  - [{}] {}", e.kind.label(), e))
@@ -53,8 +53,8 @@ pub fn assemble_manifest(input: AssembleInput<'_>) -> Result<Manifest> {
     Ok(manifest)
 }
 
-fn to_manifest_error_routes(e: &ErrorRoutes) -> mesofact::manifest::ErrorRoutes {
-    mesofact::manifest::ErrorRoutes {
+fn to_manifest_error_routes(e: &ErrorRoutes) -> mesofact_core::manifest::ErrorRoutes {
+    mesofact_core::manifest::ErrorRoutes {
         not_found: e.not_found.clone(),
         server_error: e.server_error.clone(),
     }
@@ -74,8 +74,8 @@ fn build_route(entry: &RouteEntry, input: &AssembleInput<'_>) -> Result<Route> {
     // `auto`/undefined placement resolves to host today (W173 § "auto
     // resolution"); only emitted for ssr routes.
     let placement = (entry.mode == RouteMode::Ssr).then(|| match entry.placement {
-        Some(Placement::Edge) => mesofact::manifest::ResolvedPlacement::Edge,
-        _ => mesofact::manifest::ResolvedPlacement::Host,
+        Some(Placement::Edge) => mesofact_core::manifest::ResolvedPlacement::Edge,
+        _ => mesofact_core::manifest::ResolvedPlacement::Host,
     });
 
     Ok(Route {

@@ -70,7 +70,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use mesofact::manifest::{Manifest, RouteMode};
+use mesofact_core::manifest::{Manifest, RouteMode};
 use mesofact_publisher::{
     publish_dist, CloudflareCdnPurger, PublishConfig, PublishReport, S3Store,
 };

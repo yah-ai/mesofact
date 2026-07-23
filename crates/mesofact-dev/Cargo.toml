@@ -36,7 +36,7 @@ default = ["ssr"]
 # for almanac-serve). It needs render (mesofact-render → V8) + publish
 # (mesofact-publisher); both are bundler-free, so the receiver never links
 # rolldown (§3).
-ssr = ["dep:mesofact-ssr", "dep:mesofact-render", "dep:mesofact-publisher", "dep:mesofact"]
+ssr = ["dep:mesofact-ssr", "dep:mesofact-render", "dep:mesofact-publisher", "dep:mesofact-core"]
 
 [dependencies]
 axum = { version = "0.7", default-features = false, features = ["http1", "tokio"] }
@@ -69,7 +69,7 @@ yah-mesofact-bundle = { path = "../../../yah-base/crates/mesofact-bundle", versi
 mesofact-ssr = { path = "../mesofact-ssr", optional = true }
 # Revalidate receiver deps (behind `ssr`). Both are bundler-free (no rolldown /
 # lightningcss) — see mesofact-render's crate doc (W225 §2/§3).
-mesofact = { path = "../mesofact", optional = true }
+mesofact-core = { path = "../mesofact", optional = true }
 mesofact-render = { path = "../mesofact-render", optional = true }
 mesofact-publisher = { path = "../mesofact-publisher", optional = true }
 futures = "0.3"

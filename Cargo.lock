@@ -2909,6 +2909,50 @@ name = "mesofact"
 version = "0.8.20"
 dependencies = [
  "anyhow",
+ "axum 0.8.9",
+ "http-body-util",
+ "mesofact-build",
+ "mesofact-core",
+ "mesofact-publisher",
+ "mesofact-render",
+ "mesofact-ssr",
+ "reqwest",
+ "tokio",
+ "tower",
+ "tower-http 0.6.10",
+ "tracing",
+]
+
+[[package]]
+name = "mesofact-build"
+version = "0.8.20"
+dependencies = [
+ "anyhow",
+ "clap",
+ "flate2",
+ "lightningcss",
+ "mesofact-core",
+ "mesofact-render",
+ "mesofact-ssr",
+ "reqwest",
+ "rolldown",
+ "rolldown_common",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "yah-mesofact-bundle",
+]
+
+[[package]]
+name = "mesofact-core"
+version = "0.8.20"
+dependencies = [
+ "anyhow",
  "axum 0.7.9",
  "cheers-core",
  "cheers-server",
@@ -2932,45 +2976,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mesofact-app"
-version = "0.8.20"
-dependencies = [
- "anyhow",
- "axum 0.8.9",
- "http-body-util",
- "reqwest",
- "tokio",
- "tower",
- "tower-http 0.6.10",
- "tracing",
-]
-
-[[package]]
-name = "mesofact-build"
-version = "0.8.20"
-dependencies = [
- "anyhow",
- "clap",
- "flate2",
- "lightningcss",
- "mesofact",
- "mesofact-render",
- "mesofact-ssr",
- "reqwest",
- "rolldown",
- "rolldown_common",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tar",
- "tempfile",
- "tokio",
- "toml",
- "tracing",
- "yah-mesofact-bundle",
-]
-
-[[package]]
 name = "mesofact-dev"
 version = "0.8.20"
 dependencies = [
@@ -2980,7 +2985,7 @@ dependencies = [
  "clap",
  "futures",
  "hyper-util",
- "mesofact",
+ "mesofact-core",
  "mesofact-publisher",
  "mesofact-render",
  "mesofact-ssr",
@@ -3010,7 +3015,7 @@ dependencies = [
  "clap",
  "hex",
  "hmac 0.12.1",
- "mesofact",
+ "mesofact-core",
  "percent-encoding",
  "reqwest",
  "serde",
@@ -3027,7 +3032,7 @@ name = "mesofact-render"
 version = "0.8.20"
 dependencies = [
  "anyhow",
- "mesofact",
+ "mesofact-core",
  "mesofact-ssr",
  "serde",
  "serde_json",

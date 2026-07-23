@@ -21,7 +21,7 @@
 //! given).
 
 use anyhow::{anyhow, bail, Context, Result};
-use mesofact::manifest::{Manifest, Route, RouteMode};
+use mesofact_core::manifest::{Manifest, Route, RouteMode};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

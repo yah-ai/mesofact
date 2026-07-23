@@ -4,7 +4,7 @@
 //! manifest entries.
 
 use anyhow::{Context, Result};
-use mesofact::manifest::StaticAsset;
+use mesofact_core::manifest::StaticAsset;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 

@@ -4,7 +4,7 @@
 //! `prerender.ts`.
 
 use anyhow::{bail, Context, Result};
-use mesofact::manifest::Prerender;
+use mesofact_core::manifest::Prerender;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
