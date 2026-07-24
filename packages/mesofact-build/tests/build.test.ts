@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { R2Adapter, clearR2Registry, registerR2 } from "@mesofact/runtime";
 import { build, ValidationFailed } from "../src/index.js";
+import { contentTypeFor } from "../src/static-assets.js";
 
 const FIXTURES = fileURLToPath(new URL("./fixtures/", import.meta.url));
 
@@ -704,6 +705,16 @@ describe("build (static-assets overlay — R490-F4)", () => {
 
     // Routes still build alongside the overlay.
     expect(existsSync(join(outDir, "html", "index.html"))).toBe(true);
+  });
+
+  test("serves .sh as readable text/plain, not a download (R560-F1)", () => {
+    // yah.dev/install.sh is served out of public/. `curl … | sh` only earns
+    // trust if a human can open the URL and read the script first, which they
+    // cannot if it arrives as octet-stream and the browser saves it to disk.
+    expect(contentTypeFor("install.sh")).toBe("text/plain; charset=utf-8");
+    expect(contentTypeFor("nested/install.SH")).toBe("text/plain; charset=utf-8");
+    // Genuinely opaque extensions still fall back.
+    expect(contentTypeFor("blob.bin")).toBe("application/octet-stream");
   });
 
   test("a workload without public/ emits an empty static_assets", async () => {

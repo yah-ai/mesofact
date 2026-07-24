@@ -28,6 +28,13 @@ const CONTENT_TYPES: Record<string, string> = {
   ".mjs": "text/javascript; charset=utf-8",
   ".json": "application/json",
   ".txt": "text/plain; charset=utf-8",
+  // text/plain, not text/x-shellscript, and deliberately so: a shell script in
+  // public/ is nearly always a `curl … | sh` installer, and the whole trust
+  // posture of that pattern is "read the script before you pipe it". Serving it
+  // as x-shellscript (or falling through to octet-stream) makes a browser
+  // DOWNLOAD it instead of showing it. Every installer host worth copying
+  // (sh.rustup.rs, get.docker.com) serves text/plain for the same reason.
+  ".sh": "text/plain; charset=utf-8",
   ".xml": "application/xml",
   ".svg": "image/svg+xml",
   ".png": "image/png",

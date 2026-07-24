@@ -17,7 +17,13 @@ pub fn content_type_for(rel_path: &str) -> &'static str {
         "css" => "text/css; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",
         "json" => "application/json",
-        "txt" => "text/plain; charset=utf-8",
+        // text/plain, not text/x-shellscript, and deliberately so: a shell
+        // script in public/ is nearly always a `curl … | sh` installer, and the
+        // whole trust posture of that pattern is "read the script before you
+        // pipe it". Serving it as x-shellscript (or falling through to
+        // octet-stream) makes a browser DOWNLOAD it instead of showing it.
+        // Keep in lockstep with the TS mirror (R560-F1).
+        "txt" | "sh" => "text/plain; charset=utf-8",
         "xml" => "application/xml",
         "svg" => "image/svg+xml",
         "png" => "image/png",
@@ -69,6 +75,23 @@ pub fn discover_static_assets(
         });
     }
     Ok(assets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::content_type_for;
+
+    #[test]
+    fn shell_scripts_are_readable_text_not_a_download() {
+        // yah.dev/install.sh is served out of public/. `curl … | sh` only earns
+        // trust if a human can open the URL and read the script first, which
+        // they cannot if it arrives as octet-stream and the browser saves it to
+        // disk (R560-F1).
+        assert_eq!(content_type_for("install.sh"), "text/plain; charset=utf-8");
+        assert_eq!(content_type_for("nested/install.SH"), "text/plain; charset=utf-8");
+        // Genuinely opaque extensions still fall back.
+        assert_eq!(content_type_for("blob.bin"), "application/octet-stream");
+    }
 }
 
 fn walk(abs_dir: &Path, rel_prefix: &str, out: &mut Vec<String>) -> Result<()> {
