@@ -7,17 +7,22 @@
 # The V8 link (render/ssr) is a prebuilt `librusty_v8.a` CDN download, so those
 # features are cheap to gate. `build` pulls rolldown/lightningcss — the only
 # from-source compile monster — so it stays its own crate behind `dep:`.
-# publish=false held while the crates.io names are in flux (W174 consolidation).
 # This crate also hosts the prod serving engine (server/proxy/ssr/revalidate/
 # tenants) and the `mesofact-serve` bin, moved out of mesofact-dev so a prod
 # binary never links dev affordances (W225 §2a).
+#
+# The W174 publish hold is LIFTED (2026-07-24): it was held only "while the
+# crates.io names are in flux", and the consolidation has landed — mesofact-app
+# → mesofact, mesofact → mesofact-core. All six workspace names are confirmed
+# free on the sparse index (no squat), so this publishes under the plain name.
 name = "mesofact"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
+keywords = ["web", "framework", "ssr", "server", "static-site"]
+categories = ["web-programming::http-server", "web-programming"]
 description = "mesofact — Rust-native web framework facade. Default = lean V8-free Rust-handler harness (bind/serve + /__mesofact/health + graceful shutdown); opt into render/ssr/build via features. Re-exports mesofact-core (serve/proxy engine)."
 
 [lib]

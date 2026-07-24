@@ -1,0 +1,50 @@
+# `cross` configuration for the mesofact release builds (R560-F1).
+#
+# oss/mesofact is an independent Cargo workspace (excluded from the yah root
+# workspace), so `cross` run from here resolves THIS config — not the yah-root
+# Cross.toml. Two settings, both load-bearing; without either, the two
+# `*-unknown-linux-gnu` legs of release.yml's `mesofact-build` job fail.
+#
+# ── Repo-root volume ────────────────────────────────────────────────────────
+# mesofact has path deps that ESCAPE its own workspace dir:
+#
+#   crates/mesofact/Cargo.toml        yah-mesofact-bundle → ../../../yah-base/…
+#   crates/mesofact-build/Cargo.toml  yah-mesofact-bundle → ../../../yah-base/…
+#   crates/mesofact-core/Cargo.toml   cheers-core, cheers-server → ../../../cheers/…
+#
+# Those resolve to `oss/yah-base` and `oss/cheers` — SIBLING workspaces. cross
+# mounts only the current workspace dir into the build container by default, so
+# those paths (and the sibling `Cargo.toml`s they inherit from) fall outside the
+# mount and the build dies with "failed to find a workspace root". Bind-mounting
+# the whole repo at its real path makes the siblings visible. Same mechanism and
+# same reason as oss/yubaba/Cross.toml's ../qed mount — keep them in sync.
+#
+# YAH_REPO_ROOT is set to the repo root by the `mesofact-build` job in
+# .github/workflows/release.yml. A local `cross` run must export it too.
+[build.env]
+volumes = ["YAH_REPO_ROOT"]
+
+# ── Image pins ──────────────────────────────────────────────────────────────
+# Pinned to `:main`, NOT the version-derived `:0.2.5` images, and this is not
+# cosmetic: the 0.2.5 images are Ubuntu 18.04 (glibc 2.27), which cannot even
+# execute a modern Rust toolchain's own build-script binaries — and
+# rust-toolchain.toml here pins channel 1.97.0 (R560-T2, needed for
+# oxc_transformer). The `main` images are Ubuntu 20.04 / glibc 2.31.
+#
+# glibc 2.31 is also the right FLOOR for what we ship: it is older than Debian
+# 12 (2.36), Ubuntu 22.04 (2.35) and RHEL 9 (2.34), so the published binary runs
+# on all of them. Building these legs natively on ubuntu-latest instead would
+# bake in glibc 2.39 and the artifact would refuse to start on any of the above
+# — which is precisely why release.yml routes the gnu legs through cross rather
+# than doing the cheaper native build.
+#
+# No pre-build hooks: unlike oss/yubaba, nothing here needs protoc (no
+# prost/tonic in the graph) or nasm (no rav1e / `all-image`). The `v8` crate
+# downloads its prebuilt librusty_v8.a from within its own build script, which
+# carries its own TLS stack and root certs, so no curl/ca-certificates hook is
+# needed either.
+[target.x86_64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:main"
+
+[target.aarch64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main"
