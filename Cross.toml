@@ -25,24 +25,36 @@
 volumes = ["YAH_REPO_ROOT"]
 
 # ── Image pins ──────────────────────────────────────────────────────────────
-# Pinned to `:main`, NOT the version-derived `:0.2.5` images, and this is not
-# cosmetic: the 0.2.5 images are Ubuntu 18.04 (glibc 2.27), which cannot even
-# execute a modern Rust toolchain's own build-script binaries — and
-# rust-toolchain.toml here pins channel 1.97.0 (R560-T2, needed for
-# oxc_transformer). The `main` images are Ubuntu 20.04 / glibc 2.31.
+# Pinned to `:main`, NOT the version-derived `:0.2.5` images: the 0.2.5 images
+# are Ubuntu 16.04 / glibc 2.23 (measured 2026-07-24), far too old to execute a
+# modern Rust toolchain's own binaries — and rust-toolchain.toml here pins
+# channel 1.97.0 (R560-T2, needed for oxc_transformer).
 #
-# glibc 2.31 is also the right FLOOR for what we ship: it is older than Debian
-# 12 (2.36), Ubuntu 22.04 (2.35) and RHEL 9 (2.34), so the published binary runs
-# on all of them. Building these legs natively on ubuntu-latest instead would
-# bake in glibc 2.39 and the artifact would refuse to start on any of the above
-# — which is precisely why release.yml routes the gnu legs through cross rather
-# than doing the cheaper native build.
+# DO NOT read a glibc-compatibility benefit into this. Measured 2026-07-24:
+#
+#   ghcr.io/cross-rs/{x86_64,aarch64}-unknown-linux-gnu:main  Ubuntu 24.04, glibc 2.39
+#   ghcr.io/cross-rs/x86_64-unknown-linux-gnu:0.2.5           Ubuntu 16.04, glibc 2.23
+#
+# 2.39 is exactly what a native `ubuntu-latest` build gives, so cross buys the
+# gnu legs NOTHING on the compatibility axis — and cross publishes no image in
+# between. An earlier revision of this file (and of release.yml's job comment)
+# claimed `:main` was Ubuntu 20.04 / glibc 2.31 and justified the cross routing
+# on that basis; that was wrong, inherited from a now-stale comment in
+# oss/yubaba/Cross.toml. The real, measured floor of the produced binary is
+# GLIBC_2.39, which does not run on Debian 12 (2.36), Ubuntu 22.04 (2.35), or
+# RHEL 9 / Amazon Linux 2023 (2.34). Tracked as R639 — expect these two target
+# blocks to be REPLACED by an explicit-floor toolchain (cargo-zigbuild) rather
+# than tuned.
+#
+# What cross IS still buying here: a working aarch64-unknown-linux-gnu
+# cross-compile from an x86_64 runner without hand-managing a sysroot.
 #
 # No pre-build hooks: unlike oss/yubaba, nothing here needs protoc (no
 # prost/tonic in the graph) or nasm (no rav1e / `all-image`). The `v8` crate
 # downloads its prebuilt librusty_v8.a from within its own build script, which
 # carries its own TLS stack and root certs, so no curl/ca-certificates hook is
-# needed either.
+# needed either — verified 2026-07-24 by a real build (183,580,304-byte
+# librusty_v8.a fetched, zero .ninja files, 105s wall-clock).
 [target.x86_64-unknown-linux-gnu]
 image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:main"
 
