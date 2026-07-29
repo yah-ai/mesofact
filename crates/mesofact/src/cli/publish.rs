@@ -101,7 +101,7 @@ async fn run_real(args: PublishArgs) -> ExitCode {
         &creds.access_key_id,
         &creds.secret_access_key,
     ) {
-        Ok(s) => s,
+        Ok(s) => s.with_base_prefix(cfg.prefix.clone().unwrap_or_default()),
         Err(err) => {
             eprintln!("mesofact-publish: S3 store init failed: {err}");
             return ExitCode::from(1);

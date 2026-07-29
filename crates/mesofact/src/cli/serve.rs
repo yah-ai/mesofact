@@ -205,6 +205,14 @@ fn socket_activation_listener() -> anyhow::Result<Option<tokio::net::TcpListener
 async fn run_workload_modes(args: ServeArgs) -> anyhow::Result<()> {
     use crate::{revalidate, ssr, tenants, SsrSpawnOptions};
 
+    // `--listen host:port` is the W272 canonical bind form and the one kamaji
+    // passes when it forks a receiver alongside a bundle's static server. The
+    // receiver modes used to read `--host`/`--port` directly, so a `--listen`
+    // was silently ignored and the receiver bound 0.0.0.0:3000 — publicly, and
+    // on whatever port the caller thought it had moved off of. Resolve through
+    // `bind_addr()` so all modes agree on one precedence.
+    let addr = args.bind_addr();
+
     // Multi-tenant receiver (R446): a tenants/<id>.toml registry, one process
     // hosting many surfaces. Each poke's mirror_key selects its tenant. Takes
     // precedence over the single-tenant receiver and needs no `workload`.
@@ -216,7 +224,7 @@ async fn run_workload_modes(args: ServeArgs) -> anyhow::Result<()> {
         let resolved = tenants::resolve_tenants(files, |name| std::env::var(name).ok());
         let registry = tenants::TenantRegistry::new(resolved);
         info!(tenants = registry.len(), dir = %tenants_dir.display(), "multi-tenant revalidate receiver");
-        return tenants::serve(registry, args.host, args.port).await;
+        return tenants::serve(registry, addr.ip(), addr.port()).await;
     }
 
     // Receiver mode (W225 §4): ephemeral render → publish, no resident isolate,
@@ -233,8 +241,8 @@ async fn run_workload_modes(args: ServeArgs) -> anyhow::Result<()> {
                 publish_config: args.publish_config,
                 mirror_key: args.mirror_key,
             },
-            args.host,
-            args.port,
+            addr.ip(),
+            addr.port(),
         )
         .await;
     }

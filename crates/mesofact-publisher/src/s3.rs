@@ -65,6 +65,9 @@ pub struct S3Store {
     region: String,
     access_key_id: String,
     secret_access_key: String,
+    /// Base key prefix prepended to every object key (get/head/put/list).
+    /// `""` or `"<prefix>/"`. Lets one bucket host disjoint surfaces.
+    base_prefix: String,
 }
 
 impl std::fmt::Debug for S3Store {
@@ -73,6 +76,7 @@ impl std::fmt::Debug for S3Store {
             .field("endpoint", &self.endpoint)
             .field("bucket", &self.bucket)
             .field("region", &self.region)
+            .field("base_prefix", &self.base_prefix)
             .field("access_key_id", &"<redacted>")
             .finish()
     }
@@ -98,18 +102,34 @@ impl S3Store {
             region: region.into(),
             access_key_id: access_key_id.into(),
             secret_access_key: secret_access_key.into(),
+            base_prefix: String::new(),
         })
     }
 
+    /// Set a base key prefix applied to every object key (get/head/put/list),
+    /// so one bucket can host several surfaces under disjoint prefixes (e.g.
+    /// `yah-marketing/cloud/`). Normalized to `""` or `"<p>/"` — no leading
+    /// slash, exactly one trailing slash. See `mesofact.config.toml` `prefix`.
+    pub fn with_base_prefix(mut self, prefix: impl Into<String>) -> Self {
+        let p = prefix.into();
+        let trimmed = p.trim_matches('/');
+        self.base_prefix = if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!("{trimmed}/")
+        };
+        self
+    }
+
     fn key_url(&self, key: &str) -> String {
-        let encoded = encode_key(key);
+        let encoded = encode_key(&format!("{}{}", self.base_prefix, key));
         format!("{}/{}/{}", self.endpoint, self.bucket, encoded)
     }
 
     fn list_url(&self, prefix: &str, continuation: Option<&str>) -> (String, Vec<(String, String)>) {
         let mut query = vec![
             ("list-type".to_string(), "2".to_string()),
-            ("prefix".to_string(), prefix.to_string()),
+            ("prefix".to_string(), format!("{}{}", self.base_prefix, prefix)),
         ];
         if let Some(token) = continuation {
             query.push(("continuation-token".to_string(), token.to_string()));
@@ -205,7 +225,13 @@ impl ObjectStore for S3Store {
                 .await
                 .map_err(|e| StoreError::Transport(format!("read body: {e}")))?;
             let (page_keys, next_token) = parse_list_v2(&xml);
-            keys.extend(page_keys);
+            // S3 returns full (prefixed) keys; strip base_prefix so callers see
+            // the logical keys they passed to put/get. Empty prefix strips nothing.
+            keys.extend(page_keys.into_iter().map(|k| {
+                k.strip_prefix(&self.base_prefix)
+                    .map(str::to_string)
+                    .unwrap_or(k)
+            }));
             if let Some(token) = next_token {
                 continuation = Some(token);
             } else {
@@ -480,6 +506,41 @@ mod tests {
         assert_eq!(
             encode_key("build-2026/html/about.html"),
             "build-2026/html/about.html"
+        );
+    }
+
+    #[test]
+    fn base_prefix_prepends_to_every_key() {
+        let store = S3Store::new(
+            "https://acct.r2.cloudflarestorage.com",
+            "yah-dev",
+            "auto",
+            "ak",
+            "sk",
+        )
+        .unwrap()
+        .with_base_prefix("yah-marketing/cloud");
+        assert_eq!(
+            store.key_url("build-1/html/releases.html"),
+            "https://acct.r2.cloudflarestorage.com/yah-dev/yah-marketing/cloud/build-1/html/releases.html"
+        );
+        // list_url folds the prefix into the S3 `prefix` query param.
+        let (_url, query) = store.list_url("build-1/", None);
+        assert!(query
+            .iter()
+            .any(|(k, v)| k == "prefix" && v == "yah-marketing/cloud/build-1/"));
+    }
+
+    #[test]
+    fn base_prefix_defaults_empty_and_normalizes_slashes() {
+        // Default: no prefix — keys at bucket root (back-compat).
+        let store = S3Store::new("https://e", "b", "auto", "ak", "sk").unwrap();
+        assert_eq!(store.key_url("manifest.json"), "https://e/b/manifest.json");
+        // Leading/trailing slashes collapse to exactly one trailing slash.
+        let store = store.with_base_prefix("/yah-marketing/cloud/");
+        assert_eq!(
+            store.key_url("manifest.json"),
+            "https://e/b/yah-marketing/cloud/manifest.json"
         );
     }
 

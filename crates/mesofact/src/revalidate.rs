@@ -189,7 +189,8 @@ async fn publish_built(workload: &Path, config_path: &Path) -> Result<PublishRep
         &creds.access_key_id,
         &creds.secret_access_key,
     )
-    .context("revalidate: S3 store init")?;
+    .context("revalidate: S3 store init")?
+    .with_base_prefix(cfg.prefix.clone().unwrap_or_default());
     let purger = CloudflareCdnPurger::new(&cfg.zone_id, &creds.cloudflare_api_token)
         .context("revalidate: Cloudflare purger init")?;
     let report = publish_dist(&workload.join("dist"), &store, &purger)

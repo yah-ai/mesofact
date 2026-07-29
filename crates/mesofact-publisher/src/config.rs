@@ -44,6 +44,12 @@ pub struct PublishConfig {
     pub endpoint: String,
     #[serde(default = "default_region")]
     pub region: String,
+    /// Optional base key prefix — every published object lands under this
+    /// prefix within `bucket`, so one bucket can host several surfaces (e.g.
+    /// `yah-marketing/cloud`). Absent → publish at bucket root. Threaded into
+    /// [`crate::s3::S3Store::with_base_prefix`] by the publish/revalidate paths.
+    #[serde(default)]
+    pub prefix: Option<String>,
     pub zone_id: String,
     #[serde(default = "default_access_key_env")]
     pub access_key_id_env: String,
@@ -149,6 +155,28 @@ zone_id = "deadbeef"
         assert_eq!(cfg.region, "auto");
         assert_eq!(cfg.access_key_id_env, "MESOFACT_S3_ACCESS_KEY_ID");
         assert_eq!(cfg.api_token_env, "CLOUDFLARE_API_TOKEN");
+    }
+
+    #[tokio::test]
+    async fn prefix_is_optional_and_parses() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mesofact.config.toml");
+        // Absent → None (publish at bucket root; back-compat).
+        tokio::fs::write(&path, "[publish]\nbucket=\"b\"\nendpoint=\"e\"\nzone_id=\"z\"\n")
+            .await
+            .unwrap();
+        assert!(PublishConfig::load(&path).await.unwrap().prefix.is_none());
+        // Present → Some.
+        tokio::fs::write(
+            &path,
+            "[publish]\nbucket=\"b\"\nendpoint=\"e\"\nzone_id=\"z\"\nprefix=\"yah-marketing/cloud\"\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            PublishConfig::load(&path).await.unwrap().prefix.as_deref(),
+            Some("yah-marketing/cloud")
+        );
     }
 
     #[tokio::test]
