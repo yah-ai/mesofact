@@ -37,11 +37,26 @@
 //! R330-F12 config format — is a follow-up; the ephemeral-V8 property is
 //! identical either way.
 //!
-//! Getting *fresh data onto disk* (the almanac feed-fetch: gh-releases →
+//! ## Payload-carrying pokes (yah R330-F33)
+//!
+//! Getting *fresh data onto disk* (the almanac feed-fetch: a release manifest →
 //! `data/*.json`) is an upstream **trigger** that plugs into the seam and then
-//! pokes this receiver (§3a "domain-triggered invalidation"); it is out of
-//! scope here — the receiver renders whatever data currently sits in the
-//! workload and republishes.
+//! pokes this receiver (§3a "domain-triggered invalidation"). Producing that
+//! data is still out of scope here — but *receiving* it is not.
+//!
+//! A poke may carry the render inputs it wants used ([`DataInputs`]); the
+//! receiver writes them into the workload before rendering. This exists because
+//! the inputs used to be node-local while the output is global: with several
+//! instances behind one hostname, whichever one serviced a poke published *its
+//! own* copy of the data to the shared bucket, so a poke landing on an instance
+//! whose feed sidecar had not yet ticked would overwrite fresher output with
+//! staler — silently, since last write wins and nothing errors. A poke that
+//! carries its data can be serviced by any instance with identical results, so
+//! routing becomes an optimisation rather than a correctness input.
+//!
+//! A poke with no `data_inputs` is still valid and still means "re-render from
+//! whatever is on disk" — that is what a whole-site poke, a manual curl, and a
+//! genuinely poll-driven feed all send.
 //!
 //! @yah:relay(R446, "mesofact-serve --revalidate: multi-tenant tenants/&lt;id&gt;.toml registry (R330-F12 receiver re-home)")
 //! @yah:at(2026-07-15T22:29:05Z)
@@ -60,12 +75,13 @@
 //! @yah:verify("cargo clippy -p mesofact-dev --features ssr  # clean on tenants.rs + serve.rs")
 //! @yah:verify("SMOKE (infra-gated): mesofact-serve --tenants <dir> up; POST /revalidate {route:'/releases', mirror_key:'<bearer>'} -> 202 + renders+publishes; wrong bearer -> 403")
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
@@ -96,6 +112,73 @@ pub struct RevalidateConfig {
     pub mirror_key: Option<String>,
 }
 
+/// Render inputs carried by a poke: the **workload-relative** path a route
+/// declares in its `data_inputs` → the JSON that path should hold.
+///
+/// Keyed exactly as the manifest declares the input (`src/data/releases.json`),
+/// because that is the string both the producer and
+/// [`mesofact_render`]'s `read_data_inputs` already use — the receiver needs no
+/// knowledge of the producer's workspace layout to place the bytes.
+pub type DataInputs = BTreeMap<String, serde_json::Value>;
+
+/// Check every key in a poke's payload is a path that stays inside the
+/// workload. Returns the offending key on the first violation.
+///
+/// A poke is remote input, so an unchecked key is an arbitrary-file write:
+/// `/etc/x`, `../../secrets.json` and a bare `` would all escape the workload
+/// the bearer authorizes. Only plain relative components are accepted — no
+/// root, no prefix, no `..`, no `.`.
+pub fn check_data_input_paths(inputs: &DataInputs) -> Result<(), String> {
+    for key in inputs.keys() {
+        if key.is_empty() {
+            return Err("empty data_inputs path".to_string());
+        }
+        let all_normal = Path::new(key)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)));
+        if !all_normal {
+            return Err(format!(
+                "data_inputs path {key:?} must be relative to the workload with no '..' segments"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Write a poke's carried inputs into the workload, replacing whatever this
+/// node's own feed sidecar last left there.
+///
+/// Overwriting is the point: after this, the render reads the poke's data
+/// rather than node-local state, so every instance produces the same output for
+/// the same poke. It also makes the node self-healing — a node that was down
+/// for three releases is correct on the first poke it receives, without waiting
+/// for its sidecar to catch up.
+///
+/// Written with `to_string_pretty`, matching the producer's own serialization.
+/// The bytes are not guaranteed identical to the producer's (a JSON object
+/// round-trips with sorted keys, a struct serializes in declaration order), but
+/// every consumer of these files parses them, and the sidecar's own
+/// change-detection compares parsed values — so a key reorder cannot manufacture
+/// a phantom change.
+pub async fn apply_data_inputs(workload: &Path, inputs: &DataInputs) -> Result<()> {
+    check_data_input_paths(inputs).map_err(|e| anyhow::anyhow!(e))?;
+    for (rel, value) in inputs {
+        let abs = workload.join(rel);
+        if let Some(parent) = abs.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("revalidate: creating {} for data input", parent.display()))?;
+        }
+        let body = serde_json::to_string_pretty(value)
+            .with_context(|| format!("revalidate: serializing data input {rel}"))?;
+        tokio::fs::write(&abs, body)
+            .await
+            .with_context(|| format!("revalidate: writing data input {}", abs.display()))?;
+        info!(path = %abs.display(), "revalidate: applied carried data input");
+    }
+    Ok(())
+}
+
 /// Outcome of one revalidation cycle.
 #[derive(Debug)]
 pub struct RevalidateReport {
@@ -107,14 +190,24 @@ pub struct RevalidateReport {
     pub publish: PublishReport,
 }
 
-/// One full revalidation cycle: render (ephemeral V8, off the async runtime)
-/// then publish. `route`: `Some` → that route only; `None` → every
-/// render-eligible route in the manifest (all `static`/`spa`, non-`deferred`).
+/// One full revalidation cycle: apply the poke's carried inputs, render
+/// (ephemeral V8, off the async runtime), then publish. `route`: `Some` → that
+/// route only; `None` → every render-eligible route in the manifest (all
+/// `static`/`spa`, non-`deferred`).
+///
+/// `data_inputs` is applied *inside* this function rather than by each caller so
+/// no receiver can forget it and quietly go back to rendering node-local state.
+/// An empty map is the payload-less case and touches nothing.
 pub async fn revalidate_once(
     workload: &Path,
     publish_config: &Path,
     route: Option<String>,
+    data_inputs: &DataInputs,
 ) -> Result<RevalidateReport> {
+    // Land the carried data before rendering — this is what makes the output
+    // independent of which instance serviced the poke.
+    apply_data_inputs(workload, data_inputs).await?;
+
     // Render is synchronous and V8 is `!Send`, so it runs on a blocking thread
     // — booting and dropping its own isolate (the ephemeral property).
     let workload_owned = workload.to_path_buf();
@@ -202,7 +295,13 @@ async fn publish_built(workload: &Path, config_path: &Path) -> Result<PublishRep
 // ── HTTP receiver ────────────────────────────────────────────────────────────
 
 /// A validated poke handed from the HTTP handler to the render/publish worker.
-type Job = Option<String>; // the (optional) route to revalidate
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Job {
+    /// The route to revalidate; `None` = every render-eligible route.
+    route: Option<String>,
+    /// Render inputs the poke handed over; empty = render from disk.
+    data_inputs: DataInputs,
+}
 
 #[derive(Clone)]
 struct ReceiverState {
@@ -221,7 +320,34 @@ struct RevalidateBody {
     /// `mirror_key` when one is set.
     #[serde(default)]
     mirror_key: Option<String>,
+    /// Render inputs the poke carries, keyed by workload-relative path. Absent
+    /// → the receiver renders from what is already on disk, which is the
+    /// pre-R330-F33 contract and stays supported.
+    #[serde(default)]
+    data_inputs: DataInputs,
 }
+
+/// Largest `POST /revalidate` body this receiver accepts, in bytes.
+///
+/// **Stated, not inherited.** Until yah R330-F38 this was axum's built-in
+/// `DefaultBodyLimit` — 2 MiB, chosen by the framework, named nowhere and
+/// pinned by no test, so nobody could tell whether it was a decision or an
+/// accident. That was fine while a poke carried a single release. It stopped
+/// being fine when yah's `releases` feed became an *accumulating* index whose
+/// payload grows once per release forever: the limit is now something this
+/// system will actually reach, so it is a number with a reason next to it.
+///
+/// 4 MiB is **twice** the sender's own ceiling (`MAX_POKE_PAYLOAD_BYTES` in
+/// yah's `almanac::fetch`). Sender and receiver are separately deployed, so
+/// sizing both at the same number means any version skew turns a payload the
+/// sender thought was fine into a 413. The sender refuses first, locally, where
+/// it can log a reason and degrade to a payload-less poke; this limit is the
+/// backstop for anything else that POSTs here.
+///
+/// A body over it gets 413 from axum before the handler runs — which is the
+/// right answer for an unbounded stranger, and one a legitimate almanac sender
+/// should never see.
+pub const MAX_REVALIDATE_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 /// Build the receiver router: `POST /revalidate` (enqueue) + `GET
 /// /__mesofact/health` (readiness). Decoupled from the render/publish worker
@@ -231,6 +357,10 @@ fn router(tx: mpsc::Sender<Job>, mirror_key: Option<String>) -> Router {
     Router::new()
         .route("/revalidate", post(revalidate_handler))
         .route("/__mesofact/health", get(|| async { "ok" }))
+        // Explicit rather than axum's 2 MiB default — see
+        // [`MAX_REVALIDATE_BODY_BYTES`] for why this stopped being a framework
+        // detail once pokes started carrying an accumulating history.
+        .layer(DefaultBodyLimit::max(MAX_REVALIDATE_BODY_BYTES))
         .with_state(ReceiverState { tx, mirror_key })
 }
 
@@ -248,7 +378,16 @@ async fn revalidate_handler(
         }
     }
 
-    match state.tx.try_send(body.route) {
+    // Validate the payload's paths here, not in the worker: a malformed poke
+    // deserves a synchronous 400 rather than a 202 followed by a log line no
+    // caller ever sees.
+    if let Err(e) = check_data_input_paths(&body.data_inputs) {
+        warn!(err = %e, "revalidate rejected — bad data_inputs path");
+        return StatusCode::BAD_REQUEST;
+    }
+
+    let job = Job { route: body.route, data_inputs: body.data_inputs };
+    match state.tx.try_send(job) {
         Ok(()) => StatusCode::ACCEPTED,
         Err(mpsc::error::TrySendError::Full(_)) => {
             warn!("revalidate channel full — dropping poke");
@@ -275,9 +414,13 @@ pub async fn serve(cfg: RevalidateConfig, host: std::net::IpAddr, port: u16) -> 
     let workload = cfg.workload.clone();
     let publish_config = cfg.publish_config.clone();
     tokio::spawn(async move {
-        while let Some(route) = rx.recv().await {
-            info!(route = ?route, "revalidate poke accepted");
-            match revalidate_once(&workload, &publish_config, route.clone()).await {
+        while let Some(Job { route, data_inputs }) = rx.recv().await {
+            info!(
+                route = ?route,
+                carried_inputs = data_inputs.len(),
+                "revalidate poke accepted"
+            );
+            match revalidate_once(&workload, &publish_config, route.clone(), &data_inputs).await {
                 Ok(report) => info!(
                     route = ?route,
                     rendered = ?report.rendered_routes,
@@ -324,7 +467,7 @@ mod tests {
         let app = router(tx, None);
         let resp = post_json(app, r#"{"route":"/releases"}"#).await;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
-        assert_eq!(rx.try_recv().unwrap(), Some("/releases".to_string()));
+        assert_eq!(rx.try_recv().unwrap().route, Some("/releases".to_string()));
     }
 
     #[tokio::test]
@@ -333,13 +476,13 @@ mod tests {
         let app = router(tx, None);
         let resp = post_json(app, r#"{}"#).await;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
-        assert_eq!(rx.try_recv().unwrap(), None);
+        assert_eq!(rx.try_recv().unwrap().route, None);
     }
 
     #[tokio::test]
     async fn full_channel_returns_503() {
         let (tx, _rx) = mpsc::channel::<Job>(1);
-        tx.try_send(Some("already-full".into())).unwrap();
+        tx.try_send(Job { route: Some("already-full".into()), ..Job::default() }).unwrap();
         let app = router(tx, None);
         let resp = post_json(app, r#"{"route":"/x"}"#).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -351,7 +494,7 @@ mod tests {
         let app = router(tx, Some("secret-abc".into()));
         let resp = post_json(app, r#"{"route":"/r","mirror_key":"secret-abc"}"#).await;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
-        assert_eq!(rx.try_recv().unwrap(), Some("/r".to_string()));
+        assert_eq!(rx.try_recv().unwrap().route, Some("/r".to_string()));
     }
 
     #[tokio::test]
@@ -408,5 +551,238 @@ mod tests {
         let mut got = eligible_routes(tmp.path()).unwrap();
         got.sort();
         assert_eq!(got, vec!["/", "/app", "/releases"]);
+    }
+
+    // ── Payload-carrying pokes (yah R330-F33) ────────────────────────────────
+
+    const INPUT: &str = "src/data/releases.json";
+
+    /// Drive one poke through the real HTTP handler, then apply the resulting
+    /// job to `workload` exactly as [`serve`]'s worker does immediately before
+    /// it renders. Everything downstream of this (render → publish) is a pure
+    /// function of the workload's contents, so this is the seam where "which
+    /// instance serviced the poke" either does or does not matter.
+    async fn receive_and_apply(workload: &Path, body: &'static str) -> StatusCode {
+        let (tx, mut rx) = mpsc::channel::<Job>(4);
+        let status = post_json(router(tx, None), body).await.status();
+        if status == StatusCode::ACCEPTED {
+            let job = rx.try_recv().expect("an accepted poke is enqueued");
+            apply_data_inputs(workload, &job.data_inputs).await.unwrap();
+        }
+        status
+    }
+
+    /// Stand up one instance's workload with its sidecar holding `version`.
+    fn instance_with_local_data(version: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(INPUT);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "fetched_at": "2026-01-01T00:00:00Z",
+                "releases": [{"version": version}],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        tmp
+    }
+
+    fn local_data(workload: &Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(workload.join(INPUT)).unwrap()).unwrap()
+    }
+
+    /// **The point of R330-F33.** Two instances whose node-local feed sidecars
+    /// have diverged — one never ticked past 0.8.19, one is at 0.8.21 — receive
+    /// the same payload-carrying poke. Both end up rendering from identical
+    /// inputs, so whichever one the router happened to pick publishes the same
+    /// bytes to the shared bucket.
+    ///
+    /// Before the payload existed, the poke was `{route, mirror_key}` and each
+    /// instance rendered from its own copy: a poke landing on the stale
+    /// instance published 0.8.19 over 0.8.21, silently.
+    #[tokio::test]
+    async fn a_poke_to_either_of_two_divergent_instances_renders_identical_input() {
+        let stale = instance_with_local_data("0.8.19");
+        let fresh = instance_with_local_data("0.8.21");
+        assert_ne!(
+            local_data(stale.path()),
+            local_data(fresh.path()),
+            "precondition: the two instances really do disagree",
+        );
+
+        // One release lands; the producer pokes whichever instance it reaches.
+        const POKE: &str = r#"{"route":"/releases","data_inputs":{"src/data/releases.json":
+            {"fetched_at":"2026-07-30T00:00:00Z","releases":[{"version":"0.8.22"}]}}}"#;
+
+        assert_eq!(receive_and_apply(stale.path(), POKE).await, StatusCode::ACCEPTED);
+        assert_eq!(receive_and_apply(fresh.path(), POKE).await, StatusCode::ACCEPTED);
+
+        assert_eq!(
+            local_data(stale.path()),
+            local_data(fresh.path()),
+            "the render input must not depend on which instance serviced the poke",
+        );
+        assert_eq!(
+            local_data(stale.path())["releases"][0]["version"],
+            "0.8.22",
+            "and it must be the data the poke carried, not either node's own",
+        );
+    }
+
+    /// Back-compat, and the reason the sidecar is not deleted: a payload-less
+    /// poke is still accepted, and leaves node-local data exactly as it found
+    /// it. That is the whole-site branch, a manual curl, and any genuinely
+    /// poll-driven feed.
+    #[tokio::test]
+    async fn a_payload_less_poke_is_accepted_and_touches_no_data() {
+        let node = instance_with_local_data("0.8.19");
+        let before = local_data(node.path());
+
+        for body in [r#"{}"#, r#"{"route":"/releases"}"#] {
+            let (tx, mut rx) = mpsc::channel::<Job>(4);
+            let status = post_json(router(tx, None), body).await.status();
+            assert_eq!(status, StatusCode::ACCEPTED, "empty body must not be an error");
+            let job = rx.try_recv().unwrap();
+            assert!(job.data_inputs.is_empty());
+            apply_data_inputs(node.path(), &job.data_inputs).await.unwrap();
+        }
+
+        assert_eq!(local_data(node.path()), before, "no payload, no write");
+    }
+
+    /// A carried input for a file this node has never seen is created, parents
+    /// and all — a freshly-provisioned instance is correct on its first poke
+    /// without waiting for its own sidecar to tick.
+    #[tokio::test]
+    async fn a_carried_input_creates_the_file_on_a_cold_instance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let status = receive_and_apply(
+            tmp.path(),
+            r#"{"route":"/releases","data_inputs":{"src/data/releases.json":{"releases":[]}}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(local_data(tmp.path()), serde_json::json!({"releases": []}));
+    }
+
+    /// A poke is remote input, so its paths are checked before anything is
+    /// written: an escaping key is a 400 and never reaches the worker.
+    #[tokio::test]
+    async fn an_escaping_data_input_path_returns_400_and_enqueues_nothing() {
+        for body in [
+            r#"{"data_inputs":{"../../etc/passwd":{}}}"#,
+            r#"{"data_inputs":{"/etc/passwd":{}}}"#,
+            r#"{"data_inputs":{"":{}}}"#,
+        ] {
+            let (tx, mut rx) = mpsc::channel::<Job>(4);
+            let resp = post_json(router(tx, None), body).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "body: {body}");
+            assert!(rx.try_recv().is_err(), "a rejected poke must not enqueue");
+        }
+    }
+
+    // ── The body limit is stated and pinned (yah R330-F38) ───────────────────
+
+    async fn post_owned(app: Router, body: String) -> axum::response::Response {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/revalidate")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        app.oneshot(req).await.unwrap()
+    }
+
+    /// A poke whose `data_inputs` serialize to `payload` bytes of filler.
+    fn poke_of_size(payload: usize) -> String {
+        format!(
+            r#"{{"route":"/releases","data_inputs":{{"src/data/releases.json":{{"filler":"{}"}}}}}}"#,
+            "x".repeat(payload)
+        )
+    }
+
+    /// The limit is a decision now, so it is asserted. Before this it was
+    /// axum's built-in `DefaultBodyLimit` — a framework default nothing in
+    /// either tree named or tested, which is exactly how a ceiling goes
+    /// unnoticed until the thing that reaches it ships.
+    ///
+    /// Both directions matter. Under the limit must be ACCEPTED, or an
+    /// accumulating release history silently stops rendering the day it crosses
+    /// whatever the framework happened to pick; over it must be 413, or the
+    /// receiver has no backstop at all.
+    #[tokio::test]
+    async fn the_revalidate_body_limit_is_explicit_and_enforced() {
+        // Comfortably inside: bigger than axum's 2 MiB default, so this cell
+        // FAILS if the explicit layer is ever removed and the default returns.
+        let (tx, mut rx) = mpsc::channel::<Job>(4);
+        let big = poke_of_size(3 * 1024 * 1024);
+        assert!(big.len() < MAX_REVALIDATE_BODY_BYTES);
+        assert!(big.len() > 2 * 1024 * 1024, "must exceed the inherited default it replaced");
+        let resp = post_owned(router(tx, None), big).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::ACCEPTED,
+            "a body under the stated limit must be accepted — if this is 413, the \
+             explicit DefaultBodyLimit layer was dropped and axum's 2 MiB default is back"
+        );
+        assert!(rx.try_recv().is_ok());
+
+        // Over: rejected by the layer before the handler runs.
+        let (tx, mut rx) = mpsc::channel::<Job>(4);
+        let resp = post_owned(router(tx, None), poke_of_size(MAX_REVALIDATE_BODY_BYTES)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "an oversize body is refused, not truncated"
+        );
+        assert!(rx.try_recv().is_err(), "a rejected poke must not enqueue");
+    }
+
+    /// The margin against the sender is deliberate: yah's
+    /// `almanac::fetch::MAX_POKE_PAYLOAD_BYTES` is 2 MiB and degrades to a
+    /// payload-less poke above that, so a legitimate sender always refuses
+    /// before this receiver would. Sizing them equally would turn any version
+    /// skew between separately-deployed binaries into a 413.
+    #[test]
+    fn the_receiver_limit_leaves_headroom_over_the_sender_ceiling() {
+        const ALMANAC_SENDER_CEILING: usize = 2 * 1024 * 1024;
+        assert!(
+            MAX_REVALIDATE_BODY_BYTES >= 2 * ALMANAC_SENDER_CEILING,
+            "the receiver must stay well above the sender's ceiling"
+        );
+    }
+
+    #[test]
+    fn path_check_accepts_plain_relative_paths_only() {
+        let ok = DataInputs::from([("src/data/releases.json".into(), serde_json::json!({}))]);
+        assert!(check_data_input_paths(&ok).is_ok());
+
+        for bad in ["../x.json", "a/../../x.json", "/abs.json", "./x.json", ""] {
+            let inputs = DataInputs::from([(bad.to_string(), serde_json::json!({}))]);
+            assert!(
+                check_data_input_paths(&inputs).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// A bearer-protected receiver checks the bearer *before* the payload — a
+    /// rejected caller must not get to write files.
+    #[tokio::test]
+    async fn a_wrong_bearer_is_rejected_even_with_a_valid_payload() {
+        let node = instance_with_local_data("0.8.19");
+        let before = local_data(node.path());
+        let (tx, mut rx) = mpsc::channel::<Job>(4);
+        let resp = post_json(
+            router(tx, Some("secret-abc".into())),
+            r#"{"route":"/releases","mirror_key":"nope","data_inputs":{"src/data/releases.json":
+                {"releases":[{"version":"9.9.9"}]}}}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(local_data(node.path()), before, "403 must write nothing");
     }
 }

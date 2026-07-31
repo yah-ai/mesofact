@@ -28,12 +28,18 @@
 //!
 //! ## Routing contract
 //!
-//! Inbound `POST /revalidate {route, mirror_key}`:
+//! Inbound `POST /revalidate {route, mirror_key, data_inputs?}`:
 //!   - `mirror_key` absent/empty, or matching no tenant → **403** (a tenant with
 //!     no configured bearer is unroutable — reject, never open; multi-tenant has
 //!     no "open" mode because the bearer *is* the tenant selector).
+//!   - a `data_inputs` key that escapes the workload → **400**.
 //!   - matched → enqueue a [`TenantJob`] for that tenant's workload +
 //!     publish_config → **202**.
+//!
+//! The poke's carried `data_inputs` (yah R330-F33) matter more here than in the
+//! single-tenant case: a multi-tenant runner is exactly the box that gets
+//! replicated for capacity, and the payload is what makes any replica able to
+//! service any tenant's poke. See [`crate::revalidate`]'s module docs.
 //!
 //! Secrets never live in `tenants/<id>.toml`: the bearer is named by
 //! `mirror_key_env` and resolved from the environment at load, mirroring
@@ -44,12 +50,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use axum::{
+    extract::{DefaultBodyLimit, State},
+    http::StatusCode,
+    routing::post,
+    Json, Router,
+};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use crate::revalidate::revalidate_once;
+use crate::revalidate::{check_data_input_paths, revalidate_once, DataInputs};
 
 /// On-disk shape of one `tenants/<id>.toml` file.
 #[derive(Debug, Clone, Deserialize)]
@@ -79,13 +90,19 @@ pub struct ResolvedTenant {
 
 /// A validated poke routed to a specific tenant, handed from the HTTP handler to
 /// the render/publish worker.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Not `Eq`: `data_inputs` holds arbitrary JSON, and `serde_json::Value` is only
+/// `PartialEq` (floats).
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TenantJob {
     pub tenant_id: String,
     pub workload: PathBuf,
     pub publish_config: PathBuf,
     /// The route to revalidate; `None` = every render-eligible route.
     pub route: Option<String>,
+    /// Render inputs the poke carried, written into the tenant's workload
+    /// before the render. Empty = render from what is on disk.
+    pub data_inputs: DataInputs,
 }
 
 /// The resolved multi-tenant routing table. Immutable for the process lifetime
@@ -211,6 +228,9 @@ struct RevalidateBody {
     route: Option<String>,
     #[serde(default)]
     mirror_key: Option<String>,
+    /// Render inputs the poke carries. Absent → render from the tenant's disk.
+    #[serde(default)]
+    data_inputs: DataInputs,
 }
 
 /// Build the multi-tenant receiver router: `POST /revalidate` routes by bearer,
@@ -221,6 +241,13 @@ pub fn router(tx: mpsc::Sender<TenantJob>, registry: Arc<TenantRegistry>) -> Rou
     Router::new()
         .route("/revalidate", post(revalidate_handler))
         .route("/__mesofact/health", axum::routing::get(|| async { "ok" }))
+        // This router accepts `data_inputs` exactly like the single-tenant one,
+        // and it is the shape a runner actually hosts — so it needs the same
+        // STATED limit rather than axum's inherited 2 MiB default. Sharing the
+        // constant is the point: two receivers on the same wire contract with
+        // two different ceilings is a payload that works on one node and 413s
+        // on the next. See [`crate::revalidate::MAX_REVALIDATE_BODY_BYTES`].
+        .layer(DefaultBodyLimit::max(crate::revalidate::MAX_REVALIDATE_BODY_BYTES))
         .with_state(ReceiverState { tx, registry })
 }
 
@@ -233,13 +260,24 @@ async fn revalidate_handler(
         return StatusCode::FORBIDDEN;
     };
 
+    if let Err(e) = check_data_input_paths(&body.data_inputs) {
+        warn!(tenant = %tenant.id, err = %e, "revalidate rejected — bad data_inputs path");
+        return StatusCode::BAD_REQUEST;
+    }
+
     let job = TenantJob {
         tenant_id: tenant.id.clone(),
         workload: tenant.workload.clone(),
         publish_config: tenant.publish_config.clone(),
         route: body.route,
+        data_inputs: body.data_inputs,
     };
-    info!(tenant = %job.tenant_id, route = ?job.route, "revalidate routed to tenant");
+    info!(
+        tenant = %job.tenant_id,
+        route = ?job.route,
+        carried_inputs = job.data_inputs.len(),
+        "revalidate routed to tenant"
+    );
 
     match state.tx.try_send(job) {
         Ok(()) => StatusCode::ACCEPTED,
@@ -271,7 +309,14 @@ pub async fn serve(
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
             info!(tenant = %job.tenant_id, route = ?job.route, "revalidate poke accepted");
-            match revalidate_once(&job.workload, &job.publish_config, job.route.clone()).await {
+            match revalidate_once(
+                &job.workload,
+                &job.publish_config,
+                job.route.clone(),
+                &job.data_inputs,
+            )
+            .await
+            {
                 Ok(report) => info!(
                     tenant = %job.tenant_id,
                     route = ?job.route,
@@ -370,8 +415,46 @@ mod tests {
                 workload: PathBuf::from("/app/yah-marketing"),
                 publish_config: PathBuf::from("/app/yah-marketing/mesofact.config.toml"),
                 route: Some("/releases".into()),
+                data_inputs: DataInputs::new(),
             }
         );
+    }
+
+    /// A payload-carrying poke reaches the right tenant with its data intact —
+    /// the multi-tenant half of R330-F33.
+    #[tokio::test]
+    async fn a_carried_payload_routes_to_the_tenant_that_owns_the_bearer() {
+        let (tx, mut rx) = mpsc::channel::<TenantJob>(4);
+        let app = router(tx, two_tenant_registry());
+        let resp = post_json(
+            app,
+            r#"{"route":"/releases","mirror_key":"key-mkt",
+                "data_inputs":{"src/data/releases.json":{"releases":[{"version":"0.8.21"}]}}}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let job = rx.try_recv().unwrap();
+        assert_eq!(job.tenant_id, "yah-marketing");
+        assert_eq!(
+            job.data_inputs["src/data/releases.json"]["releases"][0]["version"],
+            "0.8.21"
+        );
+    }
+
+    /// Path containment is enforced per-tenant too — a bearer authorizes one
+    /// tenant's workload, not the filesystem the runner happens to share.
+    #[tokio::test]
+    async fn an_escaping_data_input_path_returns_400_and_enqueues_nothing() {
+        let (tx, mut rx) = mpsc::channel::<TenantJob>(4);
+        let app = router(tx, two_tenant_registry());
+        let resp = post_json(
+            app,
+            r#"{"route":"/releases","mirror_key":"key-mkt",
+                "data_inputs":{"../acme/src/data/releases.json":{}}}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(rx.try_recv().is_err(), "a rejected poke must not enqueue");
     }
 
     #[tokio::test]
