@@ -15,14 +15,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-mesofact-core = { path = "../mesofact-core", version = "0.8.21" }
-mesofact-ssr = { path = "../mesofact-ssr", version = "0.8.21" }
-mesofact-render = { path = "../mesofact-render", version = "0.8.21" }
+mesofact-core = { path = "../mesofact-core", version = "0.8.22" }
+mesofact-ssr = { path = "../mesofact-ssr", version = "0.8.22" }
+mesofact-render = { path = "../mesofact-render", version = "0.8.22" }
 
 # W272 bundle-manifest types (R599-F1), across the yah-base workspace boundary.
 # default-features = false keeps this to serde+blake3+toml types only — the
 # object-store `store` feature is for cloud/kamaji, not the build side.
-yah-mesofact-bundle = { path = "../../../yah-base/crates/mesofact-bundle", version = "0.8.21", default-features = false }
+yah-mesofact-bundle = { path = "../../../yah-base/crates/mesofact-bundle", version = "0.8.22", default-features = false }
 
 rolldown = "1.1"
 rolldown_common = "1.1"
