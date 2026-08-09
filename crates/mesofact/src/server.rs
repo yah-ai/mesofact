@@ -1447,6 +1447,68 @@ mod tests {
         assert!(body_string(response).await.contains("custom"));
     }
 
+    /// R703-T7: a bundle carries its publish beacon at
+    /// `app/dist/html/.well-known/yah-publish.json`, and `yah cloud apply`
+    /// fails the deploy unless the apex serves it back. That contract rests
+    /// entirely on this path resolving — a leading-dot directory is exactly the
+    /// shape a static server is apt to reject or rewrite — so pin it here
+    /// rather than in the yubaba crate, which cannot reach this server.
+    ///
+    /// It must also come back as JSON, not `text/plain`: the verifier parses
+    /// the body, and the clean-URL fallback must not go looking for
+    /// `yah-publish.json.html`.
+    #[tokio::test]
+    async fn serves_the_publish_beacon_from_a_dot_well_known_path() {
+        let bundle = bundle_with("self", &[("index.html", "<h1>home</h1>")]);
+        let beacon_dir = bundle.path().join("app/dist/html/.well-known");
+        std::fs::create_dir_all(&beacon_dir).unwrap();
+        let body = r#"{"prefix":"bundle/yah-marketing","published_at":null,"digest":"ab","files":2}"#;
+        std::fs::write(beacon_dir.join("yah-publish.json"), body).unwrap();
+
+        let response = Server::from_bundle(bundle.path())
+            .unwrap()
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/yah-publish.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json; charset=utf-8"),
+        );
+        assert!(body_string(response).await.contains("bundle/yah-marketing"));
+    }
+
+    /// The other half of the same contract: a bundle with no beacon must 404,
+    /// not answer 200 with the index or a branded error page. A 200-with-HTML
+    /// is the exact shape that hid two yah.dev freezes, and the verifier
+    /// classifies it as `NotABeacon` only because the status is honest here.
+    #[tokio::test]
+    async fn an_unstamped_bundle_does_not_answer_the_beacon_url_with_200() {
+        let bundle = bundle_with("self", &[("index.html", "<h1>home</h1>")]);
+        let response = Server::from_bundle(bundle.path())
+            .unwrap()
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/yah-publish.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
     #[test]
     fn from_bundle_rejects_missing_manifest() {
         // A bare dir with no manifest.toml isn't a bundle.
