@@ -14,18 +14,25 @@
 //! - [`watcher`] — the rebuild-on-change file watcher.
 //! - [`s3`] — the local S3 surface that stands in for R2 during `dev`
 //!   (W225 §2 "local pond emulation").
-//! - the `mesofact-dev` binary itself.
+//! - [`cli`] — the `mes` toolchain CLI, and the two bin targets over it.
+//!
+//! [`cli`] carries the prod verbs (`serve`, `publish`, `new`) as well as the
+//! dev ones, so consumers learn one CLI — but it gets them by *calling into*
+//! [`mesofact::cli`], which is the direction that costs the prod binary
+//! nothing. The boundary above is about what links into a binary, not about
+//! which verbs a binary spells.
 //!
 //! Engine types are re-exported below so existing `mesofact_dev::Server`-style
 //! callsites keep working; new code should prefer `mesofact::…` directly.
 //!
 //! @arch:see(.yah/docs/working/W225-mesofact-consumer-deployment-model.md)
 
+pub mod cli;
 pub mod s3;
 pub mod watcher;
 
 pub use s3::{DevS3, DEFAULT_BUCKET as DEV_S3_BUCKET};
-pub use watcher::{WatchOptions, Watcher};
+pub use watcher::{BuildDriver, WatchOptions, Watcher};
 
 // Engine re-exports — the serving path now lives in the `mesofact` facade.
 pub use mesofact::proxy;
@@ -132,5 +139,78 @@ mod tests {
             "public, max-age=31536000, immutable"
         );
         assert!(body_string(response).await.contains("via dev s3"));
+    }
+
+    /// R444 end-to-end: a `mode:"ssr"` render handler that imports `r2` from
+    /// `@mesofact/runtime` and calls `.fetch(key)` resolves against the dev S3
+    /// surface from *inside the in-process V8 isolate* — the exact wiring
+    /// `main.rs` does (`DevS3::start` → `SsrSpawnOptions::with_env` →
+    /// `ssr::spawn`), proving the env + `[sources.r2]` plumbing reaches a real
+    /// request, not just a unit-level `resolve_r2_sources` call.
+    #[cfg(feature = "ssr")]
+    #[tokio::test]
+    async fn ssr_route_resolves_r2_source_against_dev_s3() {
+        let dir = tempdir().unwrap();
+        let dev = DevS3::start(dir.path().join("s3-surface"), DEV_S3_BUCKET)
+            .await
+            .unwrap();
+
+        // Seed the bucket directly over HTTP — the same anonymous PUT path
+        // s3.rs's own round-trip test exercises.
+        let put_url = format!("{}/{}/greeting.txt", dev.endpoint, dev.bucket);
+        let put = reqwest::Client::new()
+            .put(&put_url)
+            .body("hello from dev r2")
+            .send()
+            .await
+            .unwrap();
+        assert!(put.status().is_success(), "seed PUT status: {}", put.status());
+
+        std::fs::write(
+            dir.path().join("mesofact.config.toml"),
+            "[sources.assets]\nkind = \"r2\"\nbucket = \"dev\"\nendpoint_env = \"R2_ENDPOINT\"\naccess_key_id_env = \"R2_ACCESS_KEY_ID\"\nsecret_access_key_env = \"R2_SECRET_ACCESS_KEY\"\n",
+        )
+        .unwrap();
+
+        let server_dir = dir.path().join("dist/server");
+        std::fs::create_dir_all(&server_dir).unwrap();
+        std::fs::write(
+            server_dir.join("greet.js"),
+            "import { r2 } from \"@mesofact/runtime\";\n\
+             export default async function () {\n\
+               const bytes = await r2('assets').fetch('greeting.txt');\n\
+               const text = bytes ? new TextDecoder().decode(bytes) : null;\n\
+               return new Response(text ?? 'MISSING', { status: 200 });\n\
+             }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("dist/manifest.json"),
+            r#"{"routes": [{"route": "/greet", "mode": "ssr", "render_entrypoint": "dist/server/greet.js"}]}"#,
+        )
+        .unwrap();
+
+        let opts = ssr::SpawnOptions::new(
+            dir.path().to_path_buf(),
+            dir.path().join("dist"),
+            dir.path().join(".mesofact-dev"),
+        )
+        .with_env(dev.env_vars());
+        let child = ssr::spawn(opts).await.unwrap().expect("ssr present");
+
+        let resp = child
+            .dispatch(
+                "/greet",
+                mesofact::ssr_runtime::DispatchRequest {
+                    method: "GET".into(),
+                    url: "http://dev/greet".into(),
+                    headers: vec![],
+                    body: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(String::from_utf8(resp.body).unwrap(), "hello from dev r2");
     }
 }

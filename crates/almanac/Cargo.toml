@@ -1,0 +1,69 @@
+[package]
+name = "yah-almanac"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Push-rebuild engine: feed configs, ReleaseSource adapters (GH + R2), and the in-process revalidate receiver"
+keywords = ["webhook", "release", "rebuild", "automation"]
+categories = ["development-tools"]
+# R542: publishable now — yah-workload-spec and yah-object-store are both on
+# crates.io at 0.8.20, and `cargo publish --dry-run -p yah-almanac` passes.
+#
+# LIVES IN THE MESOFACT WORKSPACE, NOT YUBABA (R746-T10, operator call
+# 2026-08-14). almanac is the *ingest* half of the same freshness contract
+# mesofact renders: `mesofact serve --revalidate` re-reads a route's declared
+# `data_inputs` at poke time and never fetches, so without this crate a poke
+# re-renders byte-identical output forever (see `src/fetch.rs`). The two ship as
+# one pair of node runtime assets and must not skew — which they did, because
+# `.yah/qed/mesofact-musl.toml` built mesofact and nothing else while almanac sat
+# in a workspace that pipeline never packed. It lives here so one musl run mints
+# `runtimes/mesofact/VER` and `runtimes/almanac-feed/VER` together.
+#
+# The move was dependency-clean and stays that way only if it keeps being true:
+# this crate depends on `oss/yah-base` and NOTHING in `oss/yubaba`. `yah-cloud`
+# depends on *it*, so a yubaba dep added here would invert that edge.
+
+[lib]
+name = "yah_almanac"
+path = "src/lib.rs"
+
+# The on-node feed-fetch tier (R330-F31), and the crate's ONLY binary.
+# Server-free by construction — see `src/fetch.rs` for why the fetcher survives
+# W225 §4's receiver retirement.
+#
+# `almanac-serve` (the pond-tier standalone receiver) was deleted with the move,
+# R746-T10: W225 §4 retired that shape, `receiver.rs` records that it appeared in
+# zero service or infra configs, and a tree-wide search for the binary name found
+# only prose about its retirement. The `serve` and `receiver` *modules* stay —
+# they are live in-process embeddings, `app/yah/cli/src/almanac.rs:540`.
+[[bin]]
+name = "almanac-feed"
+path = "src/bin/feed.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+thiserror = "1.0"
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "time", "macros", "io-util", "fs", "net"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+anyhow = "1.0"
+# Spelled as explicit relative paths, not bare versions: `oss/yubaba` resolves
+# its cross-workspace deps through a `[patch.crates-io]` block, `oss/mesofact`
+# has no such block and states its yah-base path deps inline (see
+# `crates/mesofact/Cargo.toml`'s `yah-mesofact-bundle`). House style follows the
+# workspace, so these changed shape when the crate moved.
+workload-spec = { package = "yah-workload-spec", path = "../../../yah-base/crates/workload-spec", version = "0.8.29" }
+yah-object-store = { path = "../../../yah-base/crates/object-store", version = "0.8.29" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

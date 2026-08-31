@@ -63,6 +63,7 @@
   load("ext:deno_web/01_dom_exception.js");
   load("ext:deno_web/02_event.js");
   load("ext:deno_web/03_abort_signal.js");
+  load("ext:deno_web/02_timers.js");
   load("ext:deno_web/05_base64.js");
   load("ext:deno_web/06_streams.js");
   load("ext:deno_web/08_text_encoding.js");
@@ -79,6 +80,8 @@
   const file = load("ext:deno_web/09_file.js");
   const filereader = load("ext:deno_web/10_filereader.js");
   const performance = load("ext:deno_web/15_performance.js");
+  const base64 = load("ext:deno_web/05_base64.js");
+  const timers = load("ext:deno_web/02_timers.js");
   const headers = load("ext:deno_fetch/20_headers.js");
   const formdata = load("ext:deno_fetch/21_formdata.js");
   const request = load("ext:deno_fetch/23_request.js");
@@ -104,6 +107,25 @@
   globalThis.File = file.File;
   globalThis.FileReader = filereader.FileReader;
   globalThis.performance = performance.performance;
+
+  // R746-S4: these were *loaded* but never bound, so an SSR route calling
+  // btoa() or setTimeout() got a bare ReferenceError on capability that was
+  // already compiled in. Timers are legitimate in a per-request handler — a
+  // Promise.race timeout, a retry delay — and the dispatch path drives the
+  // event loop (`with_event_loop_promise`), so a pending timer actually fires.
+  globalThis.atob = base64.atob;
+  globalThis.btoa = base64.btoa;
+  globalThis.setTimeout = timers.setTimeout;
+  globalThis.clearTimeout = timers.clearTimeout;
+  // setInterval/clearInterval are deliberately NOT bound. A repeating timer
+  // started by a request handler outlives its response and leaks into every
+  // later request THIS isolate serves — and (R756-F2) a process now runs a
+  // pool of isolates, round-robined per request, so module-level state of any
+  // kind (not just timers) does not reliably survive from one request to the
+  // next: consecutive requests may land on different isolates. A
+  // request-scoped handler has no business scheduling repeating work or
+  // caching state at module scope; if a real need appears, it belongs in Rust
+  // beside the isolate pool, not inside any one isolate.
 
   // Fetch surface.
   globalThis.Headers = headers.Headers;

@@ -103,12 +103,70 @@ pub struct ServeArgs {
     #[arg(long, env = "MESOFACT_MIRROR_KEY")]
     mirror_key: Option<String>,
 
+    /// Receiver mode only: route allowlist — repeat the flag per route
+    /// (`--allow-route /releases --allow-route /issues`). Unset = every
+    /// render-eligible route in the manifest.
+    ///
+    /// Orthogonal to `--mirror-key`: this is what the receiver may re-render,
+    /// not who may ask. A deployment may set either, both or neither.
+    #[arg(long = "allow-route", value_name = "ROUTE")]
+    allow_route: Vec<String>,
+
     /// Receiver mode only: directory of `tenants/<id>.toml` files. When set,
     /// runs the **multi-tenant** receiver — each poke's `mirror_key` selects the
     /// tenant whose workload + publish_config it revalidates. Requires the `ssr`
     /// build feature.
-    #[arg(long)]
+    ///
+    /// Conflicts with the single-tenant receiver flags rather than quietly
+    /// winning over them: every one of `workload` / `--publish-config` /
+    /// `--allow-route` is per-tenant in this mode, and a silently-ignored
+    /// `--allow-route` is an allowlist an operator believes is enforced.
+    /// `--mirror-key` is only warned about — it carries `env =
+    /// MESOFACT_MIRROR_KEY`, which a runner may have set process-wide for
+    /// reasons that have nothing to do with this invocation.
+    #[arg(long, conflicts_with_all = ["workload", "publish_config", "allow_route"])]
     tenants: Option<PathBuf>,
+
+    /// Assert that an **authenticating edge** fronts this process, so routes
+    /// declaring `requires: ["user"]` may be served (R556-B13).
+    ///
+    /// `serve` has no session resolver — that check lives only in
+    /// `mesofact proxy`'s router — so a declared-authed route served by this
+    /// binary is enforced by the edge and by nothing else. Without this flag,
+    /// a workload declaring any such route makes `serve` refuse to start,
+    /// naming the routes. Passing it is the operator stating, in the
+    /// invocation, that (for example) passway's cheers-verify is in front.
+    ///
+    /// The env form is how the bundle tier will set it: kamaji forks `serve`
+    /// with a deploy-resolved env, so this rides the same channel the R2
+    /// credentials do rather than needing a new argv flag threaded through
+    /// three crates.
+    /// Accepts `1`/`true`/`yes`/`on` (and their negatives), case-insensitively,
+    /// in both the flag and the env form. Plain `bool` with `env` would make
+    /// clap demand literally `true`/`false`, so `MESOFACT_TRUST_EDGE_AUTH=1` —
+    /// the form every operator and every deploy config reaches for first —
+    /// would abort the process with a clap error. Empty reads as unset, so an
+    /// exported-but-blank var fails closed rather than crashing the serve.
+    #[arg(
+        long,
+        env = "MESOFACT_TRUST_EDGE_AUTH",
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true",
+        value_parser = parse_truthy,
+    )]
+    trust_edge_auth: bool,
+}
+
+/// Parse a human/config truthy string. See [`ServeArgs::trust_edge_auth`].
+fn parse_truthy(raw: &str) -> Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        "1" | "true" | "yes" | "on" => Ok(true),
+        other => Err(format!(
+            "expected a boolean (1/true/yes/on or 0/false/no/off), got {other:?}"
+        )),
+    }
 }
 
 impl ServeArgs {
@@ -120,10 +178,19 @@ impl ServeArgs {
 }
 
 pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
+    // `mesofact` is the crate this binary's own code lives in (W174 folded the
+    // `mesofact-serve` binary in here) — so it is the target every `info!` in
+    // this file and in `crate::revalidate` carries. The default filter named
+    // `mesofact_serve`, a crate that no longer exists, which meant a receiver
+    // deployed with `RUST_LOG` unset dropped ALL of its own output: no
+    // "listening" line at boot, no per-poke render/publish report, and no
+    // `error!("revalidate failed")`. yah R330-T35 found the yah.dev receiver
+    // running with two 0-byte log files and no way to tell a successful
+    // re-render from a silent failure.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new("mesofact_serve=info,mesofact_dev=info,tower_http=info")
+                tracing_subscriber::EnvFilter::new("mesofact=info,mesofact_dev=info,tower_http=info")
             }),
         )
         .init();
@@ -135,6 +202,15 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     if let Some(bundle) = args.bundle.as_ref() {
         let bundle_abs = bundle.canonicalize().unwrap_or_else(|_| bundle.clone());
         let server = Server::from_bundle(&bundle_abs)?;
+        // R556-B13: a bundle's app tree is `<bundle>/app`; its built route
+        // manifest is what declares the auth gate this binary cannot enforce.
+        assert_declared_auth_is_enforced(&bundle_abs.join("app"), args.trust_edge_auth)?;
+        // R746-B7: a bundle can declare `mode:"ssr"` routes same as any other
+        // workload. `Server::from_bundle` alone never attaches an isolate —
+        // either attach one now (ssr feature) or refuse to serve routes this
+        // binary cannot execute (static-only build), rather than silently
+        // 404ing them one request at a time.
+        let server = attach_bundle_ssr(server, &bundle_abs).await?;
         let idle_ttl = args.idle_ttl.filter(|s| *s > 0).map(Duration::from_secs);
 
         // Prefer an inherited socket-activation fd (kamaji's custodian handoff,
@@ -154,6 +230,118 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     }
 
     run_workload_modes(args).await
+}
+
+/// R556-B13 — fail CLOSED on a route whose declared auth gate this binary does
+/// not enforce.
+///
+/// `mesofact serve` has no session resolver. `requires: ["user"]` is checked
+/// only by `mesofact_core::proxy::router` (the `mesofact proxy` subcommand),
+/// and the W272 bundle tier forks `serve` — so before this, a route declaring
+/// the gate was served to anything that reached the port, with nothing in any
+/// log saying so. The manifest and the binary disagreed and the binary won
+/// silently.
+///
+/// The remedy is a *statement*, not a resolver: auth for these surfaces is an
+/// edge concern (passway terminates TLS and verifies cheers bearers), so the
+/// operator asserts the edge is there with `--trust-edge-auth` /
+/// `MESOFACT_TRUST_EDGE_AUTH`. Wiring a session resolver into `serve` instead
+/// would need more than calling the router — `mesofact_ssr::DispatchRequest`
+/// has no `user` field, so a resolved session has no channel into the V8
+/// isolate (W225 §2b, measured by R637).
+///
+/// **Refusing to start** rather than 401-ing the route: a process that boots
+/// and serves is the state an operator reads as "deployed and fine", and a
+/// per-route 401 buried in a mixed site is easy to miss for weeks. A failed
+/// fork is not. The cost is that one declared-authed route takes down a site
+/// whose other routes are public — deliberate, and one flag away from being
+/// exactly what the operator meant.
+fn assert_declared_auth_is_enforced(
+    workload: &std::path::Path,
+    trust_edge_auth: bool,
+) -> anyhow::Result<()> {
+    let gated = crate::routes_requiring_user(workload).map_err(|e| {
+        anyhow::anyhow!(
+            "refusing to start: cannot read the route manifest under {} to check for \
+             declared-authed routes: {e}",
+            workload.display(),
+        )
+    })?;
+    if gated.is_empty() {
+        return Ok(());
+    }
+    if trust_edge_auth {
+        info!(
+            routes = ?gated,
+            "serving routes that declare requires:[\"user\"] — this process does NOT enforce \
+             that gate; --trust-edge-auth asserts an authenticating edge is in front",
+        );
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to start: {} route(s) declare `requires: [\"user\"]` but `mesofact serve` \
+         does not enforce it — {}. That check lives only in `mesofact proxy`'s router, so \
+         serving these here would expose a confidential surface to anything that reaches the \
+         port. Either front this process with an authenticating edge (passway cheers-verify) \
+         and pass `--trust-edge-auth` / `MESOFACT_TRUST_EDGE_AUTH=1` to say so, or drop \
+         `requires` from the route if it was never meant to be gated.",
+        gated.len(),
+        gated.join(", "),
+    );
+}
+
+/// Attach an SSR isolate to a bundle server, same as the SSR-host path does
+/// for a plain workload (serve.rs `run_workload_modes`). A bundle's app tree
+/// is `<bundle>/app` (structurally a workload dir — see
+/// [`Server::from_bundle`]), so this is `ssr::spawn` pointed there plus
+/// `with_ssr`. `ssr::spawn` itself returns `Ok(None)` for a bundle with no
+/// `mode:"ssr"` routes, so the common static-only bundle is unaffected.
+///
+/// R444: this is the prod receiver path, so hand the isolate the real process
+/// env (yubaba-injected secrets) same as `run_workload_modes` does — the
+/// isolate cannot inherit it on its own.
+#[cfg(feature = "ssr")]
+async fn attach_bundle_ssr(server: crate::Server, bundle: &std::path::Path) -> anyhow::Result<crate::Server> {
+    use crate::{ssr, SsrSpawnOptions};
+
+    let app = bundle.join("app");
+    let opts = SsrSpawnOptions::new(app.clone(), app.join("dist"), app.join(".mesofact-serve"))
+        .with_env(std::env::vars().collect());
+    Ok(match ssr::spawn(opts).await? {
+        Some(child) => {
+            info!(prefixes = ?child.prefixes(), "mesofact serve --bundle: ssr runtime attached");
+            server.with_ssr(child)
+        }
+        None => server,
+    })
+}
+
+/// Static-only build (no V8): refuse rather than silently 404 every
+/// `mode:"ssr"` route in the bundle. R746-B7's minimum-acceptable interim —
+/// a loud refusal at apply time beats a 404 at request time that looks like a
+/// routing typo (same discipline `assert_declared_auth_is_enforced` /
+/// R330-B43 already paid for once).
+#[cfg(not(feature = "ssr"))]
+async fn attach_bundle_ssr(server: crate::Server, bundle: &std::path::Path) -> anyhow::Result<crate::Server> {
+    let app = bundle.join("app");
+    let ssr_routes = crate::routes_declaring_ssr(&app).map_err(|e| {
+        anyhow::anyhow!(
+            "refusing to start: cannot read the route manifest under {} to check for \
+             mode:\"ssr\" routes: {e}",
+            app.display(),
+        )
+    })?;
+    if ssr_routes.is_empty() {
+        return Ok(server);
+    }
+    anyhow::bail!(
+        "refusing to start: {} route(s) declare mode:\"ssr\" ({}) but this `mesofact serve` \
+         binary was built without the `ssr` feature (no V8) — it can only serve them as a 404. \
+         Serve this bundle with an ssr-enabled build (the shipped stock runtime is built \
+         `--features deploy`), or drop the ssr route(s) if this bundle is meant to be static.",
+        ssr_routes.len(),
+        ssr_routes.join(", "),
+    );
 }
 
 /// Adopt a listening socket handed over via the systemd socket-activation
@@ -220,9 +408,30 @@ async fn run_workload_modes(args: ServeArgs) -> anyhow::Result<()> {
         if !args.revalidate {
             warn!("--tenants implies the revalidate receiver; running multi-tenant receiver");
         }
+        if args.mirror_key.is_some() {
+            warn!(
+                "--mirror-key / MESOFACT_MIRROR_KEY is ignored in --tenants mode — \
+                 each tenant's bearer comes from its own mirror_key_env",
+            );
+        }
         let files = tenants::load_tenants(tenants_dir)?;
         let resolved = tenants::resolve_tenants(files, |name| std::env::var(name).ok());
         let registry = tenants::TenantRegistry::new(resolved);
+        // An empty registry is a receiver that 403s every poke while looking
+        // perfectly healthy on /readyz — the exact silent-failure shape yah
+        // R330-T35 spent a day on. A missing or empty `--tenants` dir is a typo
+        // or a bad mount, never an intended deployment, so refuse to boot.
+        if registry.is_empty() {
+            anyhow::bail!(
+                "--tenants {} contains no tenants/<id>.toml files — a receiver with an \
+                 empty registry rejects every poke",
+                tenants_dir.display()
+            );
+        }
+        // Two tenants resolving to the SAME bearer means one of them silently
+        // wins every poke — and "wins" here is publishing to a bucket the poke
+        // did not authorize. Fail at boot, not at the first cross-published page.
+        registry.validate()?;
         info!(tenants = registry.len(), dir = %tenants_dir.display(), "multi-tenant revalidate receiver");
         return tenants::serve(registry, addr.ip(), addr.port()).await;
     }
@@ -240,6 +449,7 @@ async fn run_workload_modes(args: ServeArgs) -> anyhow::Result<()> {
                 workload: workload_abs,
                 publish_config: args.publish_config,
                 mirror_key: args.mirror_key,
+                routes: args.allow_route,
             },
             addr.ip(),
             addr.port(),
@@ -257,14 +467,23 @@ async fn run_workload_modes(args: ServeArgs) -> anyhow::Result<()> {
     // against absolute paths regardless of the container's working directory.
     let workload_abs = workload.canonicalize().unwrap_or(workload);
 
+    // R556-B13. Checked on the SSR-host path too, not just the bundle tier:
+    // `mode: "ssr"` + `requires: ["user"]` is the exact shape the gate is for,
+    // and this path is the one that actually renders it.
+    assert_declared_auth_is_enforced(&workload_abs, args.trust_edge_auth)?;
+
     // Boot the SSR isolate against the already-built dist/. `ssr::spawn`
     // returns Ok(None) for static/SPA-only workloads (no `mode:"ssr"` route or
     // no manifest yet); those serve static only with no isolate.
+    // R444: the receiver's own process env is real (yubaba injects secrets
+    // into it directly), so hand it straight through — the isolate can't
+    // inherit process env on its own, but this process already has it.
     let opts = SsrSpawnOptions::new(
         workload_abs.clone(),
         workload_abs.join("dist"),
         workload_abs.join(".mesofact-serve"),
-    );
+    )
+    .with_env(std::env::vars().collect());
     let server = match ssr::spawn(opts).await? {
         Some(child) => {
             info!(prefixes = ?child.prefixes(), "mesofact-serve ssr runtime attached");
@@ -297,7 +516,140 @@ async fn run_workload_modes(args: ServeArgs) -> anyhow::Result<()> {
         .clone()
         .ok_or_else(|| anyhow::anyhow!("a <workload> dir is required (or --bundle to serve a W272 bundle)"))?;
     let server = Server::from_workload(&workload)?;
+    // R556-B13: the static-only build has even less chance of enforcing the
+    // gate than the ssr one — no isolate, no router, nothing that reads a
+    // session. Same refusal.
+    assert_declared_auth_is_enforced(&workload, args.trust_edge_auth)?;
     let addr = args.bind_addr();
     info!(%addr, workload = %workload.display(), "mesofact-serve listening (static only, no ssr)");
     server.serve_on(addr).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workload_with_manifest(json: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let dist = dir.path().join("dist");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(dist.join("manifest.json"), json).unwrap();
+        dir
+    }
+
+    const AUTHED: &str = r#"{"routes":[{"route":"/","mode":"ssr","requires":["user"]}]}"#;
+
+    /// R556-B13, the bug itself: a route declaring `requires: ["user"]` was
+    /// served by `mesofact serve` to anything that reached the port, because
+    /// the check lives only in `mesofact proxy`'s router. Fail closed.
+    #[test]
+    fn a_declared_authed_route_refuses_to_start_without_an_asserted_edge() {
+        let dir = workload_with_manifest(AUTHED);
+        let err = assert_declared_auth_is_enforced(dir.path(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("refusing to start"), "{err}");
+        assert!(
+            err.contains('/'),
+            "the message must name the route the operator has to look at: {err}"
+        );
+        assert!(
+            err.contains("--trust-edge-auth"),
+            "and the remedy, or the operator has a refusal with no next move: {err}"
+        );
+    }
+
+    /// The remedy: the operator states that an authenticating edge (passway
+    /// cheers-verify) is in front. That is a claim this process cannot verify,
+    /// which is exactly why it has to be said out loud in the invocation.
+    #[test]
+    fn an_asserted_edge_allows_the_declared_authed_route() {
+        let dir = workload_with_manifest(AUTHED);
+        assert!(assert_declared_auth_is_enforced(dir.path(), true).is_ok());
+    }
+
+    /// The overwhelmingly common case — no route declares the gate — must not
+    /// need the flag. Every mesofact site in tree except analytics is this.
+    #[test]
+    fn a_workload_declaring_no_authed_route_starts_unchanged() {
+        let dir = workload_with_manifest(r#"{"routes":[{"route":"/","mode":"static"}]}"#);
+        assert!(assert_declared_auth_is_enforced(dir.path(), false).is_ok());
+        // …and so does one with nothing built yet.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(assert_declared_auth_is_enforced(empty.path(), false).is_ok());
+    }
+
+    /// `MESOFACT_TRUST_EDGE_AUTH=1` is the form a deploy config reaches for
+    /// first, and a plain `#[arg(long, env)] bool` rejects it with a clap error
+    /// that aborts the process. Measured against the real analytics workload
+    /// before this parser existed.
+    #[test]
+    fn the_edge_assertion_accepts_the_truthy_forms_an_operator_will_type() {
+        for yes in ["1", "true", "TRUE", "yes", "on", " true "] {
+            assert_eq!(parse_truthy(yes), Ok(true), "{yes:?}");
+        }
+        for no in ["", "0", "false", "no", "off"] {
+            assert_eq!(parse_truthy(no), Ok(false), "{no:?}");
+        }
+        // An exported-but-blank var reads as unset, so it fails CLOSED rather
+        // than crashing a serve that would otherwise have refused anyway.
+        assert_eq!(parse_truthy(""), Ok(false));
+        assert!(parse_truthy("maybe").is_err());
+    }
+
+    /// A manifest that exists but does not parse is a refusal, not a shrug:
+    /// "we could not read the file, therefore nothing is gated" is the same
+    /// fail-open wearing a different hat.
+    #[test]
+    fn an_unreadable_manifest_refuses_to_start() {
+        let dir = workload_with_manifest("{ not json");
+        let err = assert_declared_auth_is_enforced(dir.path(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("refusing to start"), "{err}");
+    }
+
+    /// R746-B7, the bug itself: `serve --bundle` never attached an SSR
+    /// isolate, so a `mode:"ssr"` route silently 404'd. On a static-only
+    /// build there is no isolate to attach — refuse loudly instead, naming
+    /// the route, rather than serving a 404 that looks like a routing typo.
+    #[cfg(not(feature = "ssr"))]
+    #[tokio::test]
+    async fn a_bundle_declaring_ssr_refuses_to_start_on_a_static_only_build() {
+        let bundle_dir = tempfile::tempdir().unwrap();
+        let bundle = bundle_dir.path();
+        let app = bundle.join("app");
+        std::fs::create_dir_all(app.join("dist")).unwrap();
+        std::fs::write(
+            app.join("dist").join("manifest.json"),
+            r#"{"routes":[{"route":"/live","mode":"ssr"},{"route":"/","mode":"static"}]}"#,
+        )
+        .unwrap();
+        let server = crate::Server::from_workload(&app).unwrap();
+        let err = match attach_bundle_ssr(server, bundle).await {
+            Ok(_) => panic!("expected a refusal — bundle declares mode:\"ssr\""),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("refusing to start"), "{err}");
+        assert!(err.contains("/live"), "must name the route: {err}");
+        assert!(err.contains("ssr"), "and say why: {err}");
+    }
+
+    /// The overwhelmingly common bundle — no `mode:"ssr"` route — must not
+    /// need an isolate and must not be refused on a static-only build.
+    #[cfg(not(feature = "ssr"))]
+    #[tokio::test]
+    async fn a_static_only_bundle_starts_unchanged_on_a_static_only_build() {
+        let bundle_dir = tempfile::tempdir().unwrap();
+        let bundle = bundle_dir.path();
+        let app = bundle.join("app");
+        std::fs::create_dir_all(app.join("dist")).unwrap();
+        std::fs::write(
+            app.join("dist").join("manifest.json"),
+            r#"{"routes":[{"route":"/","mode":"static"}]}"#,
+        )
+        .unwrap();
+        let server = crate::Server::from_workload(&app).unwrap();
+        assert!(attach_bundle_ssr(server, bundle).await.is_ok());
+    }
 }

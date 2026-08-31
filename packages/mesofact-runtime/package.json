@@ -1,8 +1,11 @@
 {
   "name": "@mesofact/runtime",
-  "version": "0.1.0",
+  "version": "0.8.29",
   "description": "Render contract types and adapter API for mesofact (RenderRequest, RenderResult, Source, error taxonomy)",
   "license": "MIT OR Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

@@ -3,6 +3,11 @@
 # excludes `external/`, so this tree carries independent git history.
 [workspace]
 members = [
+    # The feed-ingest half of the freshness contract (R746-T10, moved here from
+    # oss/yubaba 2026-08-14). mesofact renders; almanac fetches. They ship as one
+    # pair of node runtime assets, so they release together — see the crate's
+    # own manifest for the full rationale.
+    "crates/almanac",
     "crates/mesofact-core",
     "crates/mesofact-publisher",
     "crates/mesofact-dev",
@@ -19,7 +24,7 @@ resolver = "2"
 strip = true
 
 [workspace.package]
-version = "0.8.22"
+version = "0.8.29"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"

@@ -39,6 +39,10 @@ async function makeMf(cfg: {
   mesofactBackendOrigin?: string;
   issuesOrigin?: string;
   uploadOrigin?: string;
+  routeHeaders?: { path: string; headers: Record<string, string> }[];
+  /** Escape hatch for the malformed-binding case, which the typed
+   *  `routeHeaders` field cannot express. */
+  rawRouteHeaders?: string;
 }): Promise<MfSetup> {
   const { port, stop } = startAssetServer(cfg.assets);
   const bindings: Record<string, string> = {
@@ -55,6 +59,11 @@ async function makeMf(cfg: {
   }
   if (cfg.issuesOrigin) {
     bindings.ISSUES_ORIGIN = cfg.issuesOrigin;
+  }
+  if (cfg.rawRouteHeaders !== undefined) {
+    bindings.ROUTE_HEADERS = cfg.rawRouteHeaders;
+  } else if (cfg.routeHeaders) {
+    bindings.ROUTE_HEADERS = JSON.stringify(cfg.routeHeaders);
   }
   const mf = new Miniflare({ modules: true, scriptPath: BUNDLE, bindings });
   return { mf, port, stop };
@@ -594,5 +603,343 @@ describe("instance-addressed (deferred) routes + error_routes", () => {
     const resp = await setup.mf.dispatchFetch("http://w.test/random-page");
     expect(resp.status).toBe(404);
     expect(await resp.text()).toContain("branded 404");
+  });
+});
+
+// ── build-pointer resolution (yah R330-B44) ─────────────────────────────────
+//
+// A published prefix carries BOTH layouts at once: the immutable `<build_id>/`
+// tree the current publisher writes, and the flat copy older publishers wrote
+// and never swept. These pin that the pointer wins, because the whole point of
+// a revalidate is to publish a new build tree and flip `build_id` — an edge
+// that prefers the flat copy makes every push a silent no-op.
+
+const BUILD = "2026-08-10T21-24-08Z";
+
+function manifestAsset(m: unknown) {
+  return { body: JSON.stringify(m), type: "application/json" };
+}
+
+describe("build-pointer resolution", () => {
+  let setup: MfSetup;
+
+  beforeAll(async () => {
+    setup = await makeMf({
+      mode: "static",
+      assets: {
+        "manifest.json": manifestAsset({
+          build_id: BUILD,
+          routes: [{ route: "/releases" }, { route: "/" }],
+        }),
+        // Flat copies — what the site served before the pointer moved.
+        "index.html": { body: "<h1>stale home</h1>", type: "text/html" },
+        "releases.html": { body: "<h1>stale 0.8.21</h1>", type: "text/html" },
+        "404.html": { body: "<h1>not found</h1>", type: "text/html" },
+        "app.chunk-abc123.js": {
+          body: "console.log('asset')",
+          type: "application/javascript",
+        },
+        // The build tree the manifest points at.
+        [`${BUILD}/html/index.html`]: {
+          body: "<h1>fresh home</h1>",
+          type: "text/html",
+        },
+        [`${BUILD}/html/releases.html`]: {
+          body: "<h1>fresh 0.8.22</h1>",
+          type: "text/html",
+        },
+      },
+    });
+  });
+
+  afterAll(async () => {
+    await setup.mf.dispose();
+    setup.stop();
+  });
+
+  test("clean URL serves the build tree, not the stale flat copy", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/releases");
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toContain("fresh 0.8.22");
+  });
+
+  test("/ serves the build tree's index", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/");
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toContain("fresh home");
+  });
+
+  test("an explicit .html request also resolves through the pointer", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/releases.html");
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toContain("fresh 0.8.22");
+  });
+
+  test("a build-tree page is served no-cache, not the object's own max-age", async () => {
+    // The object is immutable at `<build_id>/…` and mutable at `/releases`;
+    // passing its header through would pin a client to one release.
+    const resp = await setup.mf.dispatchFetch("http://w.test/releases");
+    expect(resp.headers.get("cache-control")).toBe("no-cache");
+  });
+
+  test("a page absent from the build tree falls back to the flat copy", async () => {
+    // Publishers that predate the build tree wrote flat keys only; a mixed
+    // prefix must keep serving them rather than 404ing the difference.
+    const mixed = await makeMf({
+      mode: "static",
+      assets: {
+        "manifest.json": manifestAsset({ build_id: BUILD, routes: [] }),
+        "legacy.html": { body: "<h1>legacy page</h1>", type: "text/html" },
+      },
+    });
+    const resp = await mixed.mf.dispatchFetch("http://w.test/legacy");
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toContain("legacy page");
+    await mixed.mf.dispose();
+    mixed.stop();
+  });
+
+  test("a manifest with no build_id behaves exactly as before", async () => {
+    const noBuild = await makeMf({
+      mode: "static",
+      assets: {
+        "manifest.json": manifestAsset({ routes: [] }),
+        "releases.html": { body: "<h1>flat only</h1>", type: "text/html" },
+      },
+    });
+    const resp = await noBuild.mf.dispatchFetch("http://w.test/releases");
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toContain("flat only");
+    await noBuild.mf.dispose();
+    noBuild.stop();
+  });
+
+  test("a site with no manifest at all still serves its flat assets", async () => {
+    const bare = await makeMf({
+      mode: "static",
+      assets: { "releases.html": { body: "<h1>bare</h1>", type: "text/html" } },
+    });
+    const resp = await bare.mf.dispatchFetch("http://w.test/releases");
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toContain("bare");
+    await bare.mf.dispose();
+    bare.stop();
+  });
+
+  test("hashed assets bypass the pointer and keep their own headers", async () => {
+    // They are content-addressed, so both layouts hold identical bytes and the
+    // indirection would only cost a manifest fetch on the majority of requests.
+    const resp = await setup.mf.dispatchFetch("http://w.test/app.chunk-abc123.js");
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get("cache-control")).not.toBe("no-cache");
+  });
+});
+
+// R600-B1, serve half. The build half lives in
+// packages/mesofact-build/tests/build.test.ts ("expands params from a declared
+// data_inputs JSON file"), which pins every emission to `dist/html<url>.html`;
+// this pins that the worker asks for exactly that key. The bug was that the two
+// halves disagreed — the renderer named instances off the route PATTERN
+// (`issues_id__<ulid>`), the worker resolves off the REQUEST PATH — so 14
+// correctly-rendered, correctly-published pages sat at keys no request could
+// produce. Neither half alone could catch it; keep both.
+describe("parametric prerender instances (non-deferred)", () => {
+  const ID = "01KZVGVT0DV61ZGGNVHAWQW2CS";
+  let setup: MfSetup;
+
+  beforeAll(async () => {
+    setup = await makeMf({
+      mode: "static",
+      assets: {
+        "manifest.json": manifestAsset({
+          build_id: BUILD,
+          // A `{from_data, items_key, param}` prerender block carries no
+          // `deferred` flag, so this route never touches the pointer store —
+          // its instances are plain published assets.
+          routes: [
+            { route: "/issues" },
+            {
+              route: "/issues/:id",
+              prerender: { from_data: "data/issues.json", items_key: "issues", param: "id" },
+            },
+          ],
+        }),
+        [`${BUILD}/html/issues.html`]: { body: "<h1>issue list</h1>", type: "text/html" },
+        [`${BUILD}/html/issues/${ID}.html`]: {
+          body: "<h1>issue detail</h1>",
+          type: "text/html",
+        },
+        "404.html": { body: "<h1>not found</h1>", type: "text/html" },
+      },
+    });
+  });
+
+  afterAll(async () => {
+    await setup.mf.dispose();
+    setup.stop();
+  });
+
+  test("an instance page resolves from the build tree at its public path", async () => {
+    const resp = await setup.mf.dispatchFetch(`http://w.test/issues/${ID}`);
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toContain("issue detail");
+  });
+
+  test("the list route at the parent path is unshadowed by the instance dir", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/issues");
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toContain("issue list");
+  });
+
+  test("an id with no published instance is a branded 404, not a stale page", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/issues/nope");
+    expect(resp.status).toBe(404);
+    expect(await resp.text()).toContain("not found");
+  });
+});
+
+// ── R746: per-route response headers ─────────────────────────────────────────
+//
+// The domain manifest's `[[routes]].headers` reach the Worker as ROUTE_HEADERS
+// and are stamped onto the response. The motivating case is COOP/COEP on a wasm
+// sub-app: without both headers the document loses `SharedArrayBuffer` silently,
+// so "the header made it onto the bytes the browser actually got" is the only
+// assertion that means anything — hence these go through miniflare rather than
+// unit-testing the matcher.
+//
+// Before this existed the headers were declared in a `_headers` file, which is a
+// Cloudflare Pages / Netlify convention nothing in this serving path reads.
+const ISOLATION = {
+  "Cross-Origin-Opener-Policy": "same-origin",
+  "Cross-Origin-Embedder-Policy": "require-corp",
+};
+
+describe("per-route response headers", () => {
+  let setup: MfSetup;
+
+  beforeAll(async () => {
+    setup = await makeMf({
+      mode: "static",
+      assets: {
+        "index.html": { body: "<h1>marketing</h1>", type: "text/html" },
+        "app/index.html": { body: "<h1>wasm app</h1>", type: "text/html" },
+        "app/bundle.wasm": { body: "\0asm", type: "application/wasm" },
+        "404.html": { body: "<h1>not found</h1>", type: "text/html" },
+      },
+      // Manifest order: the specific route sits above the catch-all, and the
+      // catch-all declares a header of its own so "first match wins, no merge"
+      // is observable rather than inferred.
+      routeHeaders: [
+        { path: "/app/*", headers: ISOLATION },
+        { path: "/*", headers: { "X-Tier": "marketing" } },
+      ],
+    });
+  });
+
+  afterAll(async () => {
+    await setup.mf.dispose();
+    setup.stop();
+  });
+
+  test("the mounted sub-app's index carries both isolation headers", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/app/");
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toContain("wasm app");
+    expect(resp.headers.get("Cross-Origin-Opener-Policy")).toBe("same-origin");
+    expect(resp.headers.get("Cross-Origin-Embedder-Policy")).toBe("require-corp");
+  });
+
+  test("the bare prefix matches too — /app is the URL the CTA links to", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/app");
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toContain("wasm app");
+    expect(resp.headers.get("Cross-Origin-Opener-Policy")).toBe("same-origin");
+  });
+
+  test("subresources under the prefix get them as well", async () => {
+    // COEP require-corp is worth nothing if the wasm itself is served from a
+    // document that is isolated but the fetch is not.
+    const resp = await setup.mf.dispatchFetch("http://w.test/app/bundle.wasm");
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get("Cross-Origin-Embedder-Policy")).toBe("require-corp");
+  });
+
+  test("first match wins — the catch-all does not merge into the app route", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/app/");
+    expect(resp.headers.get("X-Tier")).toBeNull();
+  });
+
+  test("the catch-all applies to paths the specific route misses", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/");
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get("X-Tier")).toBe("marketing");
+    expect(resp.headers.get("Cross-Origin-Opener-Policy")).toBeNull();
+  });
+
+  test("matching is segment-aware — /apple is not under /app/*", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/apple");
+    expect(resp.headers.get("Cross-Origin-Opener-Policy")).toBeNull();
+    expect(resp.headers.get("X-Tier")).toBe("marketing");
+  });
+
+  test("error responses carry the route's headers too", async () => {
+    // A 404 under /app/* is still a document the isolated app may be showing.
+    const resp = await setup.mf.dispatchFetch("http://w.test/app/missing.js");
+    expect(resp.status).toBe(404);
+    expect(resp.headers.get("Cross-Origin-Opener-Policy")).toBe("same-origin");
+  });
+
+  test("Content-Type and body survive the header rewrite", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/app/");
+    expect(resp.headers.get("Content-Type")).toContain("text/html");
+    expect(await resp.text()).toContain("wasm app");
+  });
+});
+
+describe("no ROUTE_HEADERS binding", () => {
+  let setup: MfSetup;
+
+  beforeAll(async () => {
+    setup = await makeMf({
+      mode: "static",
+      assets: { "index.html": { body: "<h1>hello</h1>", type: "text/html" } },
+    });
+  });
+
+  afterAll(async () => {
+    await setup.mf.dispose();
+    setup.stop();
+  });
+
+  test("responses pass through untouched", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/");
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toContain("hello");
+    expect(resp.headers.get("Cross-Origin-Opener-Policy")).toBeNull();
+  });
+});
+
+describe("malformed ROUTE_HEADERS binding", () => {
+  let setup: MfSetup;
+
+  beforeAll(async () => {
+    setup = await makeMf({
+      mode: "static",
+      assets: { "index.html": { body: "<h1>hello</h1>", type: "text/html" } },
+      rawRouteHeaders: "{not json",
+    });
+  });
+
+  afterAll(async () => {
+    await setup.mf.dispose();
+    setup.stop();
+  });
+
+  // The producer is Rust, so a malformed value is a bug there — but the site
+  // staying up beats every request 500ing on a config typo.
+  test("serves without extra headers rather than failing the request", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/");
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toContain("hello");
   });
 });

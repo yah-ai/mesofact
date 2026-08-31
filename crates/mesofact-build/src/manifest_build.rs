@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, bail, Result};
 use mesofact_core::manifest::{
-    Hydration, Manifest, Route, RouteMode, StaticAsset, MANIFEST_VERSION,
+    Hook, Hydration, Manifest, Route, RouteMode, StaticAsset, MANIFEST_VERSION,
 };
 use mesofact_core::validate::SourceCatalog;
 use std::collections::BTreeMap;
@@ -23,6 +23,8 @@ pub struct AssembleInput<'a> {
     /// route → client bundle (hydration block)
     pub hydration: &'a BTreeMap<String, Hydration>,
     pub static_assets: Vec<StaticAsset>,
+    /// Mode 2 hook name → `dist/server/hooks/<name>.js` (R756-F6).
+    pub hook_paths: &'a BTreeMap<String, String>,
     pub catalog: &'a SourceCatalog,
 }
 
@@ -32,6 +34,7 @@ pub fn assemble_manifest(input: AssembleInput<'_>) -> Result<Manifest> {
         routes.push(build_route(entry, &input)?);
     }
     let ssr_prefixes = derive_ssr_prefixes(&input.routes.routes);
+    let hooks = build_hooks(&input)?;
 
     let manifest = Manifest {
         version: MANIFEST_VERSION.to_string(),
@@ -40,6 +43,7 @@ pub fn assemble_manifest(input: AssembleInput<'_>) -> Result<Manifest> {
         static_assets: input.static_assets,
         error_routes: input.routes.error_routes.as_ref().map(to_manifest_error_routes),
         ssr_prefixes: (!ssr_prefixes.is_empty()).then_some(ssr_prefixes),
+        hooks,
     };
 
     if let Err(errors) = mesofact_core::validate::validate(&manifest, input.catalog) {
@@ -51,6 +55,28 @@ pub fn assemble_manifest(input: AssembleInput<'_>) -> Result<Manifest> {
         bail!("manifest validation failed:\n{detail}");
     }
     Ok(manifest)
+}
+
+/// Mode 2 hooks (R756-F6) — one entry per declared hook, carrying the bundled
+/// module the isolate registers. `None` (not an empty map) when the workload
+/// declares none, so a hook-free manifest is byte-identical to a pre-R756-F6
+/// one.
+fn build_hooks(input: &AssembleInput<'_>) -> Result<Option<BTreeMap<String, Hook>>> {
+    let Some(declared) = &input.routes.hooks else {
+        return Ok(None);
+    };
+    if declared.is_empty() {
+        return Ok(None);
+    }
+    let mut out = BTreeMap::new();
+    for name in declared.keys() {
+        let entrypoint = input
+            .hook_paths
+            .get(name)
+            .ok_or_else(|| anyhow!("hook {name}: no bundled entrypoint"))?;
+        out.insert(name.clone(), Hook { entrypoint: entrypoint.clone() });
+    }
+    Ok(Some(out))
 }
 
 fn to_manifest_error_routes(e: &ErrorRoutes) -> mesofact_core::manifest::ErrorRoutes {

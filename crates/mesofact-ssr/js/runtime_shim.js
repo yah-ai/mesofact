@@ -115,6 +115,61 @@ export function weaveHead(html, head) {
   return html.slice(0, idx) + markup + html.slice(idx);
 }
 
+// `defineReadyz` — port of packages/mesofact-runtime/src/health.ts. Pure (no
+// adapters, no I/O), so it belongs in this shared surface rather than the
+// SSR-only one: the SSR isolate needs it because it is the documented way to
+// write a `/readyz` handler (examples/hello does exactly this), and the SSG
+// isolate needs it because R756-F6's hook probe dynamic-imports the bundled
+// hook module, which imports the barrel.
+//
+// Keep the wire format byte-identical to the Rust side's (`health.rs`) and to
+// the TS original: an operator running `curl /readyz?verbose` must not be able
+// to tell which language answered. Every check runs even after one fails —
+// reporting only the first hides a second broken subsystem behind it — and a
+// check that throws counts as failed, since an exception is not an assertion
+// of readiness.
+export function defineReadyz(checks) {
+  return async (req) => {
+    const results = await Promise.all(
+      checks.map(async (c) => {
+        try {
+          return { name: c.name, pass: (await c.check()) === true };
+        } catch {
+          return { name: c.name, pass: false };
+        }
+      }),
+    );
+
+    const ok = results.every((r) => r.pass);
+    const status = ok ? 200 : 503;
+    const headers = {
+      "content-type": "text/plain; charset=utf-8",
+      // A cached 200 outlives the condition it described, which is the exact
+      // failure the probe exists to catch.
+      "cache-control": "no-cache, no-store, must-revalidate",
+    };
+
+    let verbose = false;
+    try {
+      verbose = new URL(req.url).searchParams.has("verbose");
+    } catch {
+      // A probe that 500s because it could not parse its own URL is worse
+      // than one that answers tersely.
+      verbose = false;
+    }
+
+    if (!verbose) {
+      return new Response(ok ? "ok\n" : "readyz check failed\n", { status, headers });
+    }
+
+    const listing = results
+      .map((r) => (r.pass ? `[+]${r.name} ok\n` : `[-]${r.name} failed\n`))
+      .join("");
+    const trailer = ok ? "readyz check passed\n" : "readyz check failed\n";
+    return new Response(listing + trailer, { status, headers });
+  };
+}
+
 // Track-ctx: renders execute sequentially inside one V8 isolate, so a plain
 // stack stands in for AsyncLocalStorage (node:async_hooks does not exist
 // here). Adapter calls during an awaited render still see the right ctx.
@@ -146,7 +201,14 @@ class SourceUnavailableError extends Error {
   }
 }
 
+// Mirrors the real BlobSource/KeyValueSource surface in
+// packages/mesofact-runtime/src/source.ts — `fetch`/`list` (r2) and
+// `get`/`query` (sqlite/pg), plus the `name` field and the two chainable
+// modifiers. A member missing here fails as "src.fetch is not a function"
+// instead of the explanatory SourceUnavailableError, so keep them in step.
 const throwingSource = (name, kind) => ({
+  name,
+  fetch: () => Promise.reject(new SourceUnavailableError(name, kind)),
   list: () => Promise.reject(new SourceUnavailableError(name, kind)),
   get: () => Promise.reject(new SourceUnavailableError(name, kind)),
   head: () => Promise.reject(new SourceUnavailableError(name, kind)),

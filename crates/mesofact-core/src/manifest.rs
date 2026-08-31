@@ -181,6 +181,17 @@ pub struct ErrorRoutes {
     pub server_error: Option<String>,
 }
 
+/// One declared Mode 2 hook (W311 §2 / R756-F6) — an engine-addressed
+/// endpoint callback rather than a route. A struct rather than a bare path
+/// string so the per-hook options W311 left open (chiefly Open Decision 3,
+/// "may a hook be async") land without a schema break.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hook {
+    /// Bundled module, `dist/server/hooks/<name>.js`. Same shape and
+    /// resolution rule as a route's `render_entrypoint`.
+    pub entrypoint: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: String,
@@ -190,6 +201,13 @@ pub struct Manifest {
     pub static_assets: Vec<StaticAsset>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_routes: Option<ErrorRoutes>,
+    /// Declared Mode 2 hooks, name → bundled module (R756-F6). Absent when
+    /// the workload declares none. Host-only: the edge Worker never invokes a
+    /// hook, since Mode 2's premise is that the Rust host owns the HTTP
+    /// around it. Carried here so a manifest round-trips through the
+    /// publisher without losing the block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<BTreeMap<String, Hook>>,
     /// Derived from every `mode:"ssr"` route per W173 § "SSR_PREFIXES
     /// derivation rule". Segment-aware match at the consumer:
     /// `path == p || path.starts_with(&format!("{p}/"))`. Absent when the

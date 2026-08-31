@@ -3,7 +3,7 @@
     "yah": {
       "args": [
         "mcp",
-        "/Users/user/ss/yah/external/mesofact"
+        "/Users/leif/ss/yah/oss/mesofact"
       ],
       "command": "/Applications/yah.app/Contents/MacOS/yah"
     }

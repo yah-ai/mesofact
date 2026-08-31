@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::bundle::{
-    assert_no_forbidden_modules, browser_forbidden, bundle_client_entrypoints,
+    assert_no_forbidden_modules, browser_forbidden, bundle_client_entrypoints, bundle_hooks,
     bundle_routes_file, bundle_server_entrypoints, edge_forbidden,
 };
 use crate::config::load_config;
@@ -107,7 +107,13 @@ pub async fn build(opts: BuildOptions) -> Result<BuildResult> {
     let should_install = match opts.install {
         InstallMode::Always => true,
         InstallMode::Never => false,
-        InstallMode::Auto => !node_modules.exists() && project_root.join("bun.lock").exists(),
+        InstallMode::Auto => {
+            // Every format `install::detect_lockfile` reads, in its order.
+            !node_modules.exists()
+                && (project_root.join("bun.lock").exists()
+                    || project_root.join("package-lock.json").exists()
+                    || project_root.join("pnpm-lock.yaml").exists())
+        }
     };
     if should_install {
         // `install` is end-to-end blocking (reqwest::blocking + gzip/tar
@@ -126,7 +132,7 @@ pub async fn build(opts: BuildOptions) -> Result<BuildResult> {
             tracing::info!(
                 installed = report.installed,
                 linked = report.linked,
-                "installed node_modules from bun.lock"
+                "installed node_modules from the project lockfile"
             );
         }
     }
@@ -157,6 +163,18 @@ pub async fn build(opts: BuildOptions) -> Result<BuildResult> {
         server_bundles.iter().map(|b| (b.route.clone(), b.server_path.clone())).collect();
     let bundle_paths: BTreeMap<String, PathBuf> =
         server_bundles.iter().map(|b| (b.route.clone(), b.absolute_path.clone())).collect();
+
+    // Mode 2 hook tree (R756-F6) — engine-addressed rather than path-addressed,
+    // so hooks bundle beside the route tree under `dist/server/hooks/` and
+    // never enter the route table or `ssr_prefixes`.
+    let hook_bundles = bundle_hooks(
+        &project_root,
+        &out_dir,
+        routes_config.hooks.as_ref().unwrap_or(&BTreeMap::new()),
+    )
+    .await?;
+    let hook_paths: BTreeMap<String, String> =
+        hook_bundles.iter().map(|h| (h.name.clone(), h.server_path.clone())).collect();
 
     let client_inputs: Vec<(String, String)> = routes_config
         .routes
@@ -223,6 +241,19 @@ pub async fn build(opts: BuildOptions) -> Result<BuildResult> {
         }
     }
 
+    // Phase 4b — hook default-export probe (R756-F6). Same reasoning as the
+    // SSR probe: what a hook module is *called with* varies per hook, so only
+    // callability is provable from the module's static shape — but that
+    // catches the common slip (a named export, or none at all) before the
+    // manifest promises the engine a module it cannot invoke.
+    for h in &hook_bundles {
+        let probe = ssg.probe_default(&h.absolute_path)?;
+        let kind = probe.get("kind").and_then(serde_json::Value::as_str).unwrap_or("unknown");
+        if kind != "function" {
+            bail!("hook {}: entrypoint must `export default` a function (got {kind})", h.name);
+        }
+    }
+
     // Phase 5 — source inference (author-supplied wins).
     let mut inferred_sources: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for r in &routes_config.routes {
@@ -246,10 +277,23 @@ pub async fn build(opts: BuildOptions) -> Result<BuildResult> {
         inferred_sources: &inferred_sources,
         hydration: &hydration,
         static_assets,
+        hook_paths: &hook_paths,
         catalog: &config.catalog,
     })?;
 
     // Phase 8 — prerender (SSG) for static + spa routes.
+    //
+    // The error pages are prerendered like any other route but must not be
+    // advertised in the sitemap, so resolve which route paths `error_routes`
+    // names before building the targets (R821-B2).
+    let error_route_paths: Vec<&str> = routes_config
+        .error_routes
+        .as_ref()
+        .map(|e| [e.not_found.as_deref(), e.server_error.as_deref()])
+        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .collect();
     let mut targets = Vec::new();
     for r in &routes_config.routes {
         if r.mode == RouteMode::Ssr {
@@ -262,6 +306,7 @@ pub async fn build(opts: BuildOptions) -> Result<BuildResult> {
             entry: r,
             bundle_path,
             hydration_script: hydration.get(&r.route).map(|h| h.script.as_str()),
+            is_error_route: error_route_paths.contains(&r.route.as_str()),
         });
     }
     let outcome = prerender(&ssg, &out_dir, &project_root, &build_id, &targets)?;
@@ -275,8 +320,9 @@ pub async fn build(opts: BuildOptions) -> Result<BuildResult> {
     std::fs::write(&tag_index_path, format!("{}\n", serde_json::to_string_pretty(&tag_index)?))?;
 
     // Sitemap: emitted only when the routes config names a `site_url` origin.
-    // Instance-addressed (deferred) routes and `noindex` renders were already
-    // filtered out when the SSG driver collected `sitemap_paths` (W270 §4).
+    // Instance-addressed (deferred) routes, `noindex` renders and error pages
+    // were already filtered out when the SSG driver collected `sitemap_paths`
+    // (W270 §4, R821-B2).
     let sitemap_path = match &routes_config.site_url {
         Some(site_url) => {
             let path = out_dir.join("sitemap.xml");

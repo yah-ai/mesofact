@@ -35,6 +35,15 @@ deno_net = "0.243"
 # signature; pin to whatever deno_fetch picked up.
 deno_fs = "0.161"
 deno_permissions = "0.110"
+# deno_fetch's HTTP client always builds a TLS-capable connector (even for a
+# plain-http:// request), which needs a process-wide rustls CryptoProvider.
+# Both `aws-lc-rs` and `ring` end up in the dependency graph (different deno_*
+# crates pick different rustls features), so rustls can't auto-select one —
+# the first real fetch() call panics ("Could not automatically determine the
+# process-level CryptoProvider") without an explicit `install_default()`.
+# aws-lc-rs matches what deno_net's own QUIC code already picks
+# (rustls::crypto::aws_lc_rs::default_provider(), see deno_net's quic.rs).
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 sys_traits = { version = "0.1", features = ["libc", "winapi"] }
 
 anyhow = "1"

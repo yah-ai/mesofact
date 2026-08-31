@@ -81,6 +81,27 @@ function describe(v: unknown): string {
   return typeof v;
 }
 
+// A Mode 2 hook entrypoint (R756-F6) must also `export default` a function.
+// What that function is *called with* differs per hook — `readyz`'s module is
+// a Fetch handler for historical reasons, a hook added after Mode 2 takes the
+// plain `input` object — so, exactly as with SSR routes, only callability is
+// provable from the module's static shape.
+export async function assertHookEntrypoint(name: string, bundlePath: string): Promise<void> {
+  let mod: { default?: unknown };
+  try {
+    mod = (await import(pathToFileURL(bundlePath).href)) as { default?: unknown };
+  } catch (e) {
+    throw new BuildError(
+      `hook ${name}: failed to import bundle at ${bundlePath}: ${(e as Error).message}`,
+    );
+  }
+  if (typeof mod.default !== "function") {
+    throw new BuildError(
+      `hook ${name}: entrypoint must \`export default\` a function (got ${describe(mod.default)})`,
+    );
+  }
+}
+
 export type BundleInput = {
   route: string;
   entrypoint: string; // path resolved against `projectRoot`
@@ -111,29 +132,92 @@ export async function bundleEntrypoints(
   const outputs: BundleOutput[] = [];
   for (const input of inputs) {
     const key = routeKey(input.route);
-    const absEntry = resolve(projectRoot, input.entrypoint);
-    const result = await Bun.build({
-      entrypoints: [absEntry],
-      outdir: serverDir,
-      target: "bun",
-      format: "esm",
+    const absolutePath = await bundleServerModule({
+      absEntry: resolve(projectRoot, input.entrypoint),
+      outDir: serverDir,
       naming: `${key}.js`,
-      external: ["@mesofact/runtime"],
-      splitting: false,
-      sourcemap: "none",
+      label: `route ${input.route}`,
     });
-    if (!result.success) {
-      const msg = result.logs.map((l) => l.message).join("\n");
-      throw new BuildError(`bundle failed for route ${input.route}: ${msg}`);
-    }
-    const written = result.outputs.find((o) => o.kind === "entry-point");
-    if (!written) {
-      throw new BuildError(`bundle for route ${input.route} produced no entry-point output`);
-    }
-    const absolutePath = fileURLToPath(pathToFileURL(written.path).href);
     outputs.push({
       route: input.route,
       serverPath: `dist/server/${key}.js`,
+      absolutePath,
+    });
+  }
+  return outputs;
+}
+
+// One server-target ESM bundle. Shared by the route tree and the Mode 2 hook
+// tree (R756-F6) — a hook module is bundled on exactly the same terms as a
+// route entrypoint (bun target, `@mesofact/runtime` external, no splitting),
+// because it runs in exactly the same isolate.
+async function bundleServerModule(opts: {
+  absEntry: string;
+  outDir: string;
+  naming: string;
+  label: string;
+}): Promise<string> {
+  const result = await Bun.build({
+    entrypoints: [opts.absEntry],
+    outdir: opts.outDir,
+    target: "bun",
+    format: "esm",
+    naming: opts.naming,
+    external: ["@mesofact/runtime"],
+    splitting: false,
+    sourcemap: "none",
+  });
+  if (!result.success) {
+    const msg = result.logs.map((l) => l.message).join("\n");
+    throw new BuildError(`bundle failed for ${opts.label}: ${msg}`);
+  }
+  const written = result.outputs.find((o) => o.kind === "entry-point");
+  if (!written) {
+    throw new BuildError(`bundle for ${opts.label} produced no entry-point output`);
+  }
+  return fileURLToPath(pathToFileURL(written.path).href);
+}
+
+// ─── Mode 2 hook tree (R756-F6) ───────────────────────────────────────────────
+
+export type HookBundleInput = {
+  name: string;
+  entrypoint: string; // path resolved against `projectRoot`
+};
+
+export type HookBundleOutput = {
+  name: string;
+  // Path written under `outDir/server/hooks/`. Goes in the manifest's
+  // `hooks[name].entrypoint`.
+  serverPath: string;
+  // Absolute path, for the post-bundle shape assertion.
+  absolutePath: string;
+};
+
+// Bundle each declared hook to `dist/server/hooks/<name>.js`. A separate
+// subdirectory rather than `dist/server/` proper so a hook can never collide
+// with a route whose `routeKey` happens to be `readyz` — routes and hooks are
+// different namespaces and the emitted tree says so.
+export async function bundleHooks(
+  projectRoot: string,
+  outDir: string,
+  inputs: readonly HookBundleInput[],
+): Promise<HookBundleOutput[]> {
+  if (inputs.length === 0) return [];
+  const hooksDir = join(outDir, "server", "hooks");
+  await mkdir(hooksDir, { recursive: true });
+
+  const outputs: HookBundleOutput[] = [];
+  for (const input of inputs) {
+    const absolutePath = await bundleServerModule({
+      absEntry: resolve(projectRoot, input.entrypoint),
+      outDir: hooksDir,
+      naming: `${input.name}.js`,
+      label: `hook ${input.name}`,
+    });
+    outputs.push({
+      name: input.name,
+      serverPath: `dist/server/hooks/${input.name}.js`,
       absolutePath,
     });
   }

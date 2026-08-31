@@ -374,3 +374,66 @@ describe("defineRoutes — deferred prerender validation (instance-addressed rou
     ).toThrow(/deferred: true/);
   });
 });
+
+// ── Mode 2 hook declaration (R756-F6 / W311 §2 Open Decision 1) ─────────────
+
+describe("defineRoutes — hooks", () => {
+  const staticRoute = {
+    route: "/",
+    mode: "static",
+    entrypoint: "src/home.tsx",
+    cache_policy: { ttl: 0 },
+  } as const;
+
+  test("accepts a declared hook", () => {
+    const cfg = defineRoutes({
+      routes: [staticRoute],
+      hooks: { readyz: "src/readyz.ts" },
+    });
+    expect(cfg.hooks?.readyz).toBe("src/readyz.ts");
+  });
+
+  test("a workload with no hooks block is unchanged", () => {
+    expect(defineRoutes({ routes: [staticRoute] }).hooks).toBeUndefined();
+  });
+
+  test("rejects an unknown hook name", () => {
+    expect(() =>
+      defineRoutes({
+        routes: [staticRoute],
+        // @ts-expect-error — the union rejects this at compile time too; the
+        // runtime check covers untyped callers (a JS routes file, or JSON).
+        hooks: { onRequest: "src/on_request.ts" },
+      }),
+    ).toThrow(/unknown hook "onRequest"/);
+  });
+
+  test("rejects an empty entrypoint", () => {
+    expect(() =>
+      defineRoutes({ routes: [staticRoute], hooks: { readyz: "  " } }),
+    ).toThrow(/non-empty entrypoint path/);
+  });
+
+  // Two opt-ins for one verdict is ambiguous, not additive — and silently
+  // preferring one would make the other look wired up when it is not.
+  test("rejects declaring readyz both as a hook and by claiming the route", () => {
+    expect(() =>
+      defineRoutes({
+        routes: [
+          staticRoute,
+          { route: "/readyz", mode: "ssr", entrypoint: "src/readyz.ts", cache_policy: { ttl: 0 } },
+        ],
+        hooks: { readyz: "src/readyz.ts" },
+      }),
+    ).toThrow(/declared twice/);
+  });
+
+  test("claiming the route alone is still accepted", () => {
+    const cfg = defineRoutes({
+      routes: [
+        { route: "/readyz", mode: "ssr", entrypoint: "src/readyz.ts", cache_policy: { ttl: 0 } },
+      ],
+    });
+    expect(cfg.routes).toHaveLength(1);
+  });
+});

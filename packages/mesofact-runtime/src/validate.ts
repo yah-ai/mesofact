@@ -12,11 +12,13 @@
 
 import type {
   Manifest,
+  ManifestHooks,
   ManifestRoute,
   ManifestStaticAsset,
   ManifestErrorRoutes,
 } from "./manifest.js";
 import { MANIFEST_VERSION } from "./manifest.js";
+import { HOOK_NAMES, isHookName } from "./hooks.js";
 
 export type SourceScope = "global" | "project" | "user";
 
@@ -26,7 +28,12 @@ export type ValidationErrorKind =
   | "shape"
   | "unsupported_version"
   | "mode1_scoped_source"
-  | "mode1_requires_user";
+  | "mode1_requires_user"
+  // R756-F6 — a `hooks` entry naming a hook the engine does not invoke. Its
+  // own kind rather than `shape` because the shape is fine; the name is not,
+  // and the Rust validator (which gets structure for free from serde) can
+  // only report it as a semantic rule.
+  | "unknown_hook";
 
 export type ValidationError = {
   kind: ValidationErrorKind;
@@ -247,6 +254,34 @@ function checkErrorRoutes(raw: unknown, errs: ValidationError[]): ManifestErrorR
   return out;
 }
 
+// Mode 2 hooks (R756-F6). The name set is closed — only the engine invokes a
+// hook, so an unrecognised name in a manifest is a build that emitted
+// something nothing will ever call, not a forward-compatible extension.
+function checkHooks(raw: unknown, errs: ValidationError[]): ManifestHooks | undefined {
+  if (raw === undefined) return undefined;
+  if (!isObject(raw)) {
+    errs.push(shape("hooks", "expected object"));
+    return undefined;
+  }
+  const out: Record<string, { entrypoint: string }> = {};
+  for (const [name, value] of Object.entries(raw)) {
+    if (!isHookName(name)) {
+      errs.push({
+        kind: "unknown_hook",
+        path: `hooks.${name}`,
+        message: `unknown hook '${name}' (known: ${HOOK_NAMES.join(", ")})`,
+      });
+      continue;
+    }
+    if (!isObject(value) || typeof value.entrypoint !== "string") {
+      errs.push(shape(`hooks.${name}`, "expected { entrypoint: string }"));
+      continue;
+    }
+    out[name] = { entrypoint: value.entrypoint };
+  }
+  return out as ManifestHooks;
+}
+
 function checkRules(manifest: Manifest, catalog: SourceCatalog, errs: ValidationError[]): void {
   manifest.routes.forEach((route, idx) => {
     if (route.mode !== "static") return;
@@ -332,6 +367,8 @@ export function validate(input: unknown, catalog: SourceCatalog = {}): Validatio
     }
   }
 
+  const hooks = checkHooks(input.hooks, errs);
+
   if (errs.length) return { ok: false, errors: errs };
 
   const manifest: Manifest = {
@@ -341,6 +378,7 @@ export function validate(input: unknown, catalog: SourceCatalog = {}): Validatio
     static_assets: staticAssets,
     ...(errorRoutes ? { error_routes: errorRoutes } : {}),
     ...(ssrPrefixes !== undefined ? { ssr_prefixes: ssrPrefixes } : {}),
+    ...(hooks !== undefined ? { hooks } : {}),
   };
 
   checkRules(manifest, catalog, errs);

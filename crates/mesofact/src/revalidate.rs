@@ -59,7 +59,8 @@
 //! genuinely poll-driven feed all send.
 //!
 //! @yah:relay(R446, "mesofact-serve --revalidate: multi-tenant tenants/&lt;id&gt;.toml registry (R330-F12 receiver re-home)")
-//! @yah:at(2026-07-15T22:29:05Z)
+//! @yah:status(review)
+//! @yah:at(2026-08-13T19:10:19Z)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:gotcha("COORDINATE revalidate.rs edits with Glimmerstone (chat, sigil g-polar-star) — they are live in the mesofact tree with in-flight fixes: per-extension Content-Type in object-store r2.rs put/publish (landed, uncommitted) + the clean-URL extensionless->.html router fix (mesofact R443-B4). Those are general infra; this relay must not duplicate or collide with them. Sync before substantive revalidate.rs edits.")
 //! @yah:gotcha("/releases is a STATIC prerender (releases.html) re-rendered from releases.json on revalidate — NOT a serveInstance/pointer route (W059 §3 'materialisation = build-time static, style a'). The registry routes pokes to render+publish; it does not add per-request dynamic serving.")
@@ -70,20 +71,27 @@
 //! @yah:assumes("data_inputs do NOT belong in the tenant registry: route<-data bindings already live in the mesofact manifest.json (RenderRequest.data), and the data SOURCE (gh-releases fetch) is the producer's concern, out of the receiver's scope.")
 //! @yah:handoff("LANDED (code-complete, mesofact-dev, feature=ssr): new crate::tenants module + --tenants CLI mode. (1) tenants.rs: TenantFile (id/workload/publish_config/mirror_key_env from tenants/<id>.toml) -> ResolvedTenant (bearer resolved) -> TenantRegistry.tenant_for(mirror_key) routing; TenantJob{tenant_id,workload,publish_config,route}; load_tenants(dir) (sorted, missing-dir=empty, id==stem fail-loud) + resolve_tenants(files, env-lookup closure) (bearer via mirror_key_env, never a literal secret in git); axum router (POST /revalidate {route,mirror_key} -> bearer selects tenant -> enqueue TenantJob -> 202; absent/empty/unknown bearer -> 403) + serve() draining TenantJob through the EXISTING crate::revalidate::revalidate_once (render+publish unchanged, only multiplied). (2) lib.rs: pub mod tenants (ssr). (3) serve.rs bin: --tenants <dir> mode; workload now optional; mutually exclusive with single-tenant --workload/--publish-config. Boundary held: a tenant references its OWN mesofact.config.toml, NOT yah's mirror toml. Tests: 11 new (registry routing incl. unroutable-without-bearer; HTTP 202/403 + whole-site None-route; load sorted/missing-dir/stem-mismatch; resolve env present/absent). mesofact-dev 76->87 green; clippy clean on tenants.rs/serve.rs.")
 //! @yah:handoff("REMAINING (not code in this crate): (a) YAH-SIDE generator — a yah reconciler emits each tenant's mesofact.config.toml [publish] from .yah/services/<svc>/mirrors/<env>.toml (Glimmerstone's 'thin deref' goal, kept on the yah side to preserve the export boundary); file under R330-F12's producer track. (b) DEPLOY: F11 runner hosts `mesofact-serve --tenants <dir>` (not almanac-serve), with tenants/<id>.toml + the mirror_key_env bearers set. (c) SMOKE: POST runner /revalidate {route:'/releases', mirror_key:'<yah-marketing bearer>'} -> renders+publishes to yah-marketing's R2. (d) Glimmerstone ack on the mesofact-native shape (divergence flagged; routing core is shape-invariant either way).")
-//! @yah:verify("cargo test -p mesofact-dev --features ssr tenants::  # 11 pass (registry routing + HTTP 202/403 + load/resolve)")
-//! @yah:verify("cargo test -p mesofact-dev --features ssr  # 87 pass (full crate)")
-//! @yah:verify("cargo clippy -p mesofact-dev --features ssr  # clean on tenants.rs + serve.rs")
-//! @yah:verify("SMOKE (infra-gated): mesofact-serve --tenants <dir> up; POST /revalidate {route:'/releases', mirror_key:'<bearer>'} -> 202 + renders+publishes; wrong bearer -> 403")
+//! @yah:verify("cargo test -p mesofact --features ssr tenants::  # 22 pass (registry routing, per-tenant allowlist, validate, load/resolve). NOTE: crate is `mesofact`, not `mesofact-dev` — the serving engine moved here in W225 §2a; the old mesofact-dev verify lines were stale.")
+//! @yah:verify("cargo test -p mesofact --features ssr  # 131 lib + 5 integration pass")
+//! @yah:verify("cargo clippy -p mesofact --features ssr --all-targets  # clean")
+//! @yah:verify("LIVE SMOKE (done, no infra needed): mesofact serve --revalidate --tenants <dir> --listen 127.0.0.1:38446 with two tenant tomls; /releases+mkt-bearer 202, /pricing+mkt-bearer 403 (outside that tenant's allowlist), /pricing+acme-bearer 202 (acme declares none), wrong/absent bearer 403, whole-site poke 202, escaping data_inputs 400. Renders then fail on the absent fixture workload — which is the proof the worker reached revalidate_once per tenant.")
+//! @yah:verify("CLI guards on the real binary: `--tenants X <workload>` -> clap conflict error; empty --tenants dir -> refuses to boot; two tenants sharing a bearer -> refuses to boot naming the ids (never the bearer).")
+//! @yah:handoff("R446 receiver half is COMPLETE in-crate. This session closed the last modelled gap: the per-tenant `routes` allowlist that tenants.rs carried as a `&[]` TODO at the revalidate_once call. TenantFile.routes / ResolvedTenant.routes / TenantJob.allow now thread it end-to-end, enforced in the SAME two places as the single-tenant receiver (yah R752-B7): an explicit out-of-list route is refused 403 in the handler, a whole-site poke (route:None) is NARROWED by the worker. 403 not 404 deliberately, matching revalidate.rs:474 — the route may exist, the caller lacks authority over it.")
+//! @yah:verify("Hardening found while implementing (all in R446's own files, all tested): (1) TenantRegistry::validate() — two tenants resolving to the same bearer meant tenant_for() silently gave every poke to the first, i.e. rendering one tenant's workload into the other's bucket with a 202 on the wire. Now refuses at boot, naming ids and never the bearer. (2) --tenants now clap-conflicts with workload/--publish-config/--allow-route instead of silently winning — a silently-ignored --allow-route is an allowlist an operator believes is enforced. --mirror-key only warns (it carries env=MESOFACT_MIRROR_KEY, which a runner may set process-wide). (3) An empty/missing --tenants dir refuses to boot: it produced a receiver that 403s everything while passing /readyz — the yah R330-T35 silent-failure shape. load_tenants keeps missing-dir=empty (library contract, tested); the CLI is where it becomes fatal. (4) serde(deny_unknown_fields) on TenantFile: `route` for `routes` would have parsed clean and yielded an unscoped tenant. (5) Per-tenant startup log lines (workload, publish_config, routable, allowed_routes).")
+//! @yah:gotcha("Verify lines that referenced `-p mesofact-dev` were STALE and are corrected: the serving engine (revalidate + tenants) moved into `crates/mesofact` in W225 §2a. Test with `-p mesofact --features ssr`.")
+//! @yah:gotcha("Working tree is DIRTY and uncommitted by design — tenants.rs + cli/serve.rs. No git write was made (not requested).")
+//! @yah:assumes("Glimmerstone (g-polar-star) is no longer in this camp, so the flagged mesofact-native-vs-thin-deref divergence never got an explicit ack. The mesofact-native shape is what shipped and is now tested end-to-end; the routing core is shape-invariant either way, so a later thin-deref would change only where publish_config comes from, not the registry.")
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::{
     extract::{DefaultBodyLimit, State},
     http::StatusCode,
-    routing::{get, post},
+    routing::post,
     Json, Router,
 };
 use mesofact_core::manifest::{Manifest, RouteMode};
@@ -110,6 +118,19 @@ pub struct RevalidateConfig {
     /// `mirror_key` or it is rejected 403 — the cross-mirror-pollution guard
     /// ported from `almanac::receiver` (R335-F2). `None` = open receiver.
     pub mirror_key: Option<String>,
+    /// Route allowlist. Empty = every render-eligible route in the manifest.
+    ///
+    /// This is scoping, NOT authentication — the two are orthogonal and a
+    /// deployment may set either, both, or neither (yah R752-B7). A receiver
+    /// with an allowlist re-renders exactly these routes and nothing else, so a
+    /// caller who holds the bearer still cannot reach a route the deployment
+    /// never declared.
+    ///
+    /// Enforced in two places because a poke has two shapes: an explicit
+    /// `{"route": …}` outside the list is refused, and a whole-site poke
+    /// (`route` absent) is NARROWED to the list rather than refused — "empty =
+    /// all routes" then reads the same way from both ends.
+    pub routes: Vec<String>,
 }
 
 /// Render inputs carried by a poke: the **workload-relative** path a route
@@ -195,6 +216,14 @@ pub struct RevalidateReport {
 /// route only; `None` → every render-eligible route in the manifest (all
 /// `static`/`spa`, non-`deferred`).
 ///
+/// `allow` is the deployment's route allowlist ([`RevalidateConfig::routes`]);
+/// empty = unrestricted. It is applied HERE, not only at the HTTP edge, so the
+/// scope holds for every caller of this function — the receiver, the
+/// multi-tenant router, and anything that drives a revalidate in-process. A
+/// disallowed explicit route is an error rather than a silent no-op, because a
+/// poke that renders nothing and reports success is the failure mode that made
+/// the un-enforced allowlist invisible for as long as it was (yah R752-B7).
+///
 /// `data_inputs` is applied *inside* this function rather than by each caller so
 /// no receiver can forget it and quietly go back to rendering node-local state.
 /// An empty map is the payload-less case and touches nothing.
@@ -203,6 +232,7 @@ pub async fn revalidate_once(
     publish_config: &Path,
     route: Option<String>,
     data_inputs: &DataInputs,
+    allow: &[String],
 ) -> Result<RevalidateReport> {
     // Land the carried data before rendering — this is what makes the output
     // independent of which instance serviced the poke.
@@ -211,8 +241,9 @@ pub async fn revalidate_once(
     // Render is synchronous and V8 is `!Send`, so it runs on a blocking thread
     // — booting and dropping its own isolate (the ephemeral property).
     let workload_owned = workload.to_path_buf();
+    let allow_owned = allow.to_vec();
     let (rendered_routes, instances) =
-        tokio::task::spawn_blocking(move || render_routes(&workload_owned, route))
+        tokio::task::spawn_blocking(move || render_routes(&workload_owned, route, &allow_owned))
             .await
             .context("revalidate: render task panicked")??;
 
@@ -222,11 +253,15 @@ pub async fn revalidate_once(
 
 /// Render half — boots one `SsgRuntime`, renders every instance of each
 /// target route, and writes them into `dist/`. Synchronous (V8 is `!Send`).
-fn render_routes(workload: &Path, route: Option<String>) -> Result<(Vec<String>, usize)> {
-    let routes = match route {
-        Some(r) => vec![r],
-        None => eligible_routes(workload)?,
-    };
+///
+/// `allow` empty = unrestricted; otherwise an explicit route must be in it and
+/// a whole-site poke is intersected with it.
+fn render_routes(
+    workload: &Path,
+    route: Option<String>,
+    allow: &[String],
+) -> Result<(Vec<String>, usize)> {
+    let routes = render_targets(workload, route, allow)?;
 
     let ssg = SsgRuntime::start().context("revalidate: booting SsgRuntime")?;
     let mut instances = 0usize;
@@ -241,6 +276,36 @@ fn render_routes(workload: &Path, route: Option<String>) -> Result<(Vec<String>,
         rendered.push(r);
     }
     Ok((rendered, instances))
+}
+
+/// Which routes one poke resolves to, before any rendering happens.
+///
+/// Split out of [`render_routes`] so the scoping rule is testable without
+/// booting V8 — the allowlist is a security-shaped control and "it compiles"
+/// is not evidence it holds.
+fn render_targets(workload: &Path, route: Option<String>, allow: &[String]) -> Result<Vec<String>> {
+    match route {
+        Some(r) => {
+            if !allow.is_empty() && !allow.iter().any(|a| a == &r) {
+                anyhow::bail!(
+                    "revalidate: route {r} is not in this receiver's allowlist ({})",
+                    allow.join(", ")
+                );
+            }
+            Ok(vec![r])
+        }
+        // Intersect rather than union: the allowlist may name a route the
+        // manifest doesn't render (an `ssr` or `deferred` one, or a typo), and
+        // rendering by name alone would turn that into a per-poke error.
+        None => {
+            let eligible = eligible_routes(workload)?;
+            Ok(if allow.is_empty() {
+                eligible
+            } else {
+                eligible.into_iter().filter(|r| allow.iter().any(|a| a == r)).collect()
+            })
+        }
+    }
 }
 
 /// The render-eligible routes for a whole-site poke: everything except `ssr`
@@ -308,6 +373,8 @@ struct ReceiverState {
     tx: mpsc::Sender<Job>,
     /// When `Some`, a poke must carry a matching `mirror_key` or gets 403.
     mirror_key: Option<String>,
+    /// Route allowlist; empty = unrestricted. See [`RevalidateConfig::routes`].
+    routes: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -349,19 +416,51 @@ struct RevalidateBody {
 /// should never see.
 pub const MAX_REVALIDATE_BODY_BYTES: usize = 4 * 1024 * 1024;
 
-/// Build the receiver router: `POST /revalidate` (enqueue) + `GET
-/// /__mesofact/health` (readiness). Decoupled from the render/publish worker
-/// via `tx` so it is unit-testable without V8 or a network publish — the same
-/// split `almanac::serve::serve_receiver_on` uses.
-fn router(tx: mpsc::Sender<Job>, mirror_key: Option<String>) -> Router {
+/// Build the receiver router: `POST /dawn` (enqueue) + the [`crate::health`]
+/// probes. Decoupled from the render/publish worker via `tx` so it is
+/// unit-testable without V8 or a network publish — the same split
+/// `almanac::serve::serve_receiver_on` uses.
+///
+/// Readiness is unconditional here: this receiver holds no isolate and serves
+/// no tree, so once the router is mounted it can accept every request it
+/// claims to. The one state that must fail `/readyz` — draining — is owned by
+/// [`serve`], which is why it builds its own handle and calls
+/// [`router_with_health`] directly. That leaves this a test-only convenience.
+#[cfg(test)]
+fn router(tx: mpsc::Sender<Job>, mirror_key: Option<String>, routes: Vec<String>) -> Router {
+    router_with_health(tx, mirror_key, routes, crate::Health::ready())
+}
+
+fn router_with_health(
+    tx: mpsc::Sender<Job>,
+    mirror_key: Option<String>,
+    routes: Vec<String>,
+    health: Arc<crate::Health>,
+) -> Router {
     Router::new()
+        // `POST /dawn` — "this page is stale, re-render it from these bytes"
+        // (yah R752-T10). The sibling stage, "the input changed, go re-fetch
+        // this feed", is `POST /freshen` on almanac's receiver. Both used to be
+        // `/revalidate`, told apart only by which key the body carried, and
+        // because this receiver's `RevalidateBody` is `#[serde(default)]` with
+        // no `deny_unknown_fields`, a feed-shaped body sent here parsed fine and
+        // silently meant *re-render the whole site*.
+        .route("/dawn", post(revalidate_handler))
+        // Transitional alias, unlike almanac's side which took a clean break:
+        // this path IS deployed (kamaji forks this receiver on the tenant's
+        // node) and its callers are separately-rolled units, so removing it in
+        // the same change would break every poke until both sides rolled.
+        // Retire it once no node predates R752-T10.
         .route("/revalidate", post(revalidate_handler))
-        .route("/__mesofact/health", get(|| async { "ok" }))
         // Explicit rather than axum's 2 MiB default — see
         // [`MAX_REVALIDATE_BODY_BYTES`] for why this stopped being a framework
         // detail once pokes started carrying an accumulating history.
         .layer(DefaultBodyLimit::max(MAX_REVALIDATE_BODY_BYTES))
-        .with_state(ReceiverState { tx, mirror_key })
+        .with_state(ReceiverState { tx, mirror_key, routes })
+        // After `with_state`, because the probes carry their own state — see
+        // the same note in `Server::router`. Also leaves them outside the body
+        // limit above, which is moot for a bodyless GET.
+        .merge(crate::health::probe_routes(health))
 }
 
 async fn revalidate_handler(
@@ -375,6 +474,21 @@ async fn revalidate_handler(
                 warn!("revalidate rejected — mirror_key mismatch (cross-mirror pollution blocked)");
                 return StatusCode::FORBIDDEN;
             }
+        }
+    }
+
+    // Scope check, same reasoning as the payload check below: an out-of-scope
+    // poke gets a synchronous refusal, not a 202 that renders nothing. 403
+    // rather than 404 — the route may well exist on this site; what the caller
+    // lacks is authority over it (yah R752-B7).
+    if let Some(ref route) = body.route {
+        if !state.routes.is_empty() && !state.routes.iter().any(|a| a == route) {
+            warn!(
+                route = %route,
+                allowed = %state.routes.join(", "),
+                "revalidate rejected — route outside this receiver's allowlist",
+            );
+            return StatusCode::FORBIDDEN;
         }
     }
 
@@ -405,14 +519,20 @@ pub async fn serve(cfg: RevalidateConfig, host: std::net::IpAddr, port: u16) -> 
         workload = %cfg.workload.display(),
         publish_config = %cfg.publish_config.display(),
         mirror_key = cfg.mirror_key.is_some(),
+        // Logged as the resolved list, not a bool: "which routes may this
+        // process touch" is the first question when a poke did nothing, and the
+        // startup line is where an operator looks for it.
+        allowed_routes = %if cfg.routes.is_empty() { "<all>".to_string() } else { cfg.routes.join(", ") },
         "mesofact serve revalidate receiver starting (ephemeral render → publish)",
     );
 
     let (tx, mut rx) = mpsc::channel::<Job>(16);
-    let app = router(tx, cfg.mirror_key.clone());
+    let health = crate::Health::ready();
+    let app = router_with_health(tx, cfg.mirror_key.clone(), cfg.routes.clone(), health.clone());
 
     let workload = cfg.workload.clone();
     let publish_config = cfg.publish_config.clone();
+    let allow = cfg.routes.clone();
     tokio::spawn(async move {
         while let Some(Job { route, data_inputs }) = rx.recv().await {
             info!(
@@ -420,7 +540,9 @@ pub async fn serve(cfg: RevalidateConfig, host: std::net::IpAddr, port: u16) -> 
                 carried_inputs = data_inputs.len(),
                 "revalidate poke accepted"
             );
-            match revalidate_once(&workload, &publish_config, route.clone(), &data_inputs).await {
+            match revalidate_once(&workload, &publish_config, route.clone(), &data_inputs, &allow)
+                .await
+            {
                 Ok(report) => info!(
                     route = ?route,
                     rendered = ?report.rendered_routes,
@@ -440,7 +562,17 @@ pub async fn serve(cfg: RevalidateConfig, host: std::net::IpAddr, port: u16) -> 
         .await
         .with_context(|| format!("revalidate receiver: binding to {addr}"))?;
     info!(%addr, "revalidate receiver listening");
-    axum::serve(listener, app).await.context("revalidate receiver: server error")?;
+    // Graceful shutdown, where there previously was none: a SIGTERM used to
+    // sever in-flight POSTs at the socket, so a sender could not tell a
+    // rejected poke from a lost one. This drains the HTTP side only — the
+    // render/publish worker below reads from an `mpsc` on its own task and is
+    // still cut mid-`revalidate_once`. Draining that too means holding
+    // shutdown until `rx` empties, which is a separate change with its own
+    // ceiling (a poke queue can be long, and kubelet's grace period is not).
+    axum::serve(listener, app)
+        .with_graceful_shutdown(crate::shutdown_signal_for(health))
+        .await
+        .context("revalidate receiver: server error")?;
     Ok(())
 }
 
@@ -464,7 +596,7 @@ mod tests {
     #[tokio::test]
     async fn poke_enqueues_route_and_returns_202() {
         let (tx, mut rx) = mpsc::channel::<Job>(4);
-        let app = router(tx, None);
+        let app = router(tx, None, vec![]);
         let resp = post_json(app, r#"{"route":"/releases"}"#).await;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
         assert_eq!(rx.try_recv().unwrap().route, Some("/releases".to_string()));
@@ -473,7 +605,7 @@ mod tests {
     #[tokio::test]
     async fn poke_without_route_enqueues_none_whole_site() {
         let (tx, mut rx) = mpsc::channel::<Job>(4);
-        let app = router(tx, None);
+        let app = router(tx, None, vec![]);
         let resp = post_json(app, r#"{}"#).await;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
         assert_eq!(rx.try_recv().unwrap().route, None);
@@ -483,7 +615,7 @@ mod tests {
     async fn full_channel_returns_503() {
         let (tx, _rx) = mpsc::channel::<Job>(1);
         tx.try_send(Job { route: Some("already-full".into()), ..Job::default() }).unwrap();
-        let app = router(tx, None);
+        let app = router(tx, None, vec![]);
         let resp = post_json(app, r#"{"route":"/x"}"#).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -491,7 +623,7 @@ mod tests {
     #[tokio::test]
     async fn correct_mirror_key_passes() {
         let (tx, mut rx) = mpsc::channel::<Job>(4);
-        let app = router(tx, Some("secret-abc".into()));
+        let app = router(tx, Some("secret-abc".into()), vec![]);
         let resp = post_json(app, r#"{"route":"/r","mirror_key":"secret-abc"}"#).await;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
         assert_eq!(rx.try_recv().unwrap().route, Some("/r".to_string()));
@@ -500,7 +632,7 @@ mod tests {
     #[tokio::test]
     async fn wrong_mirror_key_returns_403_and_does_not_enqueue() {
         let (tx, mut rx) = mpsc::channel::<Job>(4);
-        let app = router(tx, Some("secret-abc".into()));
+        let app = router(tx, Some("secret-abc".into()), vec![]);
         let resp = post_json(app, r#"{"route":"/r","mirror_key":"nope"}"#).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert!(rx.try_recv().is_err(), "rejected poke must not enqueue");
@@ -509,7 +641,7 @@ mod tests {
     #[tokio::test]
     async fn absent_mirror_key_returns_403_when_configured() {
         let (tx, _rx) = mpsc::channel::<Job>(4);
-        let app = router(tx, Some("secret-abc".into()));
+        let app = router(tx, Some("secret-abc".into()), vec![]);
         let resp = post_json(app, r#"{"route":"/r"}"#).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
@@ -517,7 +649,7 @@ mod tests {
     #[tokio::test]
     async fn health_returns_ok() {
         let (tx, _rx) = mpsc::channel::<Job>(4);
-        let app = router(tx, None);
+        let app = router(tx, None, vec![]);
         let req = Request::builder()
             .method(Method::GET)
             .uri("/__mesofact/health")
@@ -553,6 +685,161 @@ mod tests {
         assert_eq!(got, vec!["/", "/app", "/releases"]);
     }
 
+    // ── /dawn, and the alias it replaces (yah R752-T10) ──────────────────────
+
+    async fn post_to(app: Router, path: &str, body: &'static str) -> StatusCode {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn dawn_is_the_name_and_revalidate_is_still_served() {
+        for path in ["/dawn", "/revalidate"] {
+            let (tx, mut rx) = mpsc::channel::<Job>(4);
+            let status = post_to(router(tx, None, vec![]), path, r#"{"route":"/r"}"#).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{path} must accept a poke");
+            assert_eq!(rx.try_recv().unwrap().route, Some("/r".to_string()));
+        }
+    }
+
+    /// The alias is a deployment concession, not a second contract: both paths
+    /// hit the same handler, so scoping and auth cannot diverge between them.
+    #[tokio::test]
+    async fn the_legacy_alias_enforces_the_same_allowlist() {
+        let (tx, _rx) = mpsc::channel::<Job>(4);
+        let status = post_to(
+            router(tx, None, vec!["/releases".to_string()]),
+            "/revalidate",
+            r#"{"route":"/issues"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    // ── Route allowlist (yah R752-B7) ────────────────────────────────────────
+    //
+    // The allowlist was config-only for its whole life: parsed from the mirror
+    // toml, shipped over the wire to the node, and read by nobody. Measured on
+    // us-east-001 with `routes = ["/releases"]` declared, a poke for /issues was
+    // accepted (202) and republished. These pin both halves of the fix — the
+    // synchronous refusal, and the whole-site narrowing that a refusal alone
+    // would have missed, since that poke names no route at all.
+
+    fn allow(routes: &[&str]) -> Vec<String> {
+        routes.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn route_outside_the_allowlist_is_403_and_does_not_enqueue() {
+        let (tx, mut rx) = mpsc::channel::<Job>(4);
+        let app = router(tx, None, allow(&["/releases"]));
+        let resp = post_json(app, r#"{"route":"/issues"}"#).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(rx.try_recv().is_err(), "a refused poke must not reach the renderer");
+    }
+
+    #[tokio::test]
+    async fn route_inside_the_allowlist_is_accepted() {
+        let (tx, mut rx) = mpsc::channel::<Job>(4);
+        let app = router(tx, None, allow(&["/releases", "/issues"]));
+        let resp = post_json(app, r#"{"route":"/issues"}"#).await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(rx.try_recv().unwrap().route, Some("/issues".to_string()));
+    }
+
+    /// The allowlist is scoping, not auth: holding the bearer buys nothing
+    /// outside the declared routes.
+    #[tokio::test]
+    async fn a_correct_mirror_key_does_not_widen_the_allowlist() {
+        let (tx, _rx) = mpsc::channel::<Job>(4);
+        let app = router(tx, Some("secret-abc".into()), allow(&["/releases"]));
+        let resp = post_json(app, r#"{"route":"/issues","mirror_key":"secret-abc"}"#).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// An empty allowlist is the documented "all routes" case, unchanged.
+    #[tokio::test]
+    async fn an_empty_allowlist_accepts_any_route() {
+        let (tx, mut rx) = mpsc::channel::<Job>(4);
+        let app = router(tx, None, vec![]);
+        let resp = post_json(app, r#"{"route":"/anything"}"#).await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(rx.try_recv().unwrap().route, Some("/anything".to_string()));
+    }
+
+    /// A whole-site poke names no route, so the handler has nothing to refuse —
+    /// this is the shape that was actually measured escaping the allowlist.
+    /// It is narrowed at render time instead.
+    #[tokio::test]
+    async fn a_whole_site_poke_is_accepted_and_narrowed_at_render_time() {
+        let (tx, mut rx) = mpsc::channel::<Job>(4);
+        let app = router(tx, None, allow(&["/releases"]));
+        let resp = post_json(app, r#"{}"#).await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(rx.try_recv().unwrap().route, None, "whole-site pokes stay whole-site here");
+    }
+
+    /// Manifest fixture with two static routes; `render_routes` is only asked to
+    /// enumerate, never to render (no V8 in unit tests).
+    fn workload_with_two_routes() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+        std::fs::create_dir_all(&dist).unwrap();
+        let r = |route: &str| {
+            format!(
+                r#"{{"route":"{route}","mode":"static","render_entrypoint":"e.js","cache_policy":{{"ttl":0}}}}"#
+            )
+        };
+        std::fs::write(
+            dist.join("manifest.json"),
+            format!(
+                r#"{{"version":"1","build_id":"b1","routes":[{},{}]}}"#,
+                r("/releases"),
+                r("/issues")
+            ),
+        )
+        .unwrap();
+        tmp
+    }
+
+    #[test]
+    fn whole_site_render_targets_are_the_manifest_intersected_with_the_allowlist() {
+        let tmp = workload_with_two_routes();
+        assert_eq!(
+            render_targets(tmp.path(), None, &allow(&["/releases"])).unwrap(),
+            vec!["/releases".to_string()],
+        );
+        let mut all = render_targets(tmp.path(), None, &[]).unwrap();
+        all.sort();
+        assert_eq!(all, vec!["/issues".to_string(), "/releases".to_string()]);
+    }
+
+    /// A route in the allowlist that the manifest cannot render (`ssr`,
+    /// `deferred`, or a typo) must not be conjured into the target set.
+    #[test]
+    fn an_allowlisted_route_absent_from_the_manifest_is_not_rendered() {
+        let tmp = workload_with_two_routes();
+        assert_eq!(
+            render_targets(tmp.path(), None, &allow(&["/releases", "/nope"])).unwrap(),
+            vec!["/releases".to_string()],
+        );
+    }
+
+    /// Defence in depth: the handler refuses first, but a caller reaching
+    /// `revalidate_once` in-process gets an error rather than a silent no-op.
+    #[test]
+    fn an_explicit_disallowed_route_errors_at_render_time_too() {
+        let tmp = workload_with_two_routes();
+        let err = render_targets(tmp.path(), Some("/issues".into()), &allow(&["/releases"]))
+            .expect_err("a disallowed explicit route must not resolve to a target set");
+        assert!(err.to_string().contains("allowlist"), "error names the cause: {err}");
+    }
+
     // ── Payload-carrying pokes (yah R330-F33) ────────────────────────────────
 
     const INPUT: &str = "src/data/releases.json";
@@ -564,7 +851,7 @@ mod tests {
     /// instance serviced the poke" either does or does not matter.
     async fn receive_and_apply(workload: &Path, body: &'static str) -> StatusCode {
         let (tx, mut rx) = mpsc::channel::<Job>(4);
-        let status = post_json(router(tx, None), body).await.status();
+        let status = post_json(router(tx, None, vec![]), body).await.status();
         if status == StatusCode::ACCEPTED {
             let job = rx.try_recv().expect("an accepted poke is enqueued");
             apply_data_inputs(workload, &job.data_inputs).await.unwrap();
@@ -642,7 +929,7 @@ mod tests {
 
         for body in [r#"{}"#, r#"{"route":"/releases"}"#] {
             let (tx, mut rx) = mpsc::channel::<Job>(4);
-            let status = post_json(router(tx, None), body).await.status();
+            let status = post_json(router(tx, None, vec![]), body).await.status();
             assert_eq!(status, StatusCode::ACCEPTED, "empty body must not be an error");
             let job = rx.try_recv().unwrap();
             assert!(job.data_inputs.is_empty());
@@ -677,7 +964,7 @@ mod tests {
             r#"{"data_inputs":{"":{}}}"#,
         ] {
             let (tx, mut rx) = mpsc::channel::<Job>(4);
-            let resp = post_json(router(tx, None), body).await;
+            let resp = post_json(router(tx, None, vec![]), body).await;
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "body: {body}");
             assert!(rx.try_recv().is_err(), "a rejected poke must not enqueue");
         }
@@ -720,7 +1007,7 @@ mod tests {
         let big = poke_of_size(3 * 1024 * 1024);
         assert!(big.len() < MAX_REVALIDATE_BODY_BYTES);
         assert!(big.len() > 2 * 1024 * 1024, "must exceed the inherited default it replaced");
-        let resp = post_owned(router(tx, None), big).await;
+        let resp = post_owned(router(tx, None, vec![]), big).await;
         assert_eq!(
             resp.status(),
             StatusCode::ACCEPTED,
@@ -731,7 +1018,7 @@ mod tests {
 
         // Over: rejected by the layer before the handler runs.
         let (tx, mut rx) = mpsc::channel::<Job>(4);
-        let resp = post_owned(router(tx, None), poke_of_size(MAX_REVALIDATE_BODY_BYTES)).await;
+        let resp = post_owned(router(tx, None, vec![]), poke_of_size(MAX_REVALIDATE_BODY_BYTES)).await;
         assert_eq!(
             resp.status(),
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -776,7 +1063,7 @@ mod tests {
         let before = local_data(node.path());
         let (tx, mut rx) = mpsc::channel::<Job>(4);
         let resp = post_json(
-            router(tx, Some("secret-abc".into())),
+            router(tx, Some("secret-abc".into()), vec![]),
             r#"{"route":"/releases","mirror_key":"nope","data_inputs":{"src/data/releases.json":
                 {"releases":[{"version":"9.9.9"}]}}}"#,
         )

@@ -11,6 +11,8 @@
 //!   `source_reads` names any non-`global` source is rejected.
 //! - **R2** (`Mode1RequiresUser`) — a `Mode::Static` route whose `requires`
 //!   contains [`Requires::User`] is rejected.
+//! - **R3** (`UnknownHook`) — a `hooks` entry naming a hook the engine does
+//!   not invoke is rejected (R756-F6 / W311 §2).
 //!
 //! See `.yah/docs/architecture/mesofact.md` §"Render axis × source axis".
 
@@ -47,7 +49,18 @@ pub enum ValidationErrorKind {
     Mode1ScopedSource { name: String, scope: &'static str },
     #[error("Mode 1 cannot require 'user' (the build can't enumerate users)")]
     Mode1RequiresUser,
+    /// R756-F6 — the Mode 2 hook name set is closed. Only the engine invokes
+    /// hooks, so a name it does not know names a bundle nothing will ever
+    /// call: a typo that would otherwise fail silently at runtime as "this
+    /// app contributed no verdict".
+    #[error("unknown hook '{name}' (known: {})", HOOK_NAMES.join(", "))]
+    UnknownHook { name: String },
 }
+
+/// Every Mode 2 hook name the engine knows how to invoke. Mirrors
+/// `HOOK_NAMES` in `packages/mesofact-runtime/src/hooks.ts` and
+/// `mesofact_render::route_config`.
+pub const HOOK_NAMES: &[&str] = &["readyz"];
 
 impl ValidationErrorKind {
     /// Snake-case label matching the TS validator's `ValidationErrorKind`.
@@ -58,6 +71,7 @@ impl ValidationErrorKind {
             ValidationErrorKind::UnknownSource { .. } => "unknown_source",
             ValidationErrorKind::Mode1ScopedSource { .. } => "mode1_scoped_source",
             ValidationErrorKind::Mode1RequiresUser => "mode1_requires_user",
+            ValidationErrorKind::UnknownHook { .. } => "unknown_hook",
         }
     }
 }
@@ -111,6 +125,19 @@ pub fn validate(manifest: &Manifest, catalog: &SourceCatalog) -> Result<(), Vec<
                 errors.push(ValidationError {
                     path: format!("routes[{idx}].requires"),
                     kind: ValidationErrorKind::Mode1RequiresUser,
+                });
+            }
+        }
+    }
+
+    // R3 (R756-F6) — every declared Mode 2 hook must be a name the engine
+    // knows how to invoke.
+    if let Some(hooks) = &manifest.hooks {
+        for name in hooks.keys() {
+            if !HOOK_NAMES.contains(&name.as_str()) {
+                errors.push(ValidationError {
+                    path: format!("hooks.{name}"),
+                    kind: ValidationErrorKind::UnknownHook { name: name.clone() },
                 });
             }
         }

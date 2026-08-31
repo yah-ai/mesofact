@@ -19,6 +19,34 @@
 //! prebuilt `dist/` is the only input this needs besides the project root
 //! (used solely to re-read `data_inputs` files when no explicit data is
 //! given).
+//!
+//! @yah:relay(R600, "Prerender instance keys: renderer emits a flat name the edge router never resolves")
+//! @yah:at(2026-08-12T17:43:59Z)
+//! @yah:status(open)
+//!
+//! @yah:ticket(R600-B1, "Parametric prerender instances publish under a flat key the edge router never looks up - every /route/:param page 404s")
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:at(2026-08-13T19:17:03Z)
+//! @yah:parent(R600)
+//! @yah:severity(high)
+//! @yah:gotcha("MEASURED LIVE on yah.dev 2026-08-12 (yah camp R752-B6 / R330-F13), not inferred. The render and publish legs are both CORRECT and complete; only the lookup name disagrees. Receiver log: revalidate complete route=Some(\"/issues/:id\") rendered=[\"/issues/:id\"] instances=14 uploaded=3. The bytes are served: GET https://cdn.yah.dev/yah-marketing/cloud/<build>/html/issues_id__01KZVGVT0DV61ZGGNVHAWQW2CS.html -> 200. But GET https://yah.dev/issues/01KZVGVT0DV61ZGGNVHAWQW2CS -> 404.")
+//! @yah:gotcha("THE MISMATCH. The renderer names each emission off the ROUTE PATTERN: prerender_key(\"/issues/:id\", {id}) = route_key + \"__\" + params = issues_id__<id>, written to dist/html/issues_id__<id>.html (crates/mesofact-render/src/route_key.rs). The edge router resolves off the REQUEST PATH: assetCandidates(\"issues/<id>\") tries issues/<id>.html then issues/<id>/index.html (packages/mesofact-edge/src/router.ts:211). Neither is ever written. Bucket listing confirms: 14 issues_id__<ulid>.html objects, zero issues/<ulid>.html.")
+//! @yah:gotcha("NOT the pointer-store path, which is what everyone checks first. router.ts:240 routes through pointers only for prerender: { deferred: true }; a {from_data, items_key, param} block has no deferred flag, so matchesDeferredRoute is false and it takes the plain-asset branch. The p/ prefix is empty, consistent with that. So this is not 'instances are pointer-published and the pointer is missing' - there is no pointer involved at all.")
+//! @yah:next("RECOMMENDED SIDE: move the WRITE, not the lookup. Emit parametric instances at the path-shaped location (dist/html/issues/<id>.html) so the generic publisher - which is a plain directory walker, publish.rs:128 is literally format!(\"{build_id}/{rel_str}\") and has no route knowledge - carries them to a key the edge already resolves. Teaching the router the entrypoint-derived name instead means a THIRD copy of the route_key rule (Rust render, TS build, TS worker) plus param extraction at the edge; route_key.rs's own header already warns the two existing copies must stay identical. Note the flat key and the path agree for every NON-parametric route (/releases -> releases.html), so path-shaped was always the implied contract and only parametric routes ever diverged.")
+//! @yah:next("Blast radius to check before moving: prerender_key (crates/mesofact-render/src/route_key.rs) and its TS twin packages/mesofact-build/src/route-key.ts + prerender.ts must move together or the two pipelines emit different names - the header calls that out. dist/server/<key>.js is a SEPARATE concern and should NOT move; only the html emission name is wrong. Existing published builds keep the old keys, so this is fixed-forward on the next publish, not a migration.")
+//! @yah:verify("Regression that would have caught this: build a fixture with a {from_data, items_key, param} prerender route, then assert the emitted dist/html key is what routeToAssetKeys / assetCandidates derives from the instance's PUBLIC path. The existing coverage only asserts the file is emitted, which is why a local build proof could not catch it - the mismatch exists only on the serve side.")
+//! @yah:next("Tier: Wizard - the fix is small but it is a render/serve contract change across three packages with a naming rule that already has two copies; picking the wrong side adds a third.")
+//! @yah:handoff("FIXED, moved the WRITE as recommended. prerender_key / prerenderKey no longer flatten the route pattern; each emission is named by the PUBLIC PATH it serves at, minus the leading slash. /issues/:id + id=abc now emits dist/html/issues/abc.html, exactly what assetCandidates(url.pathname.slice(1)) asks the origin for. route_key is untouched: dist/server/<key>.js and dist/hydrate/<key>.<hash>.js stay pattern-flattened, correct since nobody addresses them by URL.")
+//! @yah:handoff("Signature moved on both twins from (route, params) to (route, url). Both call sites already had the expanded url in hand, so this drops a re-expansion and its error-swallow. Files: crates/mesofact-render/src/route_key.rs (rule + header explaining WHY there are two names), crates/mesofact-render/src/render.rs:246 (the revalidate / publish-once leg), crates/mesofact-build/src/prerender.rs:93 (Rust build leg), packages/mesofact-build/src/route-key.ts + prerender.ts:146 (Bun build leg). Both write legs now mkdir the parent, since a key can nest.")
+//! @yah:handoff("DISCOVERED + FIXED 1 - nested literal routes were broken the same way, not just parametric ones. route_key flattens every separator, so /blog/nested emitted blog_nested.html while all three resolvers ask for blog/nested.html. The ticket's premise that flat and path agree for every non-parametric route holds only for SINGLE-SEGMENT routes. Same one-line fix covers it; pinned by a case in prerender_key_is_the_public_path.")
+//! @yah:handoff("DISCOVERED + FIXED 2 - path-shaping made mesofact serve lose the LIST page, and my own new test caught it. yah.dev has both /issues (list) and /issues/:id, so dist/html now holds issues.html next to an issues/ directory. serve_static resolved a directory to <dir>/index.html BEFORE trying <key>.html, so GET /issues 404'd. Reordered crates/mesofact/src/server.rs:1052 to the edge's own candidate order - literal, then <key>.html, then <key>/index.html - which also matches serve_error_page one screen down. The edge worker already had the right order; the dev server was the odd one out.")
+//! @yah:handoff("Bonus - this closes the gap R443-B4 parked as out-of-scope in the same file (GET /issues/42 still 404 in dev, would need route-schema knowledge in mesofact-dev). Moving the write means no resolver needs route knowledge at all: instances land where the plain clean-URL rule already looks. New regression serves_parametric_instance_at_its_public_path in server.rs asserts both halves.")
+//! @yah:verify("LIVE PROOF on the real yah.dev workload, not a fixture. Built app/yah/web/marketing into a scratch out-dir, then ran the render verb with one seeded issue: `mesofact-build render <marketing> --route /issues/:id --param id=01KZVGVT0DV61ZGGNVHAWQW2CS --data <seed>` -> key: issues/01KZVGVT0DV61ZGGNVHAWQW2CS, written to html/issues/01KZVGVT0DV61ZGGNVHAWQW2CS.html. Served that dist with ./target/debug/mesofact serve --port 4611: GET /issues/01KZVGVT0DV61ZGGNVHAWQW2CS -> 200 with the rendered body, GET /issues -> 200 (list unshadowed), /releases 200, / 200, /nonsense 404.")
+//! @yah:verify("The regression you asked for, split across the two packages that own each half - neither alone can catch a write/lookup disagreement, so both are needed. WRITE half: packages/mesofact-build/tests/build.test.ts on the existing {from_data, items_key, param} fixture now asserts html/items/a.html + html/items/b.html and, generically, that every emission's htmlPath equals dist/html<url>.html. SERVE half: new describe in packages/mesofact-edge/tests/router.test.ts drives Miniflare against a build tree holding <build>/html/issues/<ulid>.html and asserts GET /issues/<ulid> -> 200, GET /issues -> 200, GET /issues/nope -> branded 404. That last case is the negative control: under the old naming the only published object is issues_id__<ulid>.html, which is exactly the no-instance-at-this-path case.")
+//! @yah:verify("Suites: cargo test -p mesofact-render -p mesofact-build -p mesofact -> 53 + 21 + 6 + 7 + 7 pass, 0 fail. bun test packages/mesofact-build -> 46 pass. bun test packages/mesofact-edge -> 43 pass (bundle rebuilt first). bun test packages/mesofact-runtime -> 99 pass. Typecheck clean on mesofact-edge. cargo clippy on the touched crates surfaces nothing new.")
+//! @yah:gotcha("cargo test --workspace is RED right now and it is NOT this change. @Miravel:polaris is mid-flight on R444 in the same tree: mesofact-ssr's SsrRuntime::start took an env arg (crates/mesofact-ssr/src/ssr.rs:145) and the call site in crates/mesofact/src/ssr.rs:418 is still 0-arg, plus an unresolved R2SourceCoords import. Feature unification turns the ssr feature on for the whole workspace, so --workspace cannot compile until they land. Per-crate runs are green. Verify per-crate until R444 settles.")
+//! @yah:cleanup("Stale flat emissions on the live receiver's persistent dist. The revalidate receiver renders into the workload's existing dist/ and the publisher walks the whole tree, so the 14 issues_id__<ulid>.html files already on that node will keep riding into every new build tree as dead weight. Not breakage - the correct issues/<ulid>.html is published alongside and wins - so no migration needed. Clear it whenever convenient with a fresh build of the workload, or rm dist/html/*__*.html on the node.")
 
 use anyhow::{anyhow, bail, Context, Result};
 use mesofact_core::manifest::{Manifest, Route, RouteMode};
@@ -55,7 +83,10 @@ pub struct RenderOptions {
 #[derive(Debug)]
 pub struct RenderOutcome {
     pub html: String,
-    /// Filesystem key (`prerender_key`) — `p_id__3` for `/p/:id` + `id=3`.
+    /// Filesystem key (`prerender_key`) — the public path minus its leading
+    /// slash, so `p/3` for `/p/:id` + `id=3`. Emitted at
+    /// `dist/html/<key>.html`, which is exactly what a request for `/p/3`
+    /// resolves to at the edge and in `mesofact serve`.
     pub key: String,
     /// Concrete URL the params expand to, e.g. `/p/3`.
     pub url: String,
@@ -226,11 +257,13 @@ fn render_instance(
         .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
         .unwrap_or_default();
 
-    let key = prerender_key(&route.route, params);
+    let key = prerender_key(&route.route, &url);
     let html_path = if write {
-        let html_dir = out_dir.join("html");
-        std::fs::create_dir_all(&html_dir)?;
-        let path = html_dir.join(format!("{key}.html"));
+        let path = out_dir.join("html").join(format!("{key}.html"));
+        // `key` is path-shaped (`issues/<id>`), so the emission may be nested.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         std::fs::write(&path, &html).with_context(|| format!("writing {}", path.display()))?;
         Some(path)
     } else {

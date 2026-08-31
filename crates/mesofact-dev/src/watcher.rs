@@ -1,7 +1,8 @@
 //! File-watch + auto-rebuild loop for `mesofact-static` workloads.
 //!
-//! Watches `<workload>/src/` via [`notify`], debounces edits, runs the
-//! workload's `build.command` (default `bun run build`), then snapshots
+//! Watches `<workload>/src/` via [`notify`], debounces edits, rebuilds
+//! ([`BuildDriver`] — in-process by default, `sh -c` when `workload.toml`
+//! declares a `[build] command`), then snapshots
 //! `<workload>/dist/` into `<workload>/.mesofact-dev/gen-<N>/` and flips a
 //! [`DistPointer`](super::DistPointer) so the running server starts serving
 //! the new artifact on the next request. Build stdout/stderr inherits the
@@ -91,13 +92,61 @@ const DEBOUNCE_MS: u64 = 200;
 const GENS_TO_KEEP: usize = 2;
 const STATE_DIR_NAME: &str = ".mesofact-dev";
 
+/// How a rebuild is produced.
+///
+/// The dev loop needs a bundler; the prod binary must never link one (W225
+/// §2/§3). That constraint says where `mesofact-build` may be linked — it
+/// does not say the dev tier has to reach it through a *third executable*,
+/// and until R759-T4 it did: the default was `sh -c "bun run build"`, so the
+/// documented "two binaries and no Node" loop actually needed bun on PATH,
+/// and the release ships only `mesofact` and `mesofact-dev`
+/// (`.yah/qed/release-build.toml`). [`BuildDriver::InProcess`] closes that:
+/// dev is the tier that is *allowed* to be fat, so it links the pipeline and
+/// calls it directly.
+#[derive(Debug, Clone)]
+pub enum BuildDriver {
+    /// Run `mesofact-build`'s pipeline in this process. Needs no package
+    /// manager and no Node — the pipeline materializes `node_modules` from
+    /// the project's lockfile itself.
+    ///
+    /// Only constructible with the `build` feature; [`WatchOptions`] falls
+    /// back to [`BuildDriver::Shell`] without it.
+    InProcess,
+    /// `sh -c <command>`, run from the workload root. What `workload.toml`'s
+    /// `[build] command` selects, and what a project with its own bundler
+    /// step wants.
+    Shell(String),
+}
+
+impl BuildDriver {
+    /// What `workload.toml` gets when it declares no `[build] command`.
+    ///
+    /// Without the `build` feature there is no pipeline linked in, so this
+    /// keeps the historical shell default rather than silently doing
+    /// nothing.
+    pub fn default_for_workload() -> Self {
+        #[cfg(feature = "build")]
+        {
+            Self::InProcess
+        }
+        #[cfg(not(feature = "build"))]
+        {
+            Self::Shell(LEGACY_SHELL_BUILD.to_string())
+        }
+    }
+}
+
+/// The pre-R759-T4 default. Retained as the `--no-default-features` fallback
+/// and named so the one place it still applies is greppable.
+pub const LEGACY_SHELL_BUILD: &str = "bun run build";
+
 /// Knobs for the watch loop.
 #[derive(Debug, Clone)]
 pub struct WatchOptions {
     /// Directory to watch recursively for source edits.
     pub watch_dir: PathBuf,
-    /// Shell command run via `sh -c` from the workload root.
-    pub build_command: String,
+    /// How a rebuild is produced.
+    pub build: BuildDriver,
     /// Directory the build writes into (the parent of `html/`). Relative
     /// paths resolve against the workload root.
     pub build_out_dir: PathBuf,
@@ -115,15 +164,20 @@ pub struct WatchOptions {
 }
 
 impl WatchOptions {
-    /// Best-effort defaults: watch `<workload>/src`, build with
-    /// `bun run build`, output to `<workload>/dist`, snapshot under
-    /// `<workload>/.mesofact-dev`. Reads `<workload>/workload.toml` if
-    /// present to override `build.command` / `build.out_dir` (so the dev
-    /// server agrees with the production reconciler).
+    /// Best-effort defaults: watch `<workload>/src`, build in-process, output
+    /// to `<workload>/dist`, snapshot under `<workload>/.mesofact-dev`. Reads
+    /// `<workload>/workload.toml` if present to override `build.command` /
+    /// `build.out_dir` (so the dev server agrees with the production
+    /// reconciler).
+    ///
+    /// A declared `[build] command` still wins and still runs through `sh
+    /// -c`; every workload in this repo declares one, so the in-process
+    /// default only changes what a workload that declares *nothing* gets —
+    /// which is the scaffolded project `mesofact new` emits.
     pub fn defaults_for_workload(workload: &Path) -> Self {
         let mut opts = Self {
             watch_dir: workload.join("src"),
-            build_command: "bun run build".to_string(),
+            build: BuildDriver::default_for_workload(),
             build_out_dir: workload.join("dist"),
             state_dir: workload.join(STATE_DIR_NAME),
             debounce: Duration::from_millis(DEBOUNCE_MS),
@@ -134,7 +188,7 @@ impl WatchOptions {
             if let Ok(parsed) = toml::from_str::<WorkloadTomlPartial>(&text) {
                 if let Some(build) = parsed.build {
                     if let Some(cmd) = build.command {
-                        opts.build_command = cmd;
+                        opts.build = BuildDriver::Shell(cmd);
                     }
                     if let Some(out) = build.out_dir {
                         opts.build_out_dir = if out.is_absolute() {
@@ -238,7 +292,7 @@ impl Watcher {
         if self.options.initial_build {
             info!("running initial build");
             if let Err(e) = self.build_and_swap(&mut next_gen).await {
-                error!(error = %e, "initial build failed; serving existing snapshot if any");
+                error!(error = format!("{e:#}"), "initial build failed; serving existing snapshot if any");
             }
         }
 
@@ -271,7 +325,7 @@ impl Watcher {
 
             info!("source change detected; rebuilding");
             if let Err(e) = self.build_and_swap(&mut next_gen).await {
-                error!(error = %e, "rebuild failed; keeping previous snapshot");
+                error!(error = format!("{e:#}"), "rebuild failed; keeping previous snapshot");
             }
         }
 
@@ -285,20 +339,63 @@ impl Watcher {
         self.build_and_swap(&mut next_gen).await
     }
 
-    async fn build_and_swap(&self, next_gen: &mut u64) -> Result<PathBuf> {
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(&self.options.build_command)
-            .current_dir(&self.workload)
-            .envs(self.options.build_env.iter().cloned())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .await
-            .with_context(|| format!("spawning build: {}", self.options.build_command))?;
-        if !status.success() {
-            anyhow::bail!("build exited with {}", status);
+    /// Produce `dist/` however [`BuildDriver`] says to.
+    async fn run_build(&self) -> Result<()> {
+        match &self.options.build {
+            BuildDriver::Shell(command) => {
+                let status = Command::new("sh")
+                    .arg("-c")
+                    .arg(command)
+                    .current_dir(&self.workload)
+                    .envs(self.options.build_env.iter().cloned())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .status()
+                    .await
+                    .with_context(|| format!("spawning build: {command}"))?;
+                if !status.success() {
+                    anyhow::bail!("build exited with {}", status);
+                }
+                Ok(())
+            }
+            BuildDriver::InProcess => self.run_build_in_process().await,
         }
+    }
+
+    #[cfg(feature = "build")]
+    async fn run_build_in_process(&self) -> Result<()> {
+        // `build_env` exists for the shell child (R490-F7 hands the dev S3
+        // coords to a build subprocess). In-process there is no child to
+        // inherit them, so set them on this process for the duration of the
+        // build — the pipeline's own R2 reads look them up through `env`
+        // exactly as the child did. Rebuilds are serialized by the watch
+        // loop, so nothing else in this process races the assignment.
+        for (k, v) in &self.options.build_env {
+            std::env::set_var(k, v);
+        }
+        mesofact::build::pipeline::build(mesofact::build::pipeline::BuildOptions {
+            project_root: self.workload.clone(),
+            out_dir: Some(self.options.build_out_dir.clone()),
+            build_id: None,
+            // `Auto`: materialize `node_modules` from the project's lockfile
+            // only when it is missing. This is the step that makes the loop
+            // work with no package manager and no Node on PATH.
+            install: mesofact::build::pipeline::InstallMode::Auto,
+        })
+        .await
+        .context("in-process build")?;
+        Ok(())
+    }
+
+    #[cfg(not(feature = "build"))]
+    async fn run_build_in_process(&self) -> Result<()> {
+        anyhow::bail!(
+            "this mesofact-dev was built without the `build` feature, so it cannot build in-process; declare `[build] command` in workload.toml"
+        )
+    }
+
+    async fn build_and_swap(&self, next_gen: &mut u64) -> Result<PathBuf> {
+        self.run_build().await?;
 
         let html_src = self.options.build_out_dir.join("html");
         if !html_src.is_dir() {
@@ -358,7 +455,7 @@ impl Watcher {
         // warning so operators notice without breaking the dev loop.
         if let Some(hook) = &self.post_build {
             if let Err(e) = hook(gen_dir.clone()).await {
-                warn!(error = %e, gen = n, "post-build publish hook failed; sim tier may be stale");
+                warn!(error = format!("{e:#}"), gen = n, "post-build hook failed");
             }
         }
 
@@ -380,7 +477,7 @@ pub fn spawn(watcher: Watcher) -> WatcherHandle {
         let result = watcher.run().await;
         flag.store(false, Ordering::SeqCst);
         if let Err(e) = result {
-            error!(error = %e, "watcher exited with error");
+            error!(error = format!("{e:#}"), "watcher exited with error");
         }
     });
     WatcherHandle { running, _join: join }
@@ -505,7 +602,11 @@ out_dir = "outdir"
 "#,
         );
         let opts = WatchOptions::defaults_for_workload(dir.path());
-        assert_eq!(opts.build_command, "echo built");
+        assert!(
+            matches!(&opts.build, BuildDriver::Shell(c) if c == "echo built"),
+            "a declared [build] command must still win over the in-process default: {:?}",
+            opts.build
+        );
         assert_eq!(opts.build_out_dir, dir.path().join("outdir"));
         assert_eq!(opts.watch_dir, dir.path().join("src"));
         assert_eq!(opts.state_dir, dir.path().join(".mesofact-dev"));
@@ -515,8 +616,25 @@ out_dir = "outdir"
     async fn defaults_for_workload_without_toml_uses_hardcoded_defaults() {
         let dir = tempdir().unwrap();
         let opts = WatchOptions::defaults_for_workload(dir.path());
-        assert_eq!(opts.build_command, "bun run build");
         assert_eq!(opts.build_out_dir, dir.path().join("dist"));
+
+        // R759-T4: a workload that declares no build command builds
+        // in-process. This is what makes `mesofact new` + `mesofact-dev .`
+        // work with only the two shipped binaries — the old `bun run build`
+        // default needed bun on PATH and a `mesofact-build` the release does
+        // not ship.
+        #[cfg(feature = "build")]
+        assert!(
+            matches!(opts.build, BuildDriver::InProcess),
+            "{:?}",
+            opts.build
+        );
+        #[cfg(not(feature = "build"))]
+        assert!(
+            matches!(&opts.build, BuildDriver::Shell(c) if c == LEGACY_SHELL_BUILD),
+            "{:?}",
+            opts.build
+        );
     }
 
     #[tokio::test]
@@ -557,7 +675,7 @@ out_dir = "outdir"
 
         let pointer = DistPointer::new(workload.path().join("dist").join("html"));
         let mut opts = WatchOptions::defaults_for_workload(workload.path());
-        opts.build_command = FAKE_BUILD.to_string();
+        opts.build = BuildDriver::Shell(FAKE_BUILD.to_string());
         let watcher = Watcher::new(workload.path(), pointer.clone(), opts);
 
         let served = watcher.rebuild().await.unwrap();
@@ -586,7 +704,7 @@ out_dir = "outdir"
 
         let pointer = DistPointer::new(workload.path().join("dist").join("html"));
         let mut opts = WatchOptions::defaults_for_workload(workload.path());
-        opts.build_command = FAKE_BUILD.to_string();
+        opts.build = BuildDriver::Shell(FAKE_BUILD.to_string());
 
         let received: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(vec![]));
         let recv2 = Arc::clone(&received);
@@ -618,7 +736,7 @@ out_dir = "outdir"
 
         let pointer = DistPointer::new(workload.path().join("dist").join("html"));
         let mut opts = WatchOptions::defaults_for_workload(workload.path());
-        opts.build_command = FAKE_BUILD.to_string();
+        opts.build = BuildDriver::Shell(FAKE_BUILD.to_string());
 
         let hook: PostBuildFn = Box::new(move |_gen_dir: PathBuf| {
             Box::pin(async move { anyhow::bail!("publish failed (test)") })
@@ -641,7 +759,7 @@ out_dir = "outdir"
         let pointer = DistPointer::new(workload.path().join("dist").join("html"));
         let mut opts = WatchOptions::defaults_for_workload(workload.path());
         // Build "succeeds" but writes the wrong place (dist/, not dist/html/).
-        opts.build_command = "mkdir -p dist && echo x > dist/marker".to_string();
+        opts.build = BuildDriver::Shell("mkdir -p dist && echo x > dist/marker".to_string());
         let watcher = Watcher::new(workload.path(), pointer.clone(), opts);
 
         let err = watcher.rebuild().await.unwrap_err();
@@ -657,7 +775,7 @@ out_dir = "outdir"
 
         let pointer = DistPointer::new(workload.path().join("dist").join("html"));
         let mut opts = WatchOptions::defaults_for_workload(workload.path());
-        opts.build_command = "exit 7".to_string();
+        opts.build = BuildDriver::Shell("exit 7".to_string());
         let watcher = Watcher::new(workload.path(), pointer.clone(), opts);
 
         let err = watcher.rebuild().await.unwrap_err();
@@ -671,7 +789,7 @@ out_dir = "outdir"
 
         let pointer = DistPointer::new(workload.path().join("dist").join("html"));
         let mut opts = WatchOptions::defaults_for_workload(workload.path());
-        opts.build_command = FAKE_BUILD.to_string();
+        opts.build = BuildDriver::Shell(FAKE_BUILD.to_string());
         opts.debounce = Duration::from_millis(50);
         let watcher = Watcher::new(workload.path(), pointer.clone(), opts);
 

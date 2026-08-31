@@ -1,0 +1,21 @@
+# Workload manifest — what a deploy tool reads about this project.
+#
+# The local loop does not need this file: `mesofact-dev .` reads
+# `mesofact.routes.ts` directly and builds in-process. It matters for the
+# DEPLOY path (`yah cloud bundle build`), which reads `routes` and
+# `build.out_dir` from here.
+#
+# `[build] command` is deliberately absent. Left unset, `mesofact-dev` runs
+# the build pipeline in-process — no third binary, no package manager, no
+# Node. Setting it opts back out to a shell command, which is what a project
+# with its own bundler step wants.
+
+schema_version = 1
+kind = "mesofact-static"
+
+# `routes` is a TOP-LEVEL field. It must stay above [build] — TOML would scope
+# it into that table otherwise, and the manifest would parse with no routes.
+routes = "./mesofact.routes.ts"
+
+[build]
+out_dir = "dist"

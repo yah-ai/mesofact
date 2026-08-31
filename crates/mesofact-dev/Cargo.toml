@@ -11,9 +11,23 @@ description = "Dev-tier affordances for mesofact workloads — rebuild-on-change
 [lib]
 path = "src/lib.rs"
 
+# `mes` is the name. `mesofact-dev` is the same CLI under the old one, kept as
+# a transitional alias — see `src/bin/mesofact-dev.rs` for what still depends
+# on it and when it can go. Both are three lines over `cli::run`.
+#
+# The CRATE stays `mesofact-dev`. A dependency line reading `mes = "0.8"` tells
+# a reader nothing, and `mesofact`'s `cli/new/mod.rs` cites this crate's
+# unpublishability as blocker #1 for the library tier — if it ever publishes,
+# it should publish under the descriptive name. Cargo decouples package name
+# from bin name; use that. (`mes` is unclaimed on crates.io as of 2026-08-30 if
+# it is worth a placeholder, but that is a separate decision from this one.)
+[[bin]]
+name = "mes"
+path = "src/main.rs"
+
 [[bin]]
 name = "mesofact-dev"
-path = "src/main.rs"
+path = "src/bin/mesofact-dev.rs"
 
 # NOTE: the prod `mesofact-serve` bin used to live here. It moved to the
 # `mesofact` facade — its presence in this crate is exactly what forced the prod
@@ -28,10 +42,30 @@ path = "src/main.rs"
 # the SPA hydrate path, the same-origin reverse proxy, the watcher, and the dev
 # S3 surface are all unaffected.
 [features]
-default = ["ssr"]
+default = ["ssr", "build"]
 # Forwards to the facade's `ssr` tier (runtime + revalidate receiver). The
 # publisher dep stays direct: the dev S3 smoke test drives S3Store itself.
-ssr = ["mesofact/ssr", "dep:mesofact-publisher"]
+# Pulls the `publish` feature below for the same reason the facade's `ssr`
+# does — see that manifest: forwarding `mesofact/ssr` alone would enable the
+# facade's `publish` cfg without setting one here, so `#[cfg(feature =
+# "publish")]` on the `mes publish` subcommand would be false while
+# `mesofact::cli::publish` was very much present. Keep the two in lockstep.
+ssr = ["mesofact/ssr", "dep:mesofact-publisher", "publish"]
+# Mirrors the facade's flag so the `mes publish` subcommand is gated on a
+# feature this crate actually declares.
+publish = ["mesofact/publish"]
+# Links the build pipeline (rolldown + lightningcss) so the watcher can build
+# IN-PROCESS instead of shelling out to a third executable (R759-T4). This is
+# the feature that makes the documented dev loop true: the release ships only
+# `mesofact` and `mesofact-dev`, so a `sh -c "bun run build"` default meant
+# the loop silently required bun on PATH.
+#
+# Default-ON, and it belongs HERE rather than in the facade: `mesofact-build`
+# is the one from-source compile monster and W225 §2/§3 forbid it in the prod
+# binary's closure. Dev is the tier that is allowed to be fat. A consumer who
+# wants a lean dev binary (their own bundler step, declared as `[build]
+# command` in workload.toml) can still `--no-default-features`.
+build = ["mesofact/build"]
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
@@ -57,7 +91,7 @@ serde_json = "1"
 toml = "0.8"
 # The serving engine. This crate is now a thin dev-affordance layer ON TOP of
 # the facade rather than the crate that owned the engine (W225 §2a).
-mesofact = { path = "../mesofact", version = "0.8.22", default-features = false }
+mesofact = { path = "../mesofact", version = "0.8.29", default-features = false }
 # Direct publisher dep for the dev-S3 round-trip test (drives S3Store itself).
 mesofact-publisher = { path = "../mesofact-publisher", optional = true }
 # HTTP client for the dev S3 round-trip. Loopback http://127.0.0.1 only — no TLS.

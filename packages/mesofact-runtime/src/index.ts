@@ -46,6 +46,9 @@ export type {
 
 export { defineRoutes, DEFAULT_RESILIENCE_TIMEOUT_MS } from "./routes.js";
 
+export type { HookName, HooksConfig } from "./hooks.js";
+export { HOOK_NAMES, HOOK_ROUTE_CLAIMS, isHookName } from "./hooks.js";
+
 export type {
   ManifestVersion,
   ManifestCachePolicy,
@@ -54,6 +57,8 @@ export type {
   ManifestRoute,
   ManifestStaticAsset,
   ManifestErrorRoutes,
+  ManifestHook,
+  ManifestHooks,
   Manifest,
   ResolvedPlacement,
 } from "./manifest.js";
@@ -83,6 +88,9 @@ export {
 
 export type { OpenGraph, TwitterCard, HeadLink, Head } from "./head.js";
 export { renderHead, weaveHead } from "./head.js";
+
+export { defineReadyz } from "./health.js";
+export type { ReadyCheck } from "./health.js";
 
 export { R2Adapter, r2, registerR2, clearR2Registry } from "./adapters/r2.js";
 export type { R2Config } from "./adapters/r2.js";

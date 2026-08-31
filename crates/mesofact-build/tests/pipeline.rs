@@ -97,7 +97,7 @@ fn static_assets_overlay_copied_and_listed() {
 }
 
 #[test]
-fn head_woven_into_shell_and_sitemap_filters_noindex_and_deferred() {
+fn head_woven_into_shell_and_sitemap_filters_noindex_deferred_and_error_routes() {
     let tmp = tempfile::tempdir().unwrap();
     let native = tmp.path().join("native");
     let result = build_native("head-sitemap", &native);
@@ -115,16 +115,29 @@ fn head_woven_into_shell_and_sitemap_filters_noindex_and_deferred() {
     let secret = std::fs::read_to_string(native.join("html/secret.html")).unwrap();
     assert!(secret.contains(r#"<meta name="robots" content="noindex">"#));
 
-    // Sitemap: indexed static routes only.
+    // Sitemap: every indexable prerendered route, whatever its mode.
     let sitemap_path = result.sitemap_path.expect("site_url set → sitemap emitted");
     assert!(sitemap_path.ends_with("sitemap.xml"), "sitemap at dist root: {sitemap_path:?}");
     let sitemap = std::fs::read_to_string(&sitemap_path).unwrap();
     assert!(sitemap.contains("<loc>https://example.test/</loc>"), "home in sitemap: {sitemap}");
     assert!(sitemap.contains("<loc>https://example.test/docs</loc>"), "docs in sitemap");
+    // A prerendered spa shell sits at a fixed URL and serves indexable HTML,
+    // so it belongs in the sitemap exactly as much as a static route does.
+    // The old `mode == Static` gate dropped it — which on a spa-shell
+    // marketing site meant the sitemap listed the 404 and nothing else
+    // (R821-B2).
+    assert!(sitemap.contains("<loc>https://example.test/app</loc>"), "spa shell in sitemap: {sitemap}");
     assert!(!sitemap.contains("/secret"), "noindex route excluded: {sitemap}");
     assert!(!sitemap.contains("/c/"), "deferred route excluded: {sitemap}");
-    // Deferred route prerendered nothing.
-    assert!(!native.join("html/c_slug.html").exists(), "deferred route emits no html");
+    // The 404 renders indexable HTML and declares no `noindex`; it is excluded
+    // solely because `error_routes` names it. Asking a crawler to index the
+    // site's own failure page is never what the author meant.
+    assert!(!sitemap.contains("/404"), "error route excluded: {sitemap}");
+    // …and it is still prerendered — the exclusion is from the sitemap only.
+    assert!(native.join("html/404.html").exists(), "error route still emits html");
+    // Deferred route prerendered nothing. Emissions are path-shaped, so an
+    // instance of /c/:slug would appear as `html/c/<slug>.html`.
+    assert!(!native.join("html/c").exists(), "deferred route emits no html");
 }
 
 #[test]
@@ -139,5 +152,58 @@ fn ssr_broken_default_export_fails_probe() {
     }));
     let Err(err) = result else { panic!("ssr-broken must fail") };
     let msg = format!("{err:#}");
+    assert!(msg.contains("export default"), "unexpected error: {msg}");
+}
+
+// ── Mode 2 hooks (R756-F6 / W311 §2) ─────────────────────────────────────────
+
+/// The Rust-native pipeline is the sole production build path, so the hook
+/// declaration site has to work here, not only in the TS pipeline. Same
+/// fixture both sides.
+#[test]
+fn declared_hook_bundles_and_lands_in_the_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let native = tmp.path().join("native");
+    build_native("hooks", &native);
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(native.join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["hooks"]["readyz"]["entrypoint"], "dist/server/hooks/readyz.js");
+    assert!(native.join("server/hooks/readyz.js").exists());
+
+    // A hook is not a route — it stays out of the route table and out of
+    // ssr_prefixes, which is the whole reason the declaration site exists.
+    let routes = manifest["routes"].as_array().unwrap();
+    assert_eq!(routes.len(), 1);
+    assert_eq!(routes[0]["route"], "/");
+    assert!(manifest["ssr_prefixes"].is_null());
+}
+
+#[test]
+fn a_workload_without_hooks_emits_no_hooks_block() {
+    let tmp = tempfile::tempdir().unwrap();
+    let native = tmp.path().join("native");
+    build_native("static-only", &native);
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(native.join("manifest.json")).unwrap())
+            .unwrap();
+    assert!(manifest["hooks"].is_null(), "hook-free manifests stay byte-identical to pre-F6");
+}
+
+#[test]
+fn broken_hook_default_export_fails_probe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let result = rt.block_on(build(BuildOptions {
+        project_root: fixtures_root().join("hooks-broken"),
+        out_dir: Some(tmp.path().join("native")),
+        build_id: Some("test-broken-hook".into()),
+        install: InstallMode::Never,
+    }));
+    let Err(err) = result else { panic!("hooks-broken must fail") };
+    let msg = format!("{err:#}");
+    assert!(msg.contains("hook readyz"), "unexpected error: {msg}");
     assert!(msg.contains("export default"), "unexpected error: {msg}");
 }

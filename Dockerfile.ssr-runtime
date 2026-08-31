@@ -12,8 +12,22 @@
 #   - The workload's built tree is bind-mounted at /app (volumes: host_dist → /app).
 #     So /app/dist/html + /app/dist/server + /app/manifest.json must be present.
 #   - Container listens on 0.0.0.0:3000 (override with --port).
-#   - Readiness: GET /__mesofact/health → 200. Point the reconciler's
-#     `ready_path` there for SSR-only sites (no static `/`).
+#   - Probes (crates/mesofact/src/health.rs), Kubernetes-conventional:
+#       livenessProbe  → GET /livez   200 while the process is serving
+#       readinessProbe → GET /readyz  200 only once the isolate has booted
+#                                     (static/SPA workloads: once dist/html/
+#                                     exists). 503 = do not send traffic.
+#       startupProbe   → GET /livez with a generous failureThreshold. There is
+#                        no /startupz; a startup probe is a schedule, not a
+#                        fourth check.
+#     `GET /__mesofact/health` and `/healthz` remain: the former is liveness
+#     (what it always was, despite its old "readiness" label — deployed
+#     reconcilers point `ready_path` at it), the latter is a /readyz alias.
+#     `ready_path` should move to /readyz for SSR-only sites — that is the
+#     endpoint that actually means "the isolate booted".
+#   - SIGTERM drains: /readyz fails for MESOFACT_DRAIN_GRACE_SECS (default 5)
+#     before the listener closes, covering endpoint-removal propagation. Keep
+#     terminationGracePeriodSeconds comfortably above it.
 #
 # For a self-contained cloud image (no bind mount), layer a child Dockerfile
 # that `COPY`s the built tree into /app on top of this one.

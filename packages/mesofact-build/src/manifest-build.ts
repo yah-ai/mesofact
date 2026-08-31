@@ -25,6 +25,7 @@
 
 import type {
   Manifest,
+  ManifestHooks,
   ManifestHydration,
   ManifestPrerender,
   ManifestRoute,
@@ -50,12 +51,16 @@ export type AssembleInput = {
   hydration?: ReadonlyMap<string, ManifestHydration>;
   // Discovered public/ overlay files (R490-F4; from `discoverStaticAssets`).
   staticAssets?: readonly ManifestStaticAsset[];
+  // Mode 2 hook name → `dist/server/hooks/<name>.js` (R756-F6; from
+  // `bundleHooks`).
+  hookPaths?: ReadonlyMap<string, string>;
   catalog: SourceCatalog;
 };
 
 export function assembleManifest(input: AssembleInput): Manifest {
   const routes = input.routes.routes.map((entry) => buildRoute(entry, input));
   const ssrPrefixes = deriveSsrPrefixes(input.routes.routes);
+  const hooks = buildHooks(input);
   const manifest: Manifest = {
     version: MANIFEST_VERSION,
     build_id: input.buildId,
@@ -63,6 +68,7 @@ export function assembleManifest(input: AssembleInput): Manifest {
     static_assets: input.staticAssets ? [...input.staticAssets] : [],
     ...(input.routes.error_routes ? { error_routes: input.routes.error_routes } : {}),
     ...(ssrPrefixes.length > 0 ? { ssr_prefixes: ssrPrefixes } : {}),
+    ...(hooks ? { hooks } : {}),
   };
 
   const result = validate(manifest, input.catalog);
@@ -70,6 +76,26 @@ export function assembleManifest(input: AssembleInput): Manifest {
     throw new ValidationFailed(result.errors);
   }
   return result.manifest;
+}
+
+// Mode 2 hooks (R756-F6) — one entry per declared hook, carrying the bundled
+// module the isolate registers. Undefined (not `{}`) when the workload
+// declares none, so a hook-free manifest is byte-identical to a pre-R756-F6
+// one.
+function buildHooks(input: AssembleInput): ManifestHooks | undefined {
+  const declared = input.routes.hooks;
+  if (!declared) return undefined;
+  const names = Object.keys(declared);
+  if (names.length === 0) return undefined;
+  const out: Record<string, { entrypoint: string }> = {};
+  for (const name of names) {
+    const bundled = input.hookPaths?.get(name);
+    if (!bundled) {
+      throw new BuildError(`hook ${name}: no bundled entrypoint`);
+    }
+    out[name] = { entrypoint: bundled };
+  }
+  return out as ManifestHooks;
 }
 
 // Resolve `placement: "auto" | undefined` to a concrete `"host" | "edge"`.

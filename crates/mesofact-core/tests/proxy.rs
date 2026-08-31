@@ -45,6 +45,7 @@ fn static_manifest(route: &str) -> Manifest {
         static_assets: vec![],
         error_routes: None,
         ssr_prefixes: None,
+        hooks: None,
     }
 }
 
@@ -85,6 +86,7 @@ async fn make_ssr_app(
         static_assets: vec![],
         error_routes: None,
         ssr_prefixes: None,
+        hooks: None,
     };
     let json = serde_json::to_vec(&manifest).unwrap();
     let pool = WorkerPool::spawn(&json, worker_entry(), 1)
@@ -561,6 +563,7 @@ async fn mode2_sqlite_generation_bump_invalidates() {
         static_assets: vec![],
         error_routes: None,
         ssr_prefixes: None,
+        hooks: None,
     };
     let json = serde_json::to_vec(&manifest).unwrap();
     let pool = WorkerPool::spawn_with_config(&json, worker_entry(), 1, Some(config_path.clone()))
@@ -756,6 +759,7 @@ async fn worker_pool_spawns_and_pings() {
         static_assets: vec![],
         error_routes: None,
         ssr_prefixes: None,
+        hooks: None,
     };
 
     let json = serde_json::to_vec(&manifest).unwrap();

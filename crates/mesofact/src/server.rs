@@ -215,6 +215,21 @@ pub struct Server {
     /// resolves against R2. `None` → deferred routes fall to the 404 page.
     #[cfg(feature = "ssr")]
     instance_store: Option<Arc<dyn ObjectStore>>,
+    /// Probe state behind `/livez` + `/readyz`. Held on the server (not built
+    /// per-router) so [`Server::serve_on_listener`] can mark it started after
+    /// the bind and drain it on SIGTERM.
+    health: Arc<crate::Health>,
+    /// Whether an SSR isolate is *expected*. Set by [`Server::with_ssr`], and
+    /// the difference between "the slot is empty because this is a static site"
+    /// and "the slot is empty because the isolate has not booted yet" — only the
+    /// second may hold readiness down. A dev watcher that populates the slot via
+    /// [`Server::ssr_slot`] alone leaves this false, so dev rebuilds never gate
+    /// readiness on a transient respawn.
+    #[cfg(feature = "ssr")]
+    expects_ssr: bool,
+    /// Whether [`Server::router`] mounts the standard probe routes. Cleared by
+    /// [`Server::without_standard_probes`] for a service that mounts its own.
+    standard_probes: bool,
 }
 
 #[derive(Clone)]
@@ -248,6 +263,10 @@ impl Server {
             identity: None,
             #[cfg(feature = "ssr")]
             instance_store: None,
+            health: crate::Health::new(),
+            #[cfg(feature = "ssr")]
+            expects_ssr: false,
+            standard_probes: true,
         })
     }
 
@@ -330,9 +349,14 @@ impl Server {
     /// Attach an SSR child. Requests whose path matches one of its prefixes
     /// are proxied to the bun subprocess; everything else falls through to
     /// the static handler. See [`ssr::spawn`] for the spawn contract.
+    ///
+    /// Also marks the workload as SSR-expecting, which puts the isolate on the
+    /// `/readyz` critical path: an SSR site with no live isolate can only 502,
+    /// so it must not be in a Service's endpoint set.
     #[cfg(feature = "ssr")]
-    pub fn with_ssr(self, ssr: SsrChild) -> Self {
+    pub fn with_ssr(mut self, ssr: SsrChild) -> Self {
         self.ssr.set(Some(Arc::new(ssr)));
+        self.expects_ssr = true;
         self
     }
 
@@ -379,9 +403,69 @@ impl Server {
         self.ssr.clone()
     }
 
+    /// The probe handle behind `/livez` + `/readyz`. Hand to a supervisor that
+    /// wants to drain this server on its own schedule.
+    pub fn health(&self) -> Arc<crate::Health> {
+        self.health.clone()
+    }
+
+    /// Install the readiness checks for this workload's shape.
+    ///
+    /// One *engine* check, because "can this process serve a request" has one
+    /// answer per mode and stacking both would break the other mode:
+    ///
+    /// - **SSR workload** → the isolate. An SSR-only site legitimately has no
+    ///   `dist/html/` (that is why `/__mesofact/health` was introduced in the
+    ///   first place, per R449-F3), so gating it on the tree would leave it
+    ///   permanently unready.
+    /// - **static / SPA** → the served tree. Without it every request 404s,
+    ///   which is precisely a pod that should be out of rotation.
+    ///
+    /// Then, when the app declares `/readyz` as an SSR route, the `app` check
+    /// from [`AppReadyCheck`]. Ordered second so the cheap engine answer is
+    /// already in the listing before anything dispatches into V8.
+    fn install_gates(&self) {
+        let mut checks: Vec<Arc<dyn crate::health::ReadyCheck>> = Vec::new();
+
+        #[cfg(feature = "ssr")]
+        if self.expects_ssr {
+            let ssr = self.ssr.clone();
+            checks.push(Arc::new(crate::health::Gate::new("ssr", move || {
+                ssr.current().is_some()
+            })));
+            checks.push(Arc::new(AppReadyCheck {
+                ssr: self.ssr.clone(),
+            }));
+        }
+        if checks.is_empty() {
+            let pointer = self.pointer.clone();
+            checks.push(Arc::new(crate::health::Gate::new("dist", move || {
+                pointer.current().exists()
+            })));
+        }
+        self.health.set_checks(checks);
+    }
+
+    /// Skip mounting the standard probe routes on [`Server::router`].
+    ///
+    /// The Rust-level override seam: a service that wants its own `/livez` or
+    /// `/readyz` — different wire format, an auth gate, a different set of
+    /// invariants — mounts them itself instead of fighting axum's
+    /// overlapping-route panic. [`Server::health`] still works, so the drain
+    /// half of the shutdown path is unaffected by opting out.
+    ///
+    /// Extending rather than replacing is the cheaper move: install a
+    /// [`ReadyCheck`](crate::health::ReadyCheck) and keep the standard wire
+    /// contract that every chart and dashboard already understands.
+    pub fn without_standard_probes(mut self) -> Self {
+        self.standard_probes = false;
+        self
+    }
+
     /// Build the axum [`Router`]. Exposed for tests + the future embedded
     /// paths (T3 reconciler).
     pub fn router(&self) -> Router {
+        self.install_gates();
         let state = ServerState {
             pointer: self.pointer.clone(),
             #[cfg(feature = "ssr")]
@@ -393,13 +477,6 @@ impl Server {
             instance_store: self.instance_store.clone(),
         };
         let mut router = Router::new()
-            // Unambiguous readiness probe for the yubaba pond/cloud reconciler
-            // (R449-F3). SSR-only workloads have no static `/` to probe; the
-            // generous "any non-5xx is alive" criterion would also accept a
-            // 404, but a dedicated 200 endpoint lets `ready_path` point
-            // somewhere that means "the isolate booted" rather than "the
-            // process is listening". Reserved path; never a route key.
-            .route(crate::HEALTH_PATH, get(crate::default_health))
             // Logical-identity probe for the adopt path (R602-B4). Returns the
             // `(service, component)` this dev server was spawned for so an
             // adopter can confirm a port holds *its* server before adopting it,
@@ -413,11 +490,36 @@ impl Server {
         if state.config_json.is_some() {
             router = router.route("/config.json", get(serve_config_json));
         }
-        router
+        let router = router
             .route("/", any(serve_dynamic))
             .route("/{*path}", any(serve_dynamic))
-            .with_state(state)
-            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        // `/livez` + `/readyz` (+ the `/healthz` and `/__mesofact/health`
+        // aliases). R449-F3 added the original single endpoint because an
+        // SSR-only workload has no static `/` to probe and the generous
+        // "any non-5xx is alive" criterion would also accept a 404 — but it
+        // answered 200 on bind, so it never delivered the "the isolate booted"
+        // meaning its comment claimed. `/readyz` does; see
+        // [`Server::install_gates`].
+        //
+        // Merged after `with_state` because these routes carry their own state;
+        // merging them into the `Router<ServerState>` above would make it
+        // `Router<()>` and orphan every `serve_dynamic` handler. They still win
+        // over `/{*path}` — matchit ranks literal segments above wildcards
+        // irrespective of registration order.
+        //
+        // That win is also why an app-declared `mode:"ssr"` `/readyz` cannot
+        // simply be routed to: the probe route shadows it. The app's handler is
+        // reached through `AppReadyCheck` instead, which is the better contract
+        // anyway — mesofact keeps ownership of the status code and the wire
+        // format, and the app contributes a verdict.
+        let router = if self.standard_probes {
+            router.merge(crate::health::probe_routes(self.health.clone()))
+        } else {
+            router
+        };
+        router.layer(TraceLayer::new_for_http())
     }
 
     /// Bind to `127.0.0.1:port` and serve until Ctrl+C / SIGTERM. The dev
@@ -486,19 +588,30 @@ impl Server {
             "mesofact-dev listening",
         );
 
+        // Serving now — `/readyz` from here on is decided by the gates alone.
+        self.health.mark_started();
+
         let shutdown = {
             let idle = idle.clone();
+            let health = self.health.clone();
             async move {
                 match idle_ttl {
                     Some(ttl) => {
                         tokio::select! {
-                            _ = crate::shutdown_signal() => {}
+                            _ = crate::shutdown_signal_for(health.clone()) => {}
+                            // An idle reap is not a rollout: nothing is holding
+                            // an endpoint for this process (kamaji keeps the
+                            // listen socket and re-forks on the next
+                            // connection), and by definition no request is in
+                            // flight — so there is nothing to drain, and a
+                            // grace window would just bill idle seconds.
                             _ = idle_reaper(idle, ttl) => {
+                                health.begin_drain();
                                 info!(idle_ttl_s = ttl.as_secs_f64(), "idle TTL elapsed — self-reaping (JIT)");
                             }
                         }
                     }
-                    None => crate::shutdown_signal().await,
+                    None => crate::shutdown_signal_for(health).await,
                 }
             }
         };
@@ -507,6 +620,113 @@ impl Server {
             .with_graceful_shutdown(shutdown)
             .await?;
         Ok(())
+    }
+}
+
+/// The TSX half of the `/readyz` extension point (W225 dual-language seam).
+///
+/// Two ways in, both meaning "this app contributes a readiness verdict".
+/// Declare the hook (R756-F6 — the general Mode 2 declaration site):
+///
+/// ```ts
+/// // mesofact.routes.ts
+/// hooks: { readyz: "src/readyz.ts" }
+/// ```
+///
+/// …or claim the route, which is how this shipped and still works:
+///
+/// ```ts
+/// // mesofact.routes.ts
+/// { route: "/readyz", mode: "ssr", entrypoint: "src/readyz.ts", cache_policy: { ttl: 0 } }
+/// ```
+///
+/// The hook declaration is the better one for a new app: the module is not a
+/// route, so it never enters `ssr_prefixes`, the edge Worker never forwards
+/// `/readyz` to the SSR origin, and it is never shadowed by the Rust probe
+/// route mounted on the same path. Declaring both is rejected at build time.
+/// Either way the module's contract is identical:
+///
+/// ```ts
+/// // src/readyz.ts — the ordinary Fetch-handler contract. 2xx means ready;
+/// // anything else takes the pod out of rotation.
+/// import { defineReadyz } from "@mesofact/runtime";
+/// export default defineReadyz([{ name: "db", check: () => db.ping() }]);
+/// ```
+///
+/// `defineReadyz` is optional sugar that emits the same `[+]name ok` listing
+/// this side emits under `?verbose`; a bare
+/// `export default async () => new Response("ok")` works identically. Worked
+/// example: `examples/hello/src/readyz.ts`.
+///
+/// The app never sees the request unless the engine is already healthy, and its
+/// answer can only subtract: a 200 from app code cannot overrule a failed `ssr`
+/// or `dist` check, and cannot un-drain a process. That asymmetry is the point.
+/// Readiness is about *routing traffic away*, and the situations where the
+/// answer matters most are exactly the ones where the app is the unreliable
+/// narrator.
+///
+/// Absent (the app declares neither) the check reports ready, so this costs
+/// nothing for the workloads that don't want it — and costs nothing at
+/// runtime either, since the absence is a registry lookup rather than a
+/// dispatch into V8 that comes back empty.
+///
+/// Internally this is Mode 2 (R756-F3 / W311 §2), not Mode 1: `ready()` calls
+/// [`SsrChild::invoke_hook`] rather than [`SsrChild::dispatch`], so only
+/// `{method, url}` crosses into the isolate and only `{status}` crosses back
+/// — no header vec, no byte body, no `Request`/`Response` envelope.
+/// `defineReadyz`'s public contract (`Request -> Response`) is unchanged; the
+/// hook adapter lives in the JS harness (`ssr_harness.js`'s `HOOK_ADAPTERS`),
+/// not in app code.
+#[cfg(feature = "ssr")]
+struct AppReadyCheck {
+    ssr: SsrSlot,
+}
+
+/// The hook name the engine invokes for the `app` readiness check. Matches
+/// `HOOK_NAMES` in `@mesofact/runtime` and `HOOK_ADAPTERS` in the JS harness.
+#[cfg(feature = "ssr")]
+const READYZ_HOOK: &str = "readyz";
+
+#[cfg(feature = "ssr")]
+impl crate::health::ReadyCheck for AppReadyCheck {
+    fn name(&self) -> &'static str {
+        "app"
+    }
+
+    fn ready(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        let slot = self.ssr.clone();
+        Box::pin(async move {
+            let Some(child) = slot.current() else {
+                // No isolate: the `ssr` check has already reported this. Don't
+                // double-count it as an app failure — report ready and let the
+                // real cause be the one line an operator reads.
+                return true;
+            };
+            if !child.has_hook(READYZ_HOOK) {
+                return true;
+            }
+            // Mode 2 (R756-F3 / W311 §2): plain JSON in, plain JSON out — no
+            // DispatchRequest/DispatchResponse envelope (header vec, byte
+            // body) crosses the isolate boundary just to move one status
+            // code, which under F2's isolate serialization would otherwise
+            // contend the same lock SSR requests queue on.
+            let input = serde_json::json!({
+                "method": "GET",
+                "url": format!("http://localhost{}", crate::READY_PATH),
+            });
+            match child.invoke_hook(READYZ_HOOK, input).await {
+                Ok(verdict) => verdict
+                    .get("status")
+                    .and_then(|s| s.as_u64())
+                    .is_some_and(|status| (200..300).contains(&status)),
+                // A handler that throws (or an unrecognised hook) is not a
+                // handler that says "ready".
+                Err(err) => {
+                    warn!(?err, "app /readyz handler failed — reporting not ready");
+                    false
+                }
+            }
+        })
     }
 }
 
@@ -578,10 +798,6 @@ async fn idle_reaper(idle: Arc<IdleTracker>, ttl: Duration) {
         }
     }
 }
-
-/// Liveness/readiness endpoint. Returns 200 once the server is listening and
-/// (for SSR workloads) the isolate has booted — `with_ssr` is set before the
-/// listener binds, so a successful bind implies the handlers are registered.
 
 /// Logical-identity endpoint (R602-B4). Returns `{"service","component"}` as
 /// JSON when the server was stamped via [`Server::with_identity`]; 404
@@ -869,27 +1085,30 @@ async fn serve_static(dist: &Path, uri_path: &str) -> Option<Response> {
         return Some(serve_error_page(dist, StatusCode::NOT_FOUND).await);
     }
 
-    let mut target = if rel.as_os_str().is_empty() {
+    // Candidate order mirrors the edge worker's `assetCandidates`
+    // (packages/mesofact-edge/src/router.ts) and `serve_error_page` below: the
+    // literal key, then `<key>.html`, then `<key>/index.html`. A key that
+    // already carries an extension is taken verbatim — `/style.css` must not
+    // fall through to a stray `style.css.html`.
+    //
+    // `.html` before the directory index is load-bearing, not cosmetic. Since
+    // R600-B1 made prerender emissions path-shaped, a site with both a
+    // `/issues` list page and `/issues/:id` instances has `issues.html` and an
+    // `issues/` directory side by side; resolving the directory first would
+    // serve a nonexistent `issues/index.html` and 404 the list page.
+    let base = if rel.as_os_str().is_empty() {
         dist.join("index.html")
     } else {
         dist.join(&rel)
     };
-    if target.is_dir() {
-        target = target.join("index.html");
+    let mut candidates = vec![base.clone()];
+    if base.extension().is_none() {
+        candidates.push(base.with_extension("html"));
+        candidates.push(base.join("index.html"));
     }
-
-    if let Ok(bytes) = tokio::fs::read(&target).await {
-        let mime = mime_for(&target);
-        return Some(([(header::CONTENT_TYPE, mime)], bytes).into_response());
-    }
-
-    // Clean-URL fallback: `/releases` → `releases.html`. Mirrors what the CDN
-    // does for prerendered routes; without it, every route emitted as
-    // `<key>.html` 404s in dev unless you hand-type the extension.
-    if target.extension().is_none() {
-        let with_html = target.with_extension("html");
-        if let Ok(bytes) = tokio::fs::read(&with_html).await {
-            let mime = mime_for(&with_html);
+    for target in &candidates {
+        if let Ok(bytes) = tokio::fs::read(target).await {
+            let mime = mime_for(target);
             return Some(([(header::CONTENT_TYPE, mime)], bytes).into_response());
         }
     }
@@ -1089,6 +1308,109 @@ async fn read_error_route(dist: &Path, server_error: bool) -> Option<String> {
     }
 }
 
+/// Routes in a workload's built manifest that declare `requires: ["user"]`
+/// (R556-B13) — the auth gate `mesofact serve` does **not** itself enforce.
+///
+/// That check exists only in `mesofact_core::proxy::router`, which the
+/// `mesofact proxy` subcommand uses. The W272 bundle tier forks `serve`, whose
+/// `Server` has no session resolver at all, so a declared-authed route was
+/// served to anyone who reached the port. Callers use this to fail closed at
+/// startup; the enforcement itself stays an edge concern (passway cheers-verify).
+///
+/// Deliberately a minimal local serde slice on the same reasoning
+/// [`read_error_route`] gives: the static-serving path must not depend on the
+/// optional `mesofact-core` types. Sorted and deduplicated so the error message
+/// a caller renders is stable.
+///
+/// Best-effort on I/O, **strict on content**: an absent manifest yields an
+/// empty list (a workload with no built manifest declares no routes at all),
+/// but a manifest that is present and unparseable yields `Err` — silently
+/// reading "no authed routes" out of a file we failed to understand is the
+/// fail-open this function exists to prevent.
+pub fn routes_requiring_user(workload: &Path) -> std::io::Result<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct ManifestSlice {
+        #[serde(default)]
+        routes: Vec<RouteSlice>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RouteSlice {
+        route: String,
+        #[serde(default)]
+        requires: Option<Vec<String>>,
+    }
+
+    let manifest_path = workload.join("dist").join("manifest.json");
+    let bytes = match std::fs::read(&manifest_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let manifest: ManifestSlice = serde_json::from_slice(&bytes).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("parsing {}: {e}", manifest_path.display()),
+        )
+    })?;
+    let mut gated: Vec<String> = manifest
+        .routes
+        .into_iter()
+        .filter(|r| {
+            r.requires
+                .as_ref()
+                .is_some_and(|req| req.iter().any(|s| s == "user"))
+        })
+        .map(|r| r.route)
+        .collect();
+    gated.sort();
+    gated.dedup();
+    Ok(gated)
+}
+
+/// Every `mode:"ssr"` route declared under `workload` (`<workload>/dist/manifest.json`).
+///
+/// R746-B7 — compiled unconditionally (unlike [`crate::ssr`], which is
+/// `ssr`-feature-gated) so a static-only build can still name the routes it
+/// is about to silently drop, rather than 404ing them one request at a time.
+/// Same fail-open discipline as [`routes_requiring_user`]: an absent manifest
+/// is "no routes declared", but a manifest present and unparseable is an
+/// error, not a shrug.
+pub fn routes_declaring_ssr(workload: &Path) -> std::io::Result<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct ManifestSlice {
+        #[serde(default)]
+        routes: Vec<RouteSlice>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RouteSlice {
+        route: String,
+        #[serde(default)]
+        mode: String,
+    }
+
+    let manifest_path = workload.join("dist").join("manifest.json");
+    let bytes = match std::fs::read(&manifest_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let manifest: ManifestSlice = serde_json::from_slice(&bytes).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("parsing {}: {e}", manifest_path.display()),
+        )
+    })?;
+    let mut ssr_routes: Vec<String> = manifest
+        .routes
+        .into_iter()
+        .filter(|r| r.mode == "ssr")
+        .map(|r| r.route)
+        .collect();
+    ssr_routes.sort();
+    ssr_routes.dedup();
+    Ok(ssr_routes)
+}
+
 /// Reject any URI path that would escape `dist/` or carry a NUL byte. Does
 /// not percent-decode — segments are treated literally, which is safe (an
 /// encoded `..` like `%2e%2e` becomes a literal filename that doesn't exist
@@ -1145,6 +1467,13 @@ fn mime_for(path: &Path) -> &'static str {
         Some("ttf") => "font/ttf",
         Some("xml") => "application/xml; charset=utf-8",
         Some("txt") | Some("md") => "text/plain; charset=utf-8",
+        // Not decorative: instantiateStreaming rejects anything but exactly
+        // application/wasm, and wasm-bindgen then silently degrades to
+        // buffer-then-compile. This table — not the manifest's
+        // `static_assets[].content_type` — is what the dev/static server
+        // actually answers with, so the build-side arm alone wouldn't fix it
+        // (R821-B1).
+        Some("wasm") => "application/wasm",
         _ => "application/octet-stream",
     }
 }
@@ -1163,12 +1492,83 @@ mod tests {
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
+    // ── R556-B13: declared-auth routes this binary cannot enforce ────────────
+
+    /// Write `<dir>/dist/manifest.json` verbatim and return the workload dir.
+    fn workload_with_manifest(json: &str) -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        let dist = dir.path().join("dist");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(dist.join("manifest.json"), json).unwrap();
+        dir
+    }
+
+    #[test]
+    fn routes_requiring_user_finds_the_declared_gate() {
+        let dir = workload_with_manifest(
+            r#"{"routes":[
+                {"route":"/","mode":"ssr","requires":["user"]},
+                {"route":"/health","mode":"static"},
+                {"route":"/admin","mode":"ssr","requires":["user"]}
+            ]}"#,
+        );
+        assert_eq!(
+            routes_requiring_user(dir.path()).unwrap(),
+            vec!["/".to_string(), "/admin".to_string()],
+            "sorted, so the refusal message a caller renders is stable",
+        );
+    }
+
+    #[test]
+    fn routes_requiring_user_ignores_routes_without_the_gate() {
+        let dir = workload_with_manifest(
+            r#"{"routes":[
+                {"route":"/","mode":"static"},
+                {"route":"/feed","mode":"ssr","requires":[]}
+            ]}"#,
+        );
+        assert!(routes_requiring_user(dir.path()).unwrap().is_empty());
+    }
+
+    /// A workload with nothing built yet declares no routes — that is an absent
+    /// manifest, not a suspicious one, so it must not block a start.
+    #[test]
+    fn routes_requiring_user_treats_an_absent_manifest_as_no_routes() {
+        let dir = tempdir().unwrap();
+        assert!(routes_requiring_user(dir.path()).unwrap().is_empty());
+    }
+
+    /// …but a manifest that IS there and does not parse must be an error.
+    /// Folding it to "no authed routes" would reopen the exact fail-open this
+    /// function exists to close, on the one input where we know least.
+    #[test]
+    fn routes_requiring_user_refuses_an_unparseable_manifest() {
+        let dir = workload_with_manifest("{ this is not json");
+        let err = routes_requiring_user(dir.path()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// Unknown `requires` values are not the gate. `requires: ["admin"]` is a
+    /// scope this binary has never understood; treating any non-empty list as
+    /// "authed" would refuse to start on a declaration that means something
+    /// else entirely.
+    #[test]
+    fn routes_requiring_user_matches_the_user_scope_specifically() {
+        let dir = workload_with_manifest(
+            r#"{"routes":[{"route":"/x","mode":"ssr","requires":["admin"]}]}"#,
+        );
+        assert!(routes_requiring_user(dir.path()).unwrap().is_empty());
+    }
+
     fn workload_with(files: &[(&str, &str)]) -> tempfile::TempDir {
         let dir = tempdir().unwrap();
         let dist = dir.path().join("dist").join("html");
         std::fs::create_dir_all(&dist).unwrap();
         for (name, body) in files {
-            std::fs::write(dist.join(name), body).unwrap();
+            let path = dist.join(name);
+            // Emissions are path-shaped, so a name may be nested (`p/3.html`).
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
         }
         dir
     }
@@ -1202,6 +1602,219 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_string(response).await, "ok");
+    }
+
+    async fn probe_status(app: Router, path: &str) -> StatusCode {
+        app.oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn readyz_tracks_the_served_tree_for_a_static_workload() {
+        // The state the old single endpoint reported as ready: bound, serving,
+        // and unable to answer anything but 404 because dist/html/ isn't there
+        // yet. `serve_on` only warns about it, so nothing else catches this.
+        let workload = tempdir().unwrap();
+        let server = Server::from_workload(workload.path()).unwrap();
+        server.health().mark_started();
+
+        assert_eq!(
+            probe_status(server.router(), crate::READY_PATH).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+        assert_eq!(
+            probe_status(server.router(), crate::LIVE_PATH).await,
+            StatusCode::OK,
+            "no restart can produce a dist tree, so liveness must not gate on it",
+        );
+
+        std::fs::create_dir_all(workload.path().join("dist").join("html")).unwrap();
+        assert_eq!(
+            probe_status(server.router(), crate::READY_PATH).await,
+            StatusCode::OK,
+        );
+    }
+
+    /// An SSR workload gates on the isolate instead — it legitimately has no
+    /// static tree, which is the case R449-F3 introduced the health path for.
+    #[cfg(feature = "ssr")]
+    #[tokio::test]
+    async fn readyz_tracks_the_isolate_for_an_ssr_workload() {
+        let workload = tempdir().unwrap();
+        let ssr = ssr::detached_for_test_with_policies(
+            vec!["/api/x".to_string()],
+            vec![],
+            mock_dispatch_resp(200, "ok"),
+        );
+        let server = Server::from_workload(workload.path())
+            .unwrap()
+            .with_ssr(ssr);
+        server.health().mark_started();
+
+        // No dist/html/ anywhere, and still ready: the isolate is what serves.
+        assert_eq!(
+            probe_status(server.router(), crate::READY_PATH).await,
+            StatusCode::OK,
+        );
+
+        // Isolate gone (crashed, or awaiting respawn) → out of rotation.
+        server.ssr_slot().set(None);
+        assert_eq!(
+            probe_status(server.router(), crate::READY_PATH).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+        assert_eq!(
+            probe_status(server.router(), crate::LIVE_PATH).await,
+            StatusCode::OK,
+        );
+    }
+
+    // ── The TSX seam: an app-declared `mode:"ssr"` /readyz ───────────────────
+
+    #[cfg(feature = "ssr")]
+    fn server_with_app_readyz(workload: &tempfile::TempDir, status: u16) -> Server {
+        let ssr = ssr::detached_for_test_with_policies(
+            vec![crate::READY_PATH.to_string()],
+            vec![],
+            mock_dispatch_resp(status, "app"),
+        );
+        let server = Server::from_workload(workload.path()).unwrap().with_ssr(ssr);
+        server.health().mark_started();
+        server
+    }
+
+    #[cfg(feature = "ssr")]
+    #[tokio::test]
+    async fn an_app_declared_readyz_contributes_its_verdict() {
+        let workload = tempdir().unwrap();
+        let server = server_with_app_readyz(&workload, 503);
+        let response = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{}?verbose", crate::READY_PATH))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_string(response).await;
+        assert!(body.contains("[+]ssr ok"), "{body}");
+        assert!(body.contains("[-]app failed"), "{body}");
+    }
+
+    #[cfg(feature = "ssr")]
+    #[tokio::test]
+    async fn an_app_readyz_returning_200_is_ready() {
+        let workload = tempdir().unwrap();
+        let server = server_with_app_readyz(&workload, 200);
+        assert_eq!(
+            probe_status(server.router(), crate::READY_PATH).await,
+            StatusCode::OK,
+        );
+    }
+
+    /// The asymmetry that makes the seam safe: an app verdict is additive.
+    #[cfg(feature = "ssr")]
+    #[tokio::test]
+    async fn an_app_readyz_cannot_overrule_the_engine() {
+        let workload = tempdir().unwrap();
+        let server = server_with_app_readyz(&workload, 200);
+        server.health().begin_drain();
+        assert_eq!(
+            probe_status(server.router(), crate::READY_PATH).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a 200 from app code must not un-drain a terminating process",
+        );
+
+        // Same for a dead isolate — and it reports as `ssr`, not `app`, so the
+        // operator reads one cause rather than two.
+        let workload = tempdir().unwrap();
+        let server = server_with_app_readyz(&workload, 200);
+        server.ssr_slot().set(None);
+        let response = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{}?verbose", crate::READY_PATH))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_string(response).await;
+        assert!(body.contains("[-]ssr failed"), "{body}");
+        assert!(body.contains("[+]app ok"), "no double-reporting: {body}");
+    }
+
+    #[cfg(feature = "ssr")]
+    #[tokio::test]
+    async fn an_ssr_workload_without_an_app_readyz_still_passes() {
+        // Opt-in: declaring no such route costs nothing.
+        let workload = tempdir().unwrap();
+        let ssr = ssr::detached_for_test_with_policies(
+            vec!["/api/x".to_string()],
+            vec![],
+            mock_dispatch_resp(200, "x"),
+        );
+        let server = Server::from_workload(workload.path()).unwrap().with_ssr(ssr);
+        server.health().mark_started();
+        assert_eq!(
+            probe_status(server.router(), crate::READY_PATH).await,
+            StatusCode::OK,
+        );
+    }
+
+    /// The Rust-level override seam: opt out and mount your own.
+    #[tokio::test]
+    async fn without_standard_probes_leaves_the_paths_free() {
+        let workload = workload_with(&[("index.html", "<h1>hello</h1>")]);
+        let app = Server::from_workload(workload.path())
+            .unwrap()
+            .without_standard_probes()
+            .router()
+            // Nothing panics on overlap, because nothing was mounted.
+            .route(crate::READY_PATH, get(|| async { "mine" }));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(crate::READY_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_string(response).await, "mine");
+    }
+
+    #[tokio::test]
+    async fn probe_paths_win_over_the_catch_all_route() {
+        // They are merged after `with_state`, i.e. after `/{*path}` is already
+        // registered. Pinning this because the ordering reads backwards.
+        let workload = workload_with(&[("index.html", "<h1>hello</h1>")]);
+        let server = Server::from_workload(workload.path()).unwrap();
+        server.health().mark_started();
+        let response = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{}?verbose", crate::READY_PATH))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_string(response).await;
+        assert!(body.starts_with("[+]started ok"), "served the SPA shell: {body}");
     }
 
     #[tokio::test]
@@ -1282,6 +1895,41 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(body_string(response).await.contains("releases"));
+    }
+
+    /// R600-B1, third serving layer. A parametric static instance emits at
+    /// `dist/html/<path>.html`, so the same clean-URL rule that resolves
+    /// `/releases` resolves `/issues/<id>` — no route-schema knowledge needed
+    /// here, which is exactly why the fix moved the write instead of teaching
+    /// three resolvers the route-key rule. Closes the gap R443-B4 parked as
+    /// "GET /issues/42 still 404 in dev" (see this module's handoff notes).
+    #[tokio::test]
+    async fn serves_parametric_instance_at_its_public_path() {
+        let workload = workload_with(&[
+            ("issues.html", "<h1>issue list</h1>"),
+            ("issues/01KZVGVT0DV61ZGGNVHAWQW2CS.html", "<h1>issue detail</h1>"),
+        ]);
+        let app = Server::from_workload(workload.path()).unwrap().router();
+        let detail = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/issues/01KZVGVT0DV61ZGGNVHAWQW2CS")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+        assert!(body_string(detail).await.contains("issue detail"));
+
+        // The list route at the parent path is not shadowed by the dir.
+        let list = app
+            .oneshot(Request::builder().uri("/issues").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        assert!(body_string(list).await.contains("issue list"));
     }
 
     #[tokio::test]
@@ -1486,6 +2134,47 @@ mod tests {
             Some("application/json; charset=utf-8"),
         );
         assert!(body_string(response).await.contains("bundle/yah-marketing"));
+    }
+
+    /// A `.wasm` asset must come back as `application/wasm` and nothing else.
+    /// `WebAssembly.instantiateStreaming` rejects every other Content-Type, and
+    /// wasm-bindgen's loader swallows that rejection — it warns and falls back
+    /// to `arrayBuffer()` + `instantiate()`, so a multi-megabyte module gets
+    /// fully downloaded before compilation starts instead of compiling as it
+    /// streams. The failure is a silent perf cliff, not an error, which is why
+    /// it needs a test (R821-B1).
+    ///
+    /// This asserts the *served* header specifically: this server answers from
+    /// [`mime_for`] over the on-disk tree and never reads the manifest's
+    /// `static_assets[].content_type`, so the build-side table being right
+    /// proves nothing about what a browser receives.
+    #[tokio::test]
+    async fn serves_wasm_with_the_mime_instantiate_streaming_accepts() {
+        let bundle = bundle_with("self", &[("index.html", "<h1>home</h1>")]);
+        let wasm_dir = bundle.path().join("app/dist/html/wasm");
+        std::fs::create_dir_all(&wasm_dir).unwrap();
+        std::fs::write(wasm_dir.join("demo_bg.wasm"), b"\0asm\x01\0\0\0").unwrap();
+
+        let response = Server::from_bundle(bundle.path())
+            .unwrap()
+            .router()
+            .oneshot(
+                Request::builder()
+                    .uri("/wasm/demo_bg.wasm")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/wasm"),
+        );
     }
 
     /// The other half of the same contract: a bundle with no beacon must 404,

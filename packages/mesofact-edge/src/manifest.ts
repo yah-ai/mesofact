@@ -24,17 +24,47 @@ export type EdgeRoute = {
 
 /** The manifest slice the edge consumes. */
 export type EdgeManifest = {
+  /**
+   * The publisher's commit point. `publish_dist` uploads an immutable
+   * `<build_id>/` tree and then flips this field in the root `manifest.json`
+   * LAST, so it is the site-level root pointer in everything but name — see
+   * `mesofact-publisher/src/pointer.rs`, which says so directly ("The
+   * site-level root pointer is conceptually `key = ""` of this store").
+   */
+  build_id?: string;
   routes?: EdgeRoute[];
   error_routes?: EdgeErrorRoutes;
   ssr_prefixes?: string[];
 };
 
 /**
+ * The prefix a build's *page* assets live under, or `null` for a manifest that
+ * names no build.
+ *
+ * `publish_dist` uploads `dist/` verbatim beneath `<build_id>/`, so the pages
+ * that `dist/html/` holds land at `<build_id>/html/<key>`. Publishers that
+ * predate the build tree flatten instead — they strip the `html/` segment and
+ * write `<key>` at the prefix root — which is why the edge has to try both.
+ */
+export function buildPageRoot(manifest: EdgeManifest | null): string | null {
+  const id = manifest?.build_id;
+  return typeof id === "string" && id.length > 0 ? `${id}/html` : null;
+}
+
+/**
  * Fetch the published manifest from the asset origin. Returns `null` when it is
  * absent or unreadable — a site with no `manifest.json` (or a transient origin
  * hiccup) simply falls back to binding-only behavior (no deferred routes, no
- * branded error pages). Fetched only on the slow (static-miss) path, so
- * static-heavy sites never pay for it.
+ * branded error pages, no build tree).
+ *
+ * Read on PAGE requests and on any static miss. It used to be static-miss only,
+ * on the reasoning that static-heavy sites should never pay for it; resolving
+ * the build pointer needs it up front (R330-B44). Requests for assets that
+ * carry a non-HTML extension — the hashed bundles and images that are most of a
+ * static site's request volume — still skip it entirely, so the fast path is
+ * preserved where it actually carries traffic. The manifest is published
+ * `no-cache` and is deliberately NOT given a `cacheTtl` override here: it is the
+ * pointer, and a cached pointer is a stale site.
  */
 export async function loadManifest(
   assetOrigin: string,

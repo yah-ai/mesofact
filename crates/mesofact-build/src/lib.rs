@@ -3,7 +3,7 @@
 //! @yah:status(review)
 //! @yah:assignee(agent:claude)
 //! @yah:next("Parallel implementation of packages/mesofact-build per W174: server/client bundling on Rolldown 1.1 (crates.io), SSG + routes evaluation + SSR probing on deno_core, LightningCSS step slot, public/ asset discovery (R490-F4 parity), tag-index, manifest assembly against crates/mesofact types, lockfile-driven npm install (pacquet replacement — see W174 amendment in the parent camp). The --legacy-bun passthrough + dist-diff equivalence harness were removed at R450-T4 once the Rust-native pipeline became the sole build path.")
-//! @yah:next("Known scope cuts, documented in the W174 amendment: source-derived prerender (r2 list) unsupported natively (use prerender.from_data); server bundles resolve browser-conditions (deno_core executor) vs Bun's node-flavored target; install step is bun.lock-driven only (no semver resolution).")
+//! @yah:next("Known scope cuts, documented in the W174 amendment: source-derived prerender (r2 list) unsupported natively (use prerender.from_data); server bundles resolve browser-conditions (deno_core executor) vs Bun's node-flavored target; install step is lockfile-driven only, no semver resolution (bun.lock, package-lock.json v2/v3 as of R771-F3, and pnpm-lock.yaml v9 as of R771-F4 — the pnpm layout is DERIVED, since that format says nothing about where anything goes).")
 //! @yah:verify("cargo test -p mesofact-build")
 //! @yah:verify("cargo run -p mesofact-build -- build <app dir>")
 //! @arch:see(../../.yah/docs/working/W174-mesofact-rust-native-pipeline.md)
@@ -17,12 +17,16 @@ pub mod check;
 pub mod config;
 pub mod css;
 pub mod install;
+pub mod lock;
 pub mod manifest_build;
+pub mod materialize;
 pub mod pipeline;
+pub mod pnpm;
 pub mod prerender;
 pub mod sitemap;
 pub mod source_infer;
 pub mod ssr_prefix;
+pub mod store;
 pub mod tag_index;
 
 // The render path was extracted to the bundler-free `mesofact-render` crate

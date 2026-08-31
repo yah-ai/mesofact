@@ -360,6 +360,12 @@ fn content_type_for(path: &Path) -> String {
         "woff" => "font/woff",
         "woff2" => "font/woff2",
         "txt" => "text/plain; charset=utf-8",
+        // The published Content-Type is what the CDN stores and replays, and
+        // instantiateStreaming rejects anything but exactly application/wasm.
+        // This walk hashes dist/ directly and never consults the manifest's
+        // `static_assets[].content_type`, so the build-side arm alone would
+        // still ship octet-stream to R2 (R821-B1).
+        "wasm" => "application/wasm",
         _ => "application/octet-stream",
     }
     .into()
@@ -396,4 +402,30 @@ async fn walk_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     }
     out.sort();
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::content_type_for;
+    use std::path::Path;
+
+    /// The Content-Type we PUT is the one the CDN stores and replays forever,
+    /// and `WebAssembly.instantiateStreaming` accepts exactly `application/wasm`
+    /// — on anything else wasm-bindgen's loader warns and falls back to
+    /// `arrayBuffer()` + `instantiate()`, downloading the whole module before
+    /// compilation starts. This walk hashes `dist/` directly and never consults
+    /// the manifest's `static_assets[].content_type`, so this table is the only
+    /// thing standing between a `.wasm` and `application/octet-stream` in
+    /// production (R821-B1).
+    #[test]
+    fn wasm_publishes_as_application_wasm() {
+        assert_eq!(
+            content_type_for(Path::new("dist/html/wasm/demo_bg.wasm")),
+            "application/wasm"
+        );
+        assert_eq!(
+            content_type_for(Path::new("dist/html/blob.bin")),
+            "application/octet-stream"
+        );
+    }
 }

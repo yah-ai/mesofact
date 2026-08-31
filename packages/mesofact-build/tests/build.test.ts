@@ -66,12 +66,13 @@ describe("build (static-only fixture)", () => {
     expect(pid.source_reads).toEqual(["assets"]); // from @mesofact-sources directive
     expect(pid.prerender).toEqual({ params: [{ id: "1" }, { id: "2" }] });
 
-    // HTML output: index.html for `/`, p_id__1.html and p_id__2.html for `/p/:id`.
+    // HTML output is keyed by PUBLIC PATH: index.html for `/`, p/1.html and
+    // p/2.html for `/p/:id` (R600-B1).
     expect(existsSync(join(outDir, "html/index.html"))).toBe(true);
-    expect(existsSync(join(outDir, "html/p_id__1.html"))).toBe(true);
-    expect(existsSync(join(outDir, "html/p_id__2.html"))).toBe(true);
-    expect(readFileSync(join(outDir, "html/p_id__1.html"), "utf8")).toContain("<h1>1</h1>");
-    expect(readFileSync(join(outDir, "html/p_id__2.html"), "utf8")).toContain("<h1>2</h1>");
+    expect(existsSync(join(outDir, "html/p/1.html"))).toBe(true);
+    expect(existsSync(join(outDir, "html/p/2.html"))).toBe(true);
+    expect(readFileSync(join(outDir, "html/p/1.html"), "utf8")).toContain("<h1>1</h1>");
+    expect(readFileSync(join(outDir, "html/p/2.html"), "utf8")).toContain("<h1>2</h1>");
 
     // tag-index: reverse map tag → urls
     expect(existsSync(result.tagIndexPath)).toBe(true);
@@ -149,7 +150,7 @@ describe("build (source-derived prerender.query)", () => {
       buildId: "test-fixture-build",
     });
 
-    for (const key of ["index.html", "p_id__1.html", "p_id__2.html"]) {
+    for (const key of ["index.html", "p/1.html", "p/2.html"]) {
       const dyn = readFileSync(join(dynamicOut, "html", key), "utf8");
       const lit = readFileSync(join(literalOut, "html", key), "utf8");
       expect(dyn).toBe(lit);
@@ -292,13 +293,16 @@ describe("build (prerender.from_data fixture)", () => {
 
     const result = await build({ projectRoot, outDir, buildId });
 
-    // Two HTML files — one per item in data/items.json.
-    expect(existsSync(join(outDir, "html/items_id__a.html"))).toBe(true);
-    expect(existsSync(join(outDir, "html/items_id__b.html"))).toBe(true);
+    // Two HTML files — one per item in data/items.json — each at the PUBLIC
+    // PATH of its instance. R600-B1: these used to land at the flattened
+    // `items_id__a.html`, a key no request for /items/a can ever produce, so
+    // every instance page 404'd in prod while render and publish were correct.
+    expect(existsSync(join(outDir, "html/items/a.html"))).toBe(true);
+    expect(existsSync(join(outDir, "html/items/b.html"))).toBe(true);
 
     // Each render sees its own params.id AND the shared req.data payload.
-    const a = readFileSync(join(outDir, "html/items_id__a.html"), "utf8");
-    const b = readFileSync(join(outDir, "html/items_id__b.html"), "utf8");
+    const a = readFileSync(join(outDir, "html/items/a.html"), "utf8");
+    const b = readFileSync(join(outDir, "html/items/b.html"), "utf8");
     expect(a).toContain("<h1>a</h1>");
     expect(a).toContain("<p>Alpha</p>");
     expect(b).toContain("<h1>b</h1>");
@@ -308,6 +312,16 @@ describe("build (prerender.from_data fixture)", () => {
     const tagIndex = JSON.parse(readFileSync(result.tagIndexPath, "utf8"));
     expect(tagIndex.tags["item:a"]).toEqual(["/items/a"]);
     expect(tagIndex.tags["item:b"]).toEqual(["/items/b"]);
+
+    // The contract, stated once: every emission's path IS its URL. The edge
+    // worker and `mesofact serve` both resolve a request by deriving
+    // `<path>.html` from `url.pathname` (assetCandidates,
+    // packages/mesofact-edge/src/router.ts), so anything else is unreachable.
+    const urls = Object.values(tagIndex.tags as Record<string, string[]>).flat();
+    expect(urls.length).toBeGreaterThan(0);
+    for (const url of urls) {
+      expect(result.htmlPaths).toContain(`dist/html${url}.html`);
+    }
   });
 
   test("rejects from_data referencing a path not in data_inputs (defineRoutes-time)", async () => {
@@ -435,6 +449,51 @@ describe("build (ssr fixture)", () => {
     expect((caught as Error).message).toContain("/api/broken");
 
     // Build failed before the manifest hit disk.
+    expect(existsSync(join(outDir, "manifest.json"))).toBe(false);
+  });
+});
+
+describe("build (Mode 2 hooks — R756-F6 / W311 §2)", () => {
+  test("bundles a declared hook to dist/server/hooks/ and carries it in the manifest", async () => {
+    const projectRoot = join(FIXTURES, "hooks");
+    // The hook module imports `@mesofact/runtime` (defineReadyz), which the
+    // post-bundle shape assertion dynamic-imports — so the out dir has to be
+    // resolvable from this package, same as the Universal-cell tests.
+    const outDir = makeProjectOut();
+
+    const result = await build({ projectRoot, outDir, buildId: "hooks-build" });
+    const manifest = JSON.parse(readFileSync(result.manifestPath, "utf8"));
+
+    expect(manifest.hooks).toEqual({ readyz: { entrypoint: "dist/server/hooks/readyz.js" } });
+    expect(existsSync(join(outDir, "server/hooks/readyz.js"))).toBe(true);
+
+    // A hook is not a route: it stays out of the route table and out of
+    // ssr_prefixes, so the edge never forwards /readyz to the SSR origin on
+    // its account and the Rust probe route never shadows it.
+    expect(manifest.routes.map((r: { route: string }) => r.route)).toEqual(["/"]);
+    expect(manifest.ssr_prefixes).toBeUndefined();
+    expect(existsSync(join(outDir, "html/readyz.html"))).toBe(false);
+  });
+
+  test("a workload declaring no hooks emits no hooks block", async () => {
+    const result = await build({
+      projectRoot: join(FIXTURES, "static-only"),
+      outDir: makeOut(),
+      buildId: "no-hooks",
+    });
+    expect(JSON.parse(readFileSync(result.manifestPath, "utf8")).hooks).toBeUndefined();
+  });
+
+  test("rejects a hook entrypoint with no default export", async () => {
+    const outDir = makeOut();
+    let caught: unknown;
+    try {
+      await build({ projectRoot: join(FIXTURES, "hooks-broken"), outDir, buildId: "fail" });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toMatch(/hook readyz: entrypoint must `export default`/);
     expect(existsSync(join(outDir, "manifest.json"))).toBe(false);
   });
 });
@@ -715,6 +774,14 @@ describe("build (static-assets overlay — R490-F4)", () => {
     expect(contentTypeFor("nested/install.SH")).toBe("text/plain; charset=utf-8");
     // Genuinely opaque extensions still fall back.
     expect(contentTypeFor("blob.bin")).toBe("application/octet-stream");
+  });
+
+  test("serves .wasm as application/wasm so instantiateStreaming works (R821-B1)", () => {
+    // Anything but exactly application/wasm makes
+    // WebAssembly.instantiateStreaming reject, and wasm-bindgen's loader
+    // silently degrades to buffer-the-whole-module-then-compile.
+    expect(contentTypeFor("wasm/noise_table_browser_lib_bg.wasm")).toBe("application/wasm");
+    expect(contentTypeFor("UPPER.WASM")).toBe("application/wasm");
   });
 
   test("a workload without public/ emits an empty static_assets", async () => {

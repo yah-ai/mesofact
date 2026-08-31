@@ -30,6 +30,8 @@
 // phase 3 infers `source_reads`, phase 4 validates, phase 6 emits the manifest.
 // See `.yah/docs/architecture/mesofact.md` §"Build pipeline".
 
+import { HOOK_NAMES, HOOK_ROUTE_CLAIMS, type HooksConfig, isHookName } from "./hooks.js";
+
 export type RouteMode = "static" | "ssr" | "spa";
 
 // Where per-request SSR rendering runs. Only meaningful for `mode:"ssr"`;
@@ -152,6 +154,12 @@ export type ErrorRoutes = {
 export type RoutesConfig = {
   routes: readonly RouteEntry[];
   error_routes?: ErrorRoutes;
+  // Mode 2 endpoint callbacks (W311 §2 / R756-F6). Hook name → entrypoint
+  // path. A hook is engine-addressed, not path-addressed: Rust decides when
+  // to call it and owns the HTTP around it, so it is declared here beside
+  // `routes` rather than inside one. See `hooks.ts` for the vocabulary and
+  // why this shape rather than a per-route `middleware` field.
+  hooks?: HooksConfig;
   // Origin for the manifest-derived sitemap (e.g. "https://yah.dev"), no
   // trailing path. When set, the build emits `dist/sitemap.xml` listing every
   // enumerable static route instance; instance-addressed (deferred) routes and
@@ -199,7 +207,40 @@ export function defineRoutes(config: RoutesConfig): RoutesConfig {
     }
     if (r.resilience !== undefined) validateResilience(r);
   }
+  if (config.hooks !== undefined) validateHooks(config);
   return config;
+}
+
+// Mode 2 hook declaration (R756-F6). Same fail-fast home as placement and
+// resilience: throw at config import, before any bundling work.
+function validateHooks(config: RoutesConfig): void {
+  const hooks = config.hooks!;
+  for (const [name, entrypoint] of Object.entries(hooks)) {
+    if (!isHookName(name)) {
+      throw new Error(
+        `defineRoutes: unknown hook ${JSON.stringify(name)} — known hooks are ${HOOK_NAMES.map(
+          (h) => JSON.stringify(h),
+        ).join(", ")}. A hook name is engine-defined: only mesofact invokes hooks, so a name it ` +
+          `does not know would never be called.`,
+      );
+    }
+    if (typeof entrypoint !== "string" || entrypoint.trim() === "") {
+      throw new Error(
+        `defineRoutes: hooks.${name}=${JSON.stringify(entrypoint)} must be a non-empty entrypoint ` +
+          `path relative to the project root (e.g. "src/${name}.ts")`,
+      );
+    }
+    const claimed = HOOK_ROUTE_CLAIMS[name];
+    if (claimed !== undefined && config.routes.some((r) => r.route === claimed)) {
+      throw new Error(
+        `defineRoutes: hook ${JSON.stringify(name)} is declared twice — as hooks.${name} and by ` +
+          `claiming the route ${JSON.stringify(claimed)}. Both mean "this app contributes a ` +
+          `${name} verdict"; pick one. The hooks declaration is usually the one you want — the ` +
+          `module stays out of ssr_prefixes, so the edge never forwards ${claimed} to the SSR ` +
+          `origin and the Rust probe route never shadows it.`,
+      );
+    }
+  }
 }
 
 const RETRY_ON = new Set<RetryOn>(["connection", "5xx", "any"]);

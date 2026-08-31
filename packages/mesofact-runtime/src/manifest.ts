@@ -6,6 +6,7 @@
 // Versioned independently of the mesofact binary; major bumps force restart.
 // See `.yah/docs/architecture/mesofact.md` §"Manifest schema".
 
+import type { HookName } from "./hooks.js";
 import type { Placement, ResiliencePolicy, RouteMode, Requires } from "./routes.js";
 
 // Placement as carried in the manifest — the build resolves `"auto"` to
@@ -74,12 +75,27 @@ export type ManifestErrorRoutes = {
   "5xx"?: string;
 };
 
+// One declared Mode 2 hook (W311 §2 / R756-F6). An object rather than a bare
+// path string because the per-hook options W311 left open — chiefly "may this
+// hook be async" (Open Decision 3) — land here without a schema break.
+export type ManifestHook = {
+  // Bundled module, `dist/server/hooks/<name>.js`. Same shape and resolution
+  // rule as a route's `render_entrypoint`.
+  entrypoint: string;
+};
+
+export type ManifestHooks = { readonly [K in HookName]?: ManifestHook };
+
 export type Manifest = {
   version: ManifestVersion;
   build_id: string;
   routes: readonly ManifestRoute[];
   static_assets: readonly ManifestStaticAsset[];
   error_routes?: ManifestErrorRoutes;
+  // Declared Mode 2 hooks, name → bundled module. Absent when the workload
+  // declares none. Host-only: the edge Worker never invokes a hook, because
+  // Mode 2's whole premise is that the Rust host owns the HTTP around it.
+  hooks?: ManifestHooks;
   // Derived from every `mode:"ssr"` route per W173 § "SSR_PREFIXES derivation
   // rule". Used by mesofact-dev (proxy) and the CF Worker to forward matching
   // paths to the SSR runtime. Segment-aware match: `path === p || path.startsWith(p + "/")`.

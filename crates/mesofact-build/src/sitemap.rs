@@ -1,9 +1,11 @@
 //! Manifest-derived sitemap emitter (W270 §4). The SSG driver collects the
-//! URL of every enumerable static-route emission that is not `noindex`;
-//! instance-addressed (deferred) routes prerender nothing and so contribute
-//! no URLs at all — unlisted-by-capability means no sitemap participation.
-//! This module joins those paths onto the configured `site_url` origin and
-//! renders a sitemaps.org 0.9 `urlset`.
+//! URL of every prerendered emission that is neither `noindex` nor an
+//! `error_routes` page; instance-addressed (deferred) routes prerender
+//! nothing and so contribute no URLs at all — unlisted-by-capability means no
+//! sitemap participation. The test is enumerability, not mode: a prerendered
+//! spa shell sits at a fixed URL and is listed like any static route
+//! (R821-B2). This module joins those paths onto the configured `site_url`
+//! origin and renders a sitemaps.org 0.9 `urlset`.
 
 /// Build a `sitemap.xml` body. `site_url` is the origin (scheme + host, e.g.
 /// `https://yah.dev`); each entry in `paths` is a root-relative route path

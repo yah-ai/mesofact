@@ -21,4 +21,6 @@ mod ssg;
 mod ssr;
 
 pub use ssg::SsgRuntime;
-pub use ssr::{DispatchRequest, DispatchResponse, SsrRuntime};
+pub use ssr::{
+    DispatchRequest, DispatchResponse, R2SourceCoords, SsrPool, SsrRuntime, DEFAULT_POOL_SIZE,
+};

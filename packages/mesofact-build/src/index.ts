@@ -69,11 +69,14 @@ import { dirname, join, resolve } from "node:path";
 import type { ManifestHydration, RouteEntry, SourceCatalog } from "@mesofact/runtime";
 import { r2 } from "@mesofact/runtime";
 import {
+  assertHookEntrypoint,
   assertSsrEntrypoint,
   bundleClientEntrypoints,
   bundleEntrypoints,
+  bundleHooks,
   type BundleInput,
   type ClientBundleInput,
+  type HookBundleInput,
 } from "./bundle.js";
 import {
   assertNoForbiddenImports,
@@ -90,8 +93,15 @@ import { buildTagIndex } from "./tag-index.js";
 
 export { BuildError } from "./load-routes.js";
 export { ValidationFailed } from "./manifest-build.js";
-export type { BundleInput, BundleOutput, ClientBundleInput, ClientBundleOutput } from "./bundle.js";
-export { bundleClientEntrypoints } from "./bundle.js";
+export type {
+  BundleInput,
+  BundleOutput,
+  ClientBundleInput,
+  ClientBundleOutput,
+  HookBundleInput,
+  HookBundleOutput,
+} from "./bundle.js";
+export { bundleClientEntrypoints, bundleHooks } from "./bundle.js";
 export type { PrerenderEmission, PrerenderInput } from "./prerender.js";
 export type { TagIndex } from "./tag-index.js";
 export { buildTagIndex } from "./tag-index.js";
@@ -196,15 +206,28 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
     clientBundles.map((c) => [c.route, { script: c.script, code_split: c.code_split }]),
   );
 
+  // Mode 2 hook tree (phase 1c, R756-F6) — declared hooks are engine-addressed
+  // rather than path-addressed, so they bundle beside the route tree but under
+  // `dist/server/hooks/` and never enter the route table or `ssr_prefixes`.
+  const hookInputs: HookBundleInput[] = Object.entries(routesConfig.hooks ?? {}).map(
+    ([name, entrypoint]) => ({ name, entrypoint }),
+  );
+  const hookBundles = await bundleHooks(projectRoot, outDir, hookInputs);
+  const hookPaths = new Map(hookBundles.map((h) => [h.name, h.serverPath]));
+
   // SSR routes are never prerendered, so prove the Fetch handler shape here
   // (before the manifest hits disk) instead of waiting for the dev proxy / Worker
   // to discover the missing default at first request. See W173 § "v1 schema
-  // delta / Entrypoint signatures".
+  // delta / Entrypoint signatures". Hooks are never prerendered either and get
+  // the same treatment.
   for (const r of routesConfig.routes) {
     if (r.mode !== "ssr") continue;
     const bundlePath = bundlePaths.get(r.route);
     if (!bundlePath) throw new BuildError(`route ${r.route}: no bundled entrypoint`);
     await assertSsrEntrypoint(r.route, bundlePath);
+  }
+  for (const h of hookBundles) {
+    await assertHookEntrypoint(h.name, h.absolutePath);
   }
 
   // Source inference (phase 3) — scan the *source* file, not the bundle, so
@@ -239,6 +262,7 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
     inferredSources,
     hydration,
     staticAssets,
+    hookPaths,
     catalog,
   });
 

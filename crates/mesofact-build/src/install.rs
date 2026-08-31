@@ -1,27 +1,62 @@
-//! Minimal npm install step (re-scoped R447). pacquet — W174's installer
-//! pillar — was retired upstream (the crates.io name is a 0.0.0 placeholder;
-//! orogene is similarly dormant), so the pipeline carries its own small
-//! installer instead of an off-the-shelf one. Deliberately narrow scope,
-//! justified by the R446 audit (15 packages, pure JS, zero install scripts):
+//! Minimal npm install step (re-scoped R447). The pipeline carries its own
+//! small installer rather than an off-the-shelf one; the R446 audit (15
+//! packages, pure JS, zero install scripts) is what justifies the narrow
+//! scope below.
 //!
-//! - **bun.lock-driven only.** Exact versions + sha512 integrity come from
-//!   the existing lockfile; this step never resolves semver ranges. No lock
-//!   → error, pointing at `bun install` (or a committed lockfile).
-//! - **Flat layout.** Every locked package lands at `node_modules/<name>`.
-//!   The audited dep surface is conflict-free; a version conflict fails the
-//!   install rather than silently nesting.
+//! Two claims that used to sit here were wrong and are corrected by R757-S1
+//! (see `.yah/docs/working/W318-npm-resolution-substrate.md`). pacquet was not
+//! "retired upstream" — it moved into the pnpm monorepo and, as of pnpm 11.7,
+//! is pnpm's opt-in Rust engine doing resolution *and* materialization; the
+//! crates.io 0.0.0 entry is a name reservation. Orogene is not "dormant" — it
+//! went closed-source with paid licenses, and its public tree no longer
+//! contains source. Neither changes the decision below; both change what a
+//! future reader should conclude from it.
+//!
+//! This module owns MATERIALIZATION only. Resolution (semver ranges +
+//! packuments -> exact versions) is R757's separate half:
+//!
+//! - **Lockfile-driven only.** Exact versions + sha512 integrity come from an
+//!   existing lockfile; this step never resolves semver ranges. No lock →
+//!   error, pointing at `bun install` / `npm install` / `pnpm install` (or a
+//!   committed lockfile). Three formats are read (W319 §4): `bun.lock`,
+//!   `package-lock.json` (`lockfileVersion` 2 or 3) and `pnpm-lock.yaml` v9,
+//!   in that precedence when a project carries several.
+//! - **The lock says where — except pnpm's, which doesn't.** bun and npm keys
+//!   are install paths, so their layout is read, not computed: a flat closure
+//!   stays flat and a conflict copy lands nested under its parent's
+//!   `node_modules/` (`dest_for`). `pnpm-lock.yaml` is keyed by package
+//!   identity and says nothing about disk, so [`crate::pnpm`] *derives* a
+//!   hoisted layout from its graph (R771-F4, W319 §4.1). That derivation is
+//!   the one place this crate hoists, and it hoists to reproduce a tree Node
+//!   resolves identically to pnpm's — not to re-resolve anything.
 //! - **No lifecycle scripts.** install/postinstall are skipped uncondition-
 //!   ally (the W174 "skip-by-default" policy; the audit found zero users).
 //! - **`file:` deps symlink** to their target, matching bun's behavior for
-//!   workspace-style links (`@mesofact/runtime`).
+//!   workspace-style links (`@mesofact/runtime`) and npm's `"link": true`
+//!   entries.
+//! - **Nothing is fetched unverified.** A registry entry with no sha512
+//!   integrity in the lock is refused by name, never downloaded on trust.
+//!   `PackageSource::Registry` carries the integrity as a required field, so
+//!   there is no path through this module that fetches without one.
+//! - **Downloaded once per machine, not once per project.** A package is
+//!   unpacked into the content-addressed [`crate::store`] under its integrity
+//!   (R771-F1, W319 §2) and every project materializes out of that entry with
+//!   the reflink → hardlink → copy chain in [`crate::materialize`] (R771-F2,
+//!   W319 §3). The old per-project `gunzip`+`untar` of a cached `.tgz` is
+//!   gone, and so is its poisoned-cache eviction: nothing durable is written
+//!   until it has been verified.
+//! - **Unix only, loudly.** Windows is out of scope for stage 1 (W319 §3):
+//!   `install` refuses up front rather than half-working through junctions.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 use sha2::{Digest, Sha512};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
-const REGISTRY: &str = "https://registry.npmjs.org";
+use crate::materialize::{self, materialize_tree, Strategy};
+use crate::store::Store;
+
+pub(crate) const REGISTRY: &str = "https://registry.npmjs.org";
 
 pub struct InstallReport {
     pub installed: usize,
@@ -77,14 +112,47 @@ fn strip_trailing_commas(src: &str) -> String {
     out
 }
 
-struct LockedPackage {
-    name: String,
-    /// `name@version` or `name@file:<path>`.
-    locator: String,
-    integrity: Option<String>,
+/// One lockfile entry reduced to what materialization needs: where it goes
+/// and where it comes from. This is the whole contract between a parser and
+/// the install walk — `parse_bun_lock`, `parse_package_lock` and
+/// [`crate::pnpm::parse_pnpm_lock`] all produce it, and the walk below reads
+/// nothing else. The first two *read* `dest_rel` (their keys are install
+/// paths); the pnpm one *derives* it, which is the entire difficulty of that
+/// format and none of this walk's business.
+#[derive(Debug)]
+pub(crate) struct LockedPackage {
+    /// The lockfile key, verbatim. Diagnostics only — never a package name
+    /// (it is an install path, or for pnpm a peer-suffixed identity) and
+    /// never a URL.
+    pub(crate) key: String,
+    /// Install path relative to the project root, e.g.
+    /// `node_modules/@babel/core/node_modules/convert-source-map`.
+    pub(crate) dest_rel: PathBuf,
+    pub(crate) source: PackageSource,
 }
 
-fn parse_bun_lock(lock_path: &Path) -> Result<Vec<LockedPackage>> {
+/// Where a package comes from — the whole vocabulary a materializer has, and
+/// therefore (R771-T5) the whole vocabulary the stage-2 lock seam may use.
+/// Public for [`crate::lock`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackageSource {
+    /// Fetch `name`@`version` from the public registry. `name` is the
+    /// *registry* name, which is not derivable from the key alone — the key
+    /// is a path, and an aliased dep (`npm:`) is installed under a directory
+    /// name that differs from the package it names.
+    ///
+    /// `integrity` is required rather than optional: it is both the
+    /// verification and the store key (W319 §2), so an entry without one
+    /// cannot be fetched *or* addressed. Every parser refuses such an entry
+    /// by name, and this type is what keeps that from being a convention.
+    Registry { name: String, version: String, integrity: String },
+    /// Symlink to a path relative to the project root (`file:` deps in
+    /// bun.lock, `"link": true` entries in package-lock, `link:` specifiers
+    /// in pnpm-lock).
+    Link { target_rel: PathBuf },
+}
+
+pub(crate) fn parse_bun_lock(lock_path: &Path) -> Result<Vec<LockedPackage>> {
     let raw = std::fs::read_to_string(lock_path)
         .with_context(|| format!("reading {}", lock_path.display()))?;
     let parsed: Value = serde_json::from_str(&strip_trailing_commas(&raw))
@@ -93,39 +161,320 @@ fn parse_bun_lock(lock_path: &Path) -> Result<Vec<LockedPackage>> {
         bail!("{}: no \"packages\" map", lock_path.display());
     };
     let mut out = Vec::new();
-    for (name, entry) in packages {
+    for (key, entry) in packages {
         let Some(arr) = entry.as_array() else {
-            bail!("{}: packages[{name}] is not an array", lock_path.display());
+            bail!("{}: packages[{key}] is not an array", lock_path.display());
         };
         let Some(locator) = arr.first().and_then(Value::as_str) else {
-            bail!("{}: packages[{name}] has no locator", lock_path.display());
+            bail!("{}: packages[{key}] has no locator", lock_path.display());
         };
         // bun.lock entry shapes: [locator, registry?, meta, integrity] for
         // registry packages; [locator, meta] for file:/workspace links.
         let integrity = arr.iter().rev().find_map(Value::as_str).and_then(|s| {
             s.starts_with("sha512-").then(|| s.to_string())
         });
+        // Locator forms: "<name>@<version>" | "<name>@file:<path>" — find the
+        // @ separating name from source (names may start with @scope/).
+        let at = locator
+            .rfind('@')
+            .filter(|&i| i > 0)
+            .ok_or_else(|| anyhow!("unparseable locator {locator:?} for {key}"))?;
+        // The *registry* name comes from the locator, never from the lock
+        // key: the key is an install path, so a nested entry keyed
+        // "@mesofact/runtime/typescript" would otherwise be fetched as a
+        // package of that name (a guaranteed 404).
+        let name = &locator[..at];
+        let version = &locator[at + 1..];
+        let source = if let Some(rel) = version.strip_prefix("file:") {
+            PackageSource::Link { target_rel: PathBuf::from(rel) }
+        } else if version.contains("workspace:") || version.starts_with("link:") {
+            bail!(
+                "{key}: locator {locator:?} uses an unsupported protocol for the Rust-native installer (file: and registry versions only)"
+            );
+        } else {
+            // The module header has always claimed a registry entry without a
+            // sha512 is refused rather than downloaded on trust; until
+            // R771-F1 that was true of the npm parser only, and a bun entry
+            // missing its integrity was fetched unverified. It is now also
+            // unaddressable — the integrity is the store key.
+            let Some(integrity) = integrity else {
+                bail!(
+                    "{}: packages[{key}] ({locator}) has no sha512 integrity — refusing to install unverified content (W319 §4)",
+                    lock_path.display()
+                );
+            };
+            PackageSource::Registry {
+                name: name.to_string(),
+                version: version.to_string(),
+                integrity,
+            }
+        };
+        // bun.lock keys are relative to the root node_modules; npm's are
+        // relative to the project root, which is what the walk wants.
         out.push(LockedPackage {
-            name: name.clone(),
-            locator: locator.to_string(),
-            integrity,
+            key: key.clone(),
+            dest_rel: dest_for(Path::new("node_modules"), key),
+            source,
         });
     }
     Ok(out)
+}
+
+/// Every lockfile format this installer reads, and where each one lives.
+#[derive(Debug)]
+enum Lockfile {
+    Bun(PathBuf),
+    /// `package-lock.json` with `lockfileVersion` 2 or 3.
+    Npm(PathBuf),
+    /// `pnpm-lock.yaml` v9. Unlike the other two this one does not say where
+    /// anything goes; the layout is derived (R771-F4, W319 §4.1).
+    Pnpm(PathBuf),
+}
+
+impl Lockfile {
+    fn path(&self) -> &Path {
+        match self {
+            Lockfile::Bun(p) | Lockfile::Npm(p) | Lockfile::Pnpm(p) => p,
+        }
+    }
+
+    fn parse(&self) -> Result<Vec<LockedPackage>> {
+        match self {
+            Lockfile::Bun(p) => parse_bun_lock(p),
+            Lockfile::Npm(p) => parse_package_lock(p),
+            Lockfile::Pnpm(p) => crate::pnpm::parse_pnpm_lock(p),
+        }
+    }
+}
+
+/// Pick the lockfile to install from, in the order bun → npm → pnpm.
+///
+/// `bun.lock` wins when a project carries several: bun is what mints the
+/// locks in this camp, and an incidental `package-lock.json` (a stray `npm
+/// install`, a vendored example) must not silently redefine the closure of a
+/// project that has been building from bun.lock all along. `pnpm-lock.yaml`
+/// is last for the same reason plus one more — it is the only format whose
+/// layout is *derived* rather than read, so it is the one whose result is
+/// least predictable from the file alone. Reading a pnpm lock a user already
+/// committed is not adopting pnpm (R757's staging note forbids making its
+/// layout, catalogs and CLI the default); it is the opposite.
+fn detect_lockfile(project_root: &Path) -> Result<Lockfile> {
+    let bun = project_root.join("bun.lock");
+    if bun.exists() {
+        return Ok(Lockfile::Bun(bun));
+    }
+    let npm = project_root.join("package-lock.json");
+    if npm.exists() {
+        return Ok(Lockfile::Npm(npm));
+    }
+    let pnpm = project_root.join("pnpm-lock.yaml");
+    if pnpm.exists() {
+        return Ok(Lockfile::Pnpm(pnpm));
+    }
+    bail!(
+        "{} has no bun.lock, package-lock.json or pnpm-lock.yaml — the Rust-native install step is lockfile-driven (W174 amendment); run `bun install` (or `npm install`, or `pnpm install`) once to mint the lock, or build against an existing node_modules with --no-install",
+        project_root.display()
+    )
+}
+
+/// A `package-lock.json` v3 (or v2) `packages` key is *already* the install
+/// path relative to the project root — `node_modules/x`,
+/// `node_modules/@babel/core/node_modules/convert-source-map`,
+/// `docs/node_modules/entities`. So there is nothing to compute here, only
+/// something to refuse: a lockfile is attacker-editable content in a pull
+/// request, and a key of `../../.ssh` would otherwise be a write outside the
+/// project root. Link *targets* are deliberately not run through this (npm's
+/// `file:../sibling` legitimately points outside the root, and the bun path
+/// has always allowed it) — only destinations.
+fn install_path(key: &str) -> Result<PathBuf> {
+    let p = Path::new(key);
+    let escapes = p.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    });
+    if escapes {
+        bail!("install path {key:?} escapes the project root");
+    }
+    Ok(p.to_path_buf())
+}
+
+/// The package name a v3 key installs, i.e. everything after the last
+/// `node_modules/` segment: `docs/node_modules/entities` → `entities`,
+/// `node_modules/@babel/core/node_modules/convert-source-map` →
+/// `convert-source-map`. Only a fallback — an entry's own `name` field wins
+/// when present, which is how `npm:` aliases stay correct.
+fn package_name_from_key(key: &str) -> &str {
+    const NM: &str = "node_modules/";
+    match key.rfind(NM) {
+        Some(i) => &key[i + NM.len()..],
+        None => key,
+    }
+}
+
+/// Parse `package-lock.json` (`lockfileVersion` 2 or 3) into the same
+/// path-keyed shape the bun.lock walk consumes (R771-F3).
+///
+/// **The missing-field policy (W319 §4) lives here.** `resolved` and
+/// `integrity` are optional in the format, so every entry lacking them is
+/// sorted into a class that is either skipped for a stated reason or refused
+/// by name — never fetched on trust:
+///
+/// - `""` — the root project itself. Skipped: it is the tree, not a
+///   dependency of it.
+/// - a key with no `node_modules` segment (`docs`, `packages/ui`) — a
+///   workspace member's own source directory. npm records its metadata here;
+///   the thing that gets materialized is the sibling `node_modules/<name>`
+///   link entry. Skipped.
+/// - `"link": true` — the symlink npm creates from `node_modules` into a
+///   workspace/`file:` directory. `resolved` is a *path*, not a URL, and
+///   there is no integrity because nothing is fetched. Symlinked.
+/// - `"inBundle": true` — a bundled dependency, already inside its parent's
+///   tarball and extracted with it. Skipped; fetching it separately is what
+///   npm itself declines to do.
+/// - anything else missing `version`, `resolved` or `integrity` — refused,
+///   with the key and the fields it does carry in the message.
+///
+/// Not filtered: `dev`, `optional` and `peer`. The bun.lock walk installs
+/// every entry the lock lists and this stays consistent with it — including
+/// the wart that a platform-gated optional (`os`/`cpu`) is fetched on every
+/// platform. Pruning is a resolution-shaped decision (which closure do you
+/// want?), not a materialization one.
+fn parse_package_lock(lock_path: &Path) -> Result<Vec<LockedPackage>> {
+    let raw = std::fs::read_to_string(lock_path)
+        .with_context(|| format!("reading {}", lock_path.display()))?;
+    let parsed: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing {}", lock_path.display()))?;
+
+    // v2 carries the same path-keyed `packages` map as v3 (plus a legacy
+    // `dependencies` mirror this ignores), so it is read on the same path. v1
+    // has no `packages` map at all and is a different format.
+    match parsed.get("lockfileVersion").and_then(Value::as_u64) {
+        Some(2 | 3) => {}
+        Some(v) => bail!(
+            "{}: lockfileVersion {v} is not supported — the path-keyed `packages` map this installer reads arrived in v2; re-run `npm install --lockfile-version 3`",
+            lock_path.display()
+        ),
+        None => bail!("{}: no \"lockfileVersion\"", lock_path.display()),
+    }
+
+    let Some(packages) = parsed.get("packages").and_then(Value::as_object) else {
+        bail!("{}: no \"packages\" map", lock_path.display());
+    };
+
+    let mut out = Vec::new();
+    for (key, entry) in packages {
+        let Some(obj) = entry.as_object() else {
+            bail!("{}: packages[{key:?}] is not an object", lock_path.display());
+        };
+        let flag = |k: &str| obj.get(k).and_then(Value::as_bool).unwrap_or(false);
+
+        // Skipped classes, in the order of the doc comment above.
+        if key.is_empty() || !key.split('/').any(|seg| seg == "node_modules") {
+            continue;
+        }
+        if flag("inBundle") {
+            continue;
+        }
+
+        let dest_rel = install_path(key)
+            .with_context(|| format!("{}: packages[{key:?}]", lock_path.display()))?;
+
+        if flag("link") {
+            let Some(target) = obj.get("resolved").and_then(Value::as_str) else {
+                bail!(
+                    "{}: packages[{key:?}] is \"link\": true with no \"resolved\" target directory",
+                    lock_path.display()
+                );
+            };
+            out.push(LockedPackage {
+                key: key.clone(),
+                dest_rel,
+                source: PackageSource::Link {
+                    target_rel: PathBuf::from(target.strip_prefix("file:").unwrap_or(target)),
+                },
+            });
+            continue;
+        }
+
+        let name = obj
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| package_name_from_key(key));
+        let Some(version) = obj.get("version").and_then(Value::as_str) else {
+            bail!(
+                "{}: packages[{key:?}] has no \"version\" and is not a root, workspace, link or bundled entry (fields: {})",
+                lock_path.display(),
+                field_names(obj)
+            );
+        };
+        let Some(resolved) = obj.get("resolved").and_then(Value::as_str) else {
+            bail!(
+                "{}: packages[{key:?}] ({name}@{version}) has no \"resolved\" tarball URL. npm omits it for entries it does not fetch — the root project, workspace source directories, \"link\": true links and \"inBundle\": true bundled deps — and this entry declares none of those (fields: {}). Re-run `npm install` to refresh the lock.",
+                lock_path.display(),
+                field_names(obj)
+            );
+        };
+        // Only the public registry is read. A `resolved` pointing anywhere
+        // else — a private mirror, git+ssh, a local tarball — is refused by
+        // name rather than quietly re-derived against registry.npmjs.org,
+        // which would install a *different* package under the same identity.
+        if !resolved.starts_with(&format!("{REGISTRY}/")) {
+            bail!(
+                "{}: packages[{key:?}] ({name}@{version}) resolves to {resolved}, which is not on {REGISTRY} — alternate registries, git and local-tarball sources are not supported by the Rust-native installer",
+                lock_path.display()
+            );
+        }
+        let Some(integrity) = obj.get("integrity").and_then(Value::as_str) else {
+            bail!(
+                "{}: packages[{key:?}] ({name}@{version}) has a \"resolved\" URL but no \"integrity\" — refusing to install unverified content (W319 §4)",
+                lock_path.display()
+            );
+        };
+        if !integrity.starts_with("sha512-") {
+            bail!(
+                "{}: packages[{key:?}] ({name}@{version}) has integrity {integrity:?}; only sha512 is verified (npm rewrites sha1 entries on `npm install`)",
+                lock_path.display()
+            );
+        }
+
+        out.push(LockedPackage {
+            key: key.clone(),
+            dest_rel,
+            source: PackageSource::Registry {
+                name: name.to_string(),
+                version: version.to_string(),
+                integrity: integrity.to_string(),
+            },
+        });
+    }
+    Ok(out)
+}
+
+/// The keys an entry does carry — what a refusal message needs to be
+/// actionable about an entry defined by what it is missing.
+fn field_names(obj: &serde_json::Map<String, Value>) -> String {
+    obj.keys().cloned().collect::<Vec<_>>().join(", ")
 }
 
 /// Install `project_root`'s locked dependency closure into
 /// `project_root/node_modules`. Idempotent: a marker file records the lock
 /// content hash; a fresh marker short-circuits.
 pub fn install(project_root: &Path) -> Result<InstallReport> {
-    let lock_path = project_root.join("bun.lock");
-    if !lock_path.exists() {
-        bail!(
-            "{} has no bun.lock — the Rust-native install step is lockfile-driven (W174 amendment); run `bun install` once to mint the lock, or build against an existing node_modules with --no-install",
-            project_root.display()
-        );
-    }
-    let lock_raw = std::fs::read(&lock_path)?;
+    #[cfg(not(unix))]
+    bail!(
+        "the Rust-native install step is unix-only: Windows is out of scope for stage 1 (W319 §3). Install with npm or bun and build with --no-install."
+    );
+    // Read before the freshness short-circuit below, so a typo in the
+    // override is refused on every run rather than only on the runs that
+    // happen to do work.
+    let chain = materialize::chain_from_env()?;
+    let lock = detect_lockfile(project_root)?;
+    let lock_path = lock.path();
+    let lock_raw = std::fs::read(lock_path)?;
     let lock_hash = format!("{:x}", Sha512::digest(&lock_raw));
     let node_modules = project_root.join("node_modules");
     let marker = node_modules.join(".mesofact-install.json");
@@ -135,9 +484,8 @@ pub fn install(project_root: &Path) -> Result<InstallReport> {
         }
     }
 
-    let packages = parse_bun_lock(&lock_path)?;
-    let cache_dir = cache_root()?;
-    std::fs::create_dir_all(&cache_dir)?;
+    let packages = lock.parse()?;
+    let store = Store::open()?;
 
     let client = reqwest::blocking::Client::builder()
         .user_agent("mesofact-build")
@@ -146,38 +494,29 @@ pub fn install(project_root: &Path) -> Result<InstallReport> {
     let mut installed = 0;
     let mut linked = 0;
     for pkg in &packages {
-        let dest = dest_for(&node_modules, &pkg.name);
-        // Locator forms: "<name>@<version>" | "<name>@file:<path>" — find
-        // the @ separating name from source (names may start with @scope/).
-        let at = pkg.locator.rfind('@').filter(|&i| i > 0).ok_or_else(|| {
-            anyhow!("unparseable locator {:?} for {}", pkg.locator, pkg.name)
-        })?;
-        // The *registry* name comes from the locator, never from the lock
-        // key: the key is an install path, so a nested entry keyed
-        // "@mesofact/runtime/typescript" would otherwise be fetched as a
-        // package of that name (a guaranteed 404).
-        let registry_name = &pkg.locator[..at];
-        let source = &pkg.locator[at + 1..];
-        if let Some(rel) = source.strip_prefix("file:") {
-            let target = project_root.join(rel);
-            if !target.exists() {
-                bail!(
-                    "{}: file: dependency target {} does not exist",
-                    pkg.name,
-                    target.display()
-                );
+        // `dest_rel` is project-root-relative for both formats — a package
+        // under a workspace (`docs/node_modules/entities`) lands in that
+        // workspace's node_modules, not the root's.
+        let dest = project_root.join(&pkg.dest_rel);
+        match &pkg.source {
+            PackageSource::Link { target_rel } => {
+                let target = project_root.join(target_rel);
+                if !target.exists() {
+                    bail!(
+                        "{}: link target {} does not exist",
+                        pkg.key,
+                        target.display()
+                    );
+                }
+                link_package(&dest, &target)?;
+                linked += 1;
             }
-            link_package(&dest, &target)?;
-            linked += 1;
-        } else if source.contains("workspace:") || source.starts_with("link:") {
-            bail!(
-                "{}: locator {:?} uses an unsupported protocol for the Rust-native installer (file: and registry versions only)",
-                pkg.name,
-                pkg.locator
-            );
-        } else {
-            install_registry_package(&client, &cache_dir, &dest, registry_name, source, pkg.integrity.as_deref())?;
-            installed += 1;
+            PackageSource::Registry { name, version, integrity } => {
+                install_registry_package(
+                    &client, &store, chain, &dest, name, version, integrity,
+                )?;
+                installed += 1;
+            }
         }
     }
 
@@ -222,14 +561,35 @@ fn dest_for(node_modules: &Path, key: &str) -> PathBuf {
     p
 }
 
-fn cache_root() -> Result<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .ok_or_else(|| anyhow!("neither XDG_CACHE_HOME nor HOME is set"))?;
-    Ok(base.join("mesofact").join("npm"))
+/// The path to `target` as seen from directory `base`. Both must already be
+/// canonical — the caller canonicalizes, so no `..` or symlink survives into
+/// the comparison and a plain component walk is exact.
+fn relative_from(base: &Path, target: &Path) -> PathBuf {
+    let mut b = base.components().peekable();
+    let mut t = target.components().peekable();
+    while b.peek().is_some() && b.peek() == t.peek() {
+        b.next();
+        t.next();
+    }
+    let mut out = PathBuf::new();
+    for _ in b {
+        out.push("..");
+    }
+    for c in t {
+        out.push(c);
+    }
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    out
 }
 
+/// Symlink `dest` at `target`, **relatively** — which is what both npm and
+/// bun write, and the difference is not cosmetic: an absolute link (what this
+/// wrote before R771-F3) dangles the moment the project tree is moved,
+/// copied, or restored from a CI cache at a different path. Verified against
+/// a real `npm install` tree; the link was the only file the two trees
+/// disagreed on.
 fn link_package(dest: &Path, target: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
@@ -242,98 +602,59 @@ fn link_package(dest: &Path, target: &Path) -> Result<()> {
         }
     }
     #[cfg(unix)]
-    std::os::unix::fs::symlink(target.canonicalize()?, dest)?;
+    {
+        // The link's own directory is the frame of reference, and it exists
+        // by now (create_dir_all above), so both sides can canonicalize.
+        let from = dest
+            .parent()
+            .ok_or_else(|| anyhow!("link destination {} has no parent", dest.display()))?
+            .canonicalize()?;
+        let to = target
+            .canonicalize()
+            .with_context(|| format!("link target {}", target.display()))?;
+        std::os::unix::fs::symlink(relative_from(&from, &to), dest)?;
+    }
     #[cfg(not(unix))]
     bail!("file: dependency links are unix-only for now");
     Ok(())
 }
 
+/// Put `name`@`version` at `dest`, via the store: the entry for `integrity`
+/// is fetched and unpacked once per machine, and this only materializes a
+/// copy of it into the project.
+///
+/// The download is verified inside [`Store::insert_tarball`] before anything
+/// durable is written, so a mismatch leaves no artifact to evict — which is
+/// what the old cache's poisoned-`.tgz` deletion existed to clean up.
 fn install_registry_package(
     client: &reqwest::blocking::Client,
-    cache_dir: &Path,
+    store: &Store,
+    chain: &[Strategy],
     dest: &Path,
     name: &str,
     version: &str,
-    integrity: Option<&str>,
+    integrity: &str,
 ) -> Result<()> {
-    // Tarball basename drops the scope: @scope/pkg → pkg-<version>.tgz.
-    let basename = name.rsplit('/').next().unwrap_or(name);
-    let cache_file = cache_dir.join(format!(
-        "{}-{version}.tgz",
-        name.replace('/', "+")
-    ));
-    let bytes = if cache_file.exists() {
-        std::fs::read(&cache_file)?
-    } else {
-        let url = format!("{REGISTRY}/{name}/-/{basename}-{version}.tgz");
-        let resp = client.get(&url).send().with_context(|| format!("GET {url}"))?;
-        if !resp.status().is_success() {
-            bail!("GET {url} → {}", resp.status());
-        }
-        let bytes = resp.bytes()?.to_vec();
-        std::fs::write(&cache_file, &bytes)?;
-        bytes
-    };
-
-    if let Some(expected) = integrity {
-        let got = format!(
-            "sha512-{}",
-            base64_encode(&Sha512::digest(&bytes))
-        );
-        if got != expected {
-            // Poisoned cache or registry mismatch — drop the cache entry so
-            // a retry re-downloads.
-            let _ = std::fs::remove_file(&cache_file);
-            bail!("{name}@{version}: integrity mismatch (expected {expected}, got {got})");
-        }
-    }
+    let entry = store
+        .ensure(integrity, || {
+            // Tarball basename drops the scope: @scope/pkg → pkg-<version>.tgz.
+            let basename = name.rsplit('/').next().unwrap_or(name);
+            let url = format!("{REGISTRY}/{name}/-/{basename}-{version}.tgz");
+            let resp = client.get(&url).send().with_context(|| format!("GET {url}"))?;
+            if !resp.status().is_success() {
+                bail!("GET {url} → {}", resp.status());
+            }
+            Ok(resp.bytes()?.to_vec())
+        })
+        .with_context(|| format!("{name}@{version}"))?;
 
     if dest.exists() {
         std::fs::remove_dir_all(dest)
             .or_else(|_| std::fs::remove_file(dest))
             .with_context(|| format!("clearing {}", dest.display()))?;
     }
-    std::fs::create_dir_all(dest)?;
-
-    let gz = flate2::read::GzDecoder::new(&bytes[..]);
-    let mut archive = tar::Archive::new(gz);
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.into_owned();
-        // npm tarballs root everything under a single dir (almost always
-        // "package/"); strip that first component whatever it's called.
-        let stripped: PathBuf = path.components().skip(1).collect();
-        if stripped.as_os_str().is_empty() {
-            continue;
-        }
-        let out_path = dest.join(&stripped);
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        if entry.header().entry_type().is_dir() {
-            std::fs::create_dir_all(&out_path)?;
-        } else {
-            let mut buf = Vec::new();
-            entry.read_to_end(&mut buf)?;
-            std::fs::write(&out_path, buf)?;
-        }
-    }
-    Ok(())
-}
-
-// Standard (non-url-safe, padded) base64 — npm integrity strings use it.
-fn base64_encode(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(TABLE[(n >> 18) as usize & 63] as char);
-        out.push(TABLE[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
-    }
-    out
+    materialize_tree(&entry, dest, chain)
+        .with_context(|| format!("materializing {name}@{version} into {}", dest.display()))
 }
 
 #[cfg(test)]
@@ -349,12 +670,8 @@ mod tests {
         assert_eq!(v["a"], serde_json::json!([1, 2]));
     }
 
-    #[test]
-    fn base64_matches_known_vector() {
-        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"ab"), "YWI=");
-    }
+    // The base64 codec moved to `crate::store` with the integrity handling
+    // that is its only caller (R771-F1); its vectors live there now.
 
     #[test]
     fn lock_keys_split_into_package_chains() {
@@ -382,5 +699,357 @@ mod tests {
             dest_for(nm, "@mesofact/runtime/typescript"),
             Path::new("/p/node_modules/@mesofact/runtime/node_modules/typescript")
         );
+    }
+
+    // ---- R771-F3: package-lock.json v3 ------------------------------------
+
+    /// Write `body` as `name` in a fresh tempdir; the dir is returned because
+    /// dropping it deletes the file.
+    fn lock_file(name: &str, body: &str) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(name);
+        std::fs::write(&path, body).unwrap();
+        (tmp, path)
+    }
+
+    fn by_key<'a>(pkgs: &'a [LockedPackage], key: &str) -> &'a LockedPackage {
+        pkgs.iter().find(|p| p.key == key).unwrap_or_else(|| {
+            let keys: Vec<&str> = pkgs.iter().map(|p| p.key.as_str()).collect();
+            panic!("no entry keyed {key:?}; have {keys:?}")
+        })
+    }
+
+    fn registry_of(pkg: &LockedPackage) -> (&str, &str) {
+        match &pkg.source {
+            PackageSource::Registry { name, version, .. } => (name, version),
+            PackageSource::Link { .. } => panic!("{} is a link, not a registry entry", pkg.key),
+        }
+    }
+
+    fn integrity_of(pkg: &LockedPackage) -> Option<&str> {
+        match &pkg.source {
+            PackageSource::Registry { integrity, .. } => Some(integrity),
+            PackageSource::Link { .. } => None,
+        }
+    }
+
+    /// Shaped after a real npm v3 lock: a workspace (`docs`) with its own
+    /// nested copy of a dep, a scoped package, a conflict copy nested under
+    /// its parent, a `link: true` workspace symlink and a bundled entry.
+    const NPM_V3_LOCK: &str = r#"{
+      "name": "demo",
+      "version": "1.0.0",
+      "lockfileVersion": 3,
+      "requires": true,
+      "packages": {
+        "": {
+          "name": "demo",
+          "version": "1.0.0",
+          "workspaces": ["docs"],
+          "dependencies": { "@babel/core": "^7.24.0", "entities": "^4.5.0" }
+        },
+        "docs": {
+          "name": "@demo/docs",
+          "version": "0.1.0",
+          "dependencies": { "entities": "^5.0.0" }
+        },
+        "node_modules/@babel/core": {
+          "version": "7.24.0",
+          "resolved": "https://registry.npmjs.org/@babel/core/-/core-7.24.0.tgz",
+          "integrity": "sha512-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa==",
+          "engines": { "node": ">=6.9.0" }
+        },
+        "node_modules/@babel/core/node_modules/convert-source-map": {
+          "version": "2.0.0",
+          "resolved": "https://registry.npmjs.org/convert-source-map/-/convert-source-map-2.0.0.tgz",
+          "integrity": "sha512-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb=="
+        },
+        "node_modules/convert-source-map": {
+          "version": "1.9.0",
+          "resolved": "https://registry.npmjs.org/convert-source-map/-/convert-source-map-1.9.0.tgz",
+          "integrity": "sha512-cccccccccccccccccccccccccccccccccccccccc==",
+          "dev": true
+        },
+        "node_modules/docs": {
+          "resolved": "docs",
+          "link": true
+        },
+        "node_modules/wrappy": {
+          "version": "1.0.2",
+          "inBundle": true,
+          "license": "ISC"
+        },
+        "docs/node_modules/entities": {
+          "version": "5.0.0",
+          "resolved": "https://registry.npmjs.org/entities/-/entities-5.0.0.tgz",
+          "integrity": "sha512-dddddddddddddddddddddddddddddddddddddddd==",
+          "engines": { "node": ">=0.12" }
+        }
+      }
+    }"#;
+
+    #[test]
+    fn package_lock_v3_keys_are_install_paths_verbatim() {
+        let (_tmp, path) = lock_file("package-lock.json", NPM_V3_LOCK);
+        let pkgs = parse_package_lock(&path).unwrap();
+
+        // "" (root), "docs" (workspace source dir) and wrappy (bundled) are
+        // skipped; the other five are materialized.
+        assert_eq!(pkgs.len(), 5, "unexpected entries: {:?}", pkgs.iter().map(|p| &p.key).collect::<Vec<_>>());
+
+        let scoped = by_key(&pkgs, "node_modules/@babel/core");
+        assert_eq!(scoped.dest_rel, Path::new("node_modules/@babel/core"));
+        assert_eq!(registry_of(scoped), ("@babel/core", "7.24.0"));
+
+        // The conflict copy stays nested under its parent — the key already
+        // spells the on-disk path, node_modules segments and all.
+        let nested = by_key(&pkgs, "node_modules/@babel/core/node_modules/convert-source-map");
+        assert_eq!(
+            nested.dest_rel,
+            Path::new("node_modules/@babel/core/node_modules/convert-source-map")
+        );
+        assert_eq!(registry_of(nested), ("convert-source-map", "2.0.0"));
+        // ... alongside, not instead of, the hoisted copy at a different version.
+        assert_eq!(registry_of(by_key(&pkgs, "node_modules/convert-source-map")).1, "1.9.0");
+
+        // A non-root project path installs into that project's node_modules.
+        let ws_dep = by_key(&pkgs, "docs/node_modules/entities");
+        assert_eq!(ws_dep.dest_rel, Path::new("docs/node_modules/entities"));
+        assert_eq!(registry_of(ws_dep), ("entities", "5.0.0"));
+
+        let link = by_key(&pkgs, "node_modules/docs");
+        assert!(integrity_of(link).is_none());
+        match &link.source {
+            PackageSource::Link { target_rel } => assert_eq!(target_rel, Path::new("docs")),
+            PackageSource::Registry { .. } => panic!("workspace link parsed as a registry fetch"),
+        }
+    }
+
+    #[test]
+    fn package_lock_integrity_carries_through() {
+        let (_tmp, path) = lock_file("package-lock.json", NPM_V3_LOCK);
+        let pkgs = parse_package_lock(&path).unwrap();
+        assert_eq!(
+            integrity_of(by_key(&pkgs, "node_modules/@babel/core")),
+            Some("sha512-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa==")
+        );
+    }
+
+    /// `npm:` aliases install under a directory that is not the package name,
+    /// so the entry's own `name` wins over the key.
+    #[test]
+    fn package_lock_alias_uses_the_entry_name() {
+        let (_tmp, path) = lock_file(
+            "package-lock.json",
+            r#"{ "lockfileVersion": 3, "packages": {
+                "node_modules/string-width-cjs": {
+                  "name": "string-width",
+                  "version": "4.2.3",
+                  "resolved": "https://registry.npmjs.org/string-width/-/string-width-4.2.3.tgz",
+                  "integrity": "sha512-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee=="
+                } } }"#,
+        );
+        let pkgs = parse_package_lock(&path).unwrap();
+        assert_eq!(registry_of(&pkgs[0]), ("string-width", "4.2.3"));
+        assert_eq!(pkgs[0].dest_rel, Path::new("node_modules/string-width-cjs"));
+    }
+
+    fn refusal(entry: &str) -> String {
+        let (_tmp, path) = lock_file(
+            "package-lock.json",
+            &format!(r#"{{ "lockfileVersion": 3, "packages": {{ {entry} }} }}"#),
+        );
+        let err = parse_package_lock(&path).expect_err("expected a refusal");
+        format!("{err:#}")
+    }
+
+    #[test]
+    fn package_lock_refuses_a_fetch_without_integrity() {
+        let msg = refusal(
+            r#""node_modules/left-pad": { "version": "1.3.0",
+               "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz" }"#,
+        );
+        assert!(msg.contains("node_modules/left-pad"), "{msg}");
+        assert!(msg.contains("integrity"), "{msg}");
+    }
+
+    #[test]
+    fn package_lock_refuses_sha1_integrity() {
+        let msg = refusal(
+            r#""node_modules/left-pad": { "version": "1.3.0",
+               "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+               "integrity": "sha1-YtRJHQGwB4z8m2vRvBpNLbTAWnQ=" }"#,
+        );
+        assert!(msg.contains("sha512"), "{msg}");
+    }
+
+    /// The §4 finding: entries with no `resolved` are real and common. The
+    /// ones with a documented reason are skipped above; an unexplained one is
+    /// named, not guessed at.
+    #[test]
+    fn package_lock_refuses_an_unexplained_missing_resolved() {
+        let msg = refusal(r#""node_modules/mystery": { "version": "1.0.0", "dev": true }"#);
+        assert!(msg.contains("node_modules/mystery"), "{msg}");
+        assert!(msg.contains("resolved"), "{msg}");
+        // The message lists what the entry *does* carry, so the reader can
+        // classify it without opening the lock.
+        assert!(msg.contains("version, dev"), "{msg}");
+    }
+
+    #[test]
+    fn package_lock_refuses_a_foreign_registry() {
+        let msg = refusal(
+            r#""node_modules/internal": { "version": "1.0.0",
+               "resolved": "https://npm.corp.example.com/internal/-/internal-1.0.0.tgz",
+               "integrity": "sha512-ffffffffffffffffffffffffffffffffffffffff==" }"#,
+        );
+        assert!(msg.contains("npm.corp.example.com"), "{msg}");
+    }
+
+    #[test]
+    fn package_lock_refuses_a_key_escaping_the_project_root() {
+        let msg = refusal(
+            r#""node_modules/../../evil": { "version": "1.0.0",
+               "resolved": "https://registry.npmjs.org/evil/-/evil-1.0.0.tgz",
+               "integrity": "sha512-gggggggggggggggggggggggggggggggggggggggg==" }"#,
+        );
+        assert!(msg.contains("escapes the project root"), "{msg}");
+    }
+
+    #[test]
+    fn package_lock_refuses_a_v1_lock() {
+        let (_tmp, path) = lock_file(
+            "package-lock.json",
+            r#"{ "lockfileVersion": 1, "dependencies": { "left-pad": { "version": "1.3.0" } } }"#,
+        );
+        let msg = format!("{:#}", parse_package_lock(&path).unwrap_err());
+        assert!(msg.contains("lockfileVersion 1"), "{msg}");
+    }
+
+    #[test]
+    fn package_lock_v2_reads_on_the_v3_path() {
+        let (_tmp, path) = lock_file(
+            "package-lock.json",
+            r#"{ "lockfileVersion": 2,
+                 "dependencies": { "left-pad": { "version": "1.3.0" } },
+                 "packages": { "node_modules/left-pad": {
+                   "version": "1.3.0",
+                   "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                   "integrity": "sha512-hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh==" } } }"#,
+        );
+        let pkgs = parse_package_lock(&path).unwrap();
+        assert_eq!(registry_of(&pkgs[0]), ("left-pad", "1.3.0"));
+    }
+
+    #[test]
+    fn package_names_come_from_the_last_node_modules_segment() {
+        assert_eq!(package_name_from_key("node_modules/entities"), "entities");
+        assert_eq!(package_name_from_key("node_modules/@babel/core"), "@babel/core");
+        assert_eq!(
+            package_name_from_key("node_modules/@babel/core/node_modules/convert-source-map"),
+            "convert-source-map"
+        );
+        assert_eq!(package_name_from_key("docs/node_modules/entities"), "entities");
+    }
+
+    // ---- the shared walk contract ----------------------------------------
+
+    #[test]
+    fn bun_lock_keys_become_root_node_modules_paths() {
+        let (_tmp, path) = lock_file(
+            "bun.lock",
+            r#"{
+              "lockfileVersion": 1,
+              "workspaces": { "": { "name": "demo" } },
+              "packages": {
+                "typescript": ["typescript@5.4.5", "", {}, "sha512-iiiiiiiiiiiiiiiiiiii=="],
+                "@mesofact/runtime": ["@mesofact/runtime@file:packages/runtime", {}],
+                "@mesofact/runtime/typescript": ["typescript@5.0.4", "", {}, "sha512-jjjjjjjjjjjjjjjjjjjj=="],
+              }
+            }"#,
+        );
+        let pkgs = parse_bun_lock(&path).unwrap();
+        assert_eq!(pkgs.len(), 3);
+
+        // Unlike npm's, a bun key is relative to the *root* node_modules — the
+        // parser is what puts both formats on the same project-relative axis.
+        let top = by_key(&pkgs, "typescript");
+        assert_eq!(top.dest_rel, Path::new("node_modules/typescript"));
+        assert_eq!(registry_of(top), ("typescript", "5.4.5"));
+
+        let nested = by_key(&pkgs, "@mesofact/runtime/typescript");
+        assert_eq!(
+            nested.dest_rel,
+            Path::new("node_modules/@mesofact/runtime/node_modules/typescript")
+        );
+        assert_eq!(registry_of(nested), ("typescript", "5.0.4"));
+
+        let link = by_key(&pkgs, "@mesofact/runtime");
+        assert_eq!(link.dest_rel, Path::new("node_modules/@mesofact/runtime"));
+        match &link.source {
+            PackageSource::Link { target_rel } => {
+                assert_eq!(target_rel, Path::new("packages/runtime"))
+            }
+            PackageSource::Registry { .. } => panic!("file: dep parsed as a registry fetch"),
+        }
+    }
+
+    /// R771-F1: the integrity is the store key as well as the verification,
+    /// so a registry entry without one is refused at parse time on the bun
+    /// path too (it used to be fetched and installed unverified).
+    #[test]
+    fn bun_lock_refuses_a_registry_entry_without_integrity() {
+        let (_tmp, path) = lock_file(
+            "bun.lock",
+            r#"{
+              "lockfileVersion": 1,
+              "packages": { "typescript": ["typescript@5.4.5", "", {}] }
+            }"#,
+        );
+        let msg = parse_bun_lock(&path).unwrap_err().to_string();
+        assert!(msg.contains("typescript"), "{msg}");
+        assert!(msg.contains("integrity"), "{msg}");
+    }
+
+    #[test]
+    fn bun_lock_wins_when_a_project_carries_both_locks() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package-lock.json"), "{}").unwrap();
+        assert!(matches!(detect_lockfile(tmp.path()).unwrap(), Lockfile::Npm(_)));
+        std::fs::write(tmp.path().join("bun.lock"), "{}").unwrap();
+        assert!(matches!(detect_lockfile(tmp.path()).unwrap(), Lockfile::Bun(_)));
+    }
+
+    #[test]
+    fn workspace_links_are_written_relative() {
+        assert_eq!(
+            relative_from(Path::new("/p/node_modules/@e2e"), Path::new("/p/docs")),
+            Path::new("../../docs")
+        );
+        assert_eq!(
+            relative_from(Path::new("/p/node_modules"), Path::new("/p/node_modules/x")),
+            Path::new("x")
+        );
+        assert_eq!(relative_from(Path::new("/p/a"), Path::new("/p/a")), Path::new("."));
+        assert_eq!(relative_from(Path::new("/p/node_modules"), Path::new("/q")), Path::new("../../q"));
+    }
+
+    #[test]
+    fn link_package_writes_a_relocatable_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/package.json"), "{}").unwrap();
+        let dest = root.join("node_modules/@e2e/docs");
+        link_package(&dest, &root.join("docs")).unwrap();
+        assert_eq!(std::fs::read_link(&dest).unwrap(), Path::new("../../docs"));
+        assert!(dest.join("package.json").exists(), "the relative link does not resolve");
+    }
+
+    #[test]
+    fn no_lockfile_names_both_formats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let msg = format!("{:#}", detect_lockfile(tmp.path()).unwrap_err());
+        assert!(msg.contains("bun.lock") && msg.contains("package-lock.json"), "{msg}");
     }
 }

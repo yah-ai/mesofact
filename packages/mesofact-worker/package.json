@@ -1,6 +1,6 @@
 {
   "name": "@mesofact/worker",
-  "version": "0.1.0",
+  "version": "0.8.29",
   "description": "Bun render-pool worker — UDS server speaking the mesofact IPC protocol. Internal to mesofact; not published.",
   "license": "MIT OR Apache-2.0",
   "private": true,

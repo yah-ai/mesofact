@@ -51,7 +51,7 @@
 // calls its framework's hydrate (see contract.ts).
 
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   escapeJsonForScriptTag,
@@ -143,9 +143,12 @@ export async function prerender(
         );
       }
 
-      const key = prerenderKey(input.route, params);
+      const key = prerenderKey(input.route, url);
       const htmlPath = `dist/html/${key}.html`;
-      await writeFile(join(htmlDir, `${key}.html`), html, "utf8");
+      const outPath = join(htmlDir, `${key}.html`);
+      // `key` is path-shaped ("issues/<id>"), so the emission may be nested.
+      await mkdir(dirname(outPath), { recursive: true });
+      await writeFile(outPath, html, "utf8");
 
       const combined = new Set<string>([...(result.cache.tags ?? []), ...ctx.tags]);
       emissions.push({

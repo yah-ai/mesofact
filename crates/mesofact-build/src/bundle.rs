@@ -129,6 +129,63 @@ pub async fn bundle_server_entrypoints(
     Ok(outputs)
 }
 
+/// One bundled Mode 2 hook module (R756-F6).
+pub struct HookBundle {
+    pub name: String,
+    /// Manifest `hooks[name].entrypoint` value (`dist/server/hooks/<name>.js`).
+    pub server_path: String,
+    /// Absolute path, for the post-bundle shape assertion.
+    pub absolute_path: PathBuf,
+}
+
+/// Bundle each declared Mode 2 hook to `dist/server/hooks/<name>.js` (R756-F6).
+///
+/// Same bundler terms as a route entrypoint — it runs in the same isolate —
+/// but a separate subdirectory, so a hook can never collide with a route whose
+/// `route_key` happens to be `readyz`. Routes and hooks are different
+/// namespaces and the emitted tree says so.
+pub async fn bundle_hooks(
+    project_root: &Path,
+    out_dir: &Path,
+    inputs: &BTreeMap<String, String>, // name → entrypoint
+) -> Result<Vec<HookBundle>> {
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let hooks_dir = out_dir.join("server").join("hooks");
+    std::fs::create_dir_all(&hooks_dir)?;
+
+    let mut outputs = Vec::new();
+    for (name, entrypoint) in inputs {
+        let abs_entry = project_root.join(entrypoint);
+        let options = BundlerOptions {
+            input: Some(vec![InputItem {
+                name: Some(name.clone()),
+                import: abs_entry.to_string_lossy().into_owned(),
+            }]),
+            dir: Some(hooks_dir.to_string_lossy().into_owned()),
+            platform: Some(Platform::Browser),
+            external: Some(IsExternal::from(vec!["@mesofact/runtime".to_string()])),
+            entry_filenames: Some(ChunkFilenamesOutputOption::String("[name].js".to_string())),
+            ..base_options(project_root)
+        };
+        let assets = run_bundler(options, &format!("hook {name}")).await?;
+        let entry = assets
+            .iter()
+            .find_map(|a| match a {
+                Output::Chunk(c) if c.is_entry => Some(c),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow!("bundle for hook {name} produced no entry-point output"))?;
+        outputs.push(HookBundle {
+            name: name.clone(),
+            server_path: format!("dist/server/hooks/{name}.js"),
+            absolute_path: hooks_dir.join(entry.filename.as_str()),
+        });
+    }
+    Ok(outputs)
+}
+
 /// Bundle each client entrypoint to `dist/hydrate/<key>.<hash>.js` with
 /// code splitting. `@mesofact/runtime` is NOT external here (parity with
 /// bundle.ts — client code must not touch the server adapter registry).

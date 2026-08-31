@@ -25,15 +25,24 @@
 //                              optional; absent/invalid → one attempt, no timeout
 //   MESOFACT_BACKEND_ORIGIN  — almanac surface; /api/releases* proxied here
 //   ISSUES_ORIGIN            — issue-tracker surface; /api/issues* proxied here
+//   ROUTE_HEADERS            — JSON `[{ path, headers }]`, the domain manifest's
+//                              per-route response headers in manifest order (see
+//                              `applyRouteHeaders`); optional, absent → no-op
 //
-// Manifest-driven behavior on a static miss (W270 §3):
-//   * a path matching an instance-addressed (deferred) route resolves through
-//     the pointer store — present → render-root bytes (immutable cache), deleted
-//     → 410, absent → the manifest's error_routes.404 page;
+// Manifest-driven behavior:
+//   * PAGE requests resolve against the build tree the manifest's `build_id`
+//     points at (`<build_id>/html/<key>`) before the flat copy at the prefix
+//     root — the site-level root pointer, which is what makes a revalidate
+//     visible at the edge at all (yah R330-B44);
+//   * on a static miss, a path matching an instance-addressed (deferred) route
+//     resolves through the pointer store — present → render-root bytes
+//     (immutable cache), deleted → 410, absent → the manifest's
+//     error_routes.404 page;
 //   * error_routes.{404,5xx} are honored (branded pages), replacing the old
 //     hardcoded plaintext 404.
 
 import {
+  buildPageRoot,
   loadManifest,
   matchesDeferredRoute,
   type EdgeErrorRoutes,
@@ -51,6 +60,14 @@ interface Env {
   SSR_RESILIENCE?: string;
   MESOFACT_BACKEND_ORIGIN?: string;
   ISSUES_ORIGIN?: string;
+  ROUTE_HEADERS?: string;
+}
+
+/** One entry of the `ROUTE_HEADERS` table — mirrors `DomainRoute` in
+ *  `oss/yubaba/crates/cloud/src/config.rs` (path + its `headers` map). */
+interface RouteHeaderRule {
+  path: string;
+  headers: Record<string, string>;
 }
 
 // W181 v1 schema mirror — see oss/mesofact/packages/mesofact-runtime/src/routes.ts.
@@ -72,123 +89,178 @@ type ResilienceMap = Record<string, ResiliencePolicy>;
 // immutable — the pointer is the only mutable object.
 const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
 
+// A page served out of the build tree is bytes at an IMMUTABLE url (they are
+// published `public, max-age=86400`, correct for `<build_id>/html/x.html`) being
+// served at a MUTABLE one (`/x`, whose content changes when the pointer moves).
+// Passing the object's own header through would let a client hold a day-old
+// release page after a revalidate, which is the freshness bug this indirection
+// exists to fix, reintroduced one layer down.
+const PAGE_CACHE_CONTROL = "no-cache";
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
-    const path = url.pathname;
-    const resilience = parseResilience(env.SSR_RESILIENCE);
+    // Route first, then stamp the matching route's declared response headers
+    // onto whatever came back. Wrapping the whole router — rather than each
+    // `return` inside it — is what makes the guarantee total: a header a
+    // domain declares for a path applies to the asset hit, the clean-URL hit,
+    // the SPA shell, the branded 404 and the SSR proxy alike. A header set
+    // that only held on the happy path would be worse than none for the case
+    // that motivated this (COOP/COEP: a document served without them silently
+    // loses SharedArrayBuffer instead of failing loudly).
+    const resp = await route(request, env);
+    return applyRouteHeaders(resp, new URL(request.url).pathname, env.ROUTE_HEADERS);
+  },
+};
 
-    // Backend API routing (R455-T4): /api/issues* → ISSUES_ORIGIN,
-    // /api/releases* → MESOFACT_BACKEND_ORIGIN. Takes priority over SSR
-    // routing so pond/prod paths hit the backend container directly.
-    if (env.ISSUES_ORIGIN && path.startsWith("/api/issues")) {
-      const target =
-        env.ISSUES_ORIGIN +
-        "/issues" +
-        path.slice("/api/issues".length) +
-        url.search;
+/** The router proper. Every `return` here is post-processed by
+ *  [`applyRouteHeaders`] in the exported `fetch` above. */
+async function route(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const path = url.pathname;
+  const resilience = parseResilience(env.SSR_RESILIENCE);
+
+  // Backend API routing (R455-T4): /api/issues* → ISSUES_ORIGIN,
+  // /api/releases* → MESOFACT_BACKEND_ORIGIN. Takes priority over SSR
+  // routing so pond/prod paths hit the backend container directly.
+  if (env.ISSUES_ORIGIN && path.startsWith("/api/issues")) {
+    const target =
+      env.ISSUES_ORIGIN +
+      "/issues" +
+      path.slice("/api/issues".length) +
+      url.search;
+    return proxyWithResilience(request, target, policyFor(resilience, path));
+  }
+  if (env.MESOFACT_BACKEND_ORIGIN && path.startsWith("/api/releases")) {
+    const target =
+      env.MESOFACT_BACKEND_ORIGIN +
+      "/releases" +
+      path.slice("/api/releases".length) +
+      url.search;
+    return proxyWithResilience(request, target, policyFor(resilience, path));
+  }
+
+  // SSR: proxy matching prefixes to origin
+  if (env.WORKER_MODE === "ssr" && env.SSR_ORIGIN) {
+    let prefixes: string[] = [];
+    try {
+      prefixes = JSON.parse(env.SSR_PREFIXES);
+    } catch {
+      // malformed JSON — fall through to asset serving
+    }
+    // Segment-aware match (W173): exact prefix OR descendant under prefix.
+    // Naive `path.startsWith(p)` would proxy /api/healthcheck to an
+    // /api/health origin — bytes match, segments don't.
+    const matched = prefixes.find(
+      (p) => path === p || path.startsWith(p.endsWith("/") ? p : p + "/"),
+    );
+    if (matched) {
+      const target = env.SSR_ORIGIN + path + url.search;
       return proxyWithResilience(request, target, policyFor(resilience, path));
     }
-    if (env.MESOFACT_BACKEND_ORIGIN && path.startsWith("/api/releases")) {
-      const target =
-        env.MESOFACT_BACKEND_ORIGIN +
-        "/releases" +
-        path.slice("/api/releases".length) +
-        url.search;
-      return proxyWithResilience(request, target, policyFor(resilience, path));
-    }
+  }
 
-    // SSR: proxy matching prefixes to origin
-    if (env.WORKER_MODE === "ssr" && env.SSR_ORIGIN) {
-      let prefixes: string[] = [];
-      try {
-        prefixes = JSON.parse(env.SSR_PREFIXES);
-      } catch {
-        // malformed JSON — fall through to asset serving
-      }
-      // Segment-aware match (W173): exact prefix OR descendant under prefix.
-      // Naive `path.startsWith(p)` would proxy /api/healthcheck to an
-      // /api/health origin — bytes match, segments don't.
-      const matched = prefixes.find(
-        (p) => path === p || path.startsWith(p.endsWith("/") ? p : p + "/"),
-      );
-      if (matched) {
-        const target = env.SSR_ORIGIN + path + url.search;
-        return proxyWithResilience(request, target, policyFor(resilience, path));
-      }
-    }
-
-    // Dynamic user content (R490-T8): /uploads/* routes to UPLOAD_ORIGIN,
-    // separate from the build-output static assets on ASSET_ORIGIN. No writer
-    // exists yet — the binding is a reserved seam; absent → clean 404, and a
-    // miss is a real 404 (never the SPA shell or 404.html, which belong to the
-    // static site). Segment-aware: the trailing slash keeps /uploadsfoo out.
-    if (path.startsWith("/uploads/")) {
-      if (!env.UPLOAD_ORIGIN) {
-        return new Response("Not Found", { status: 404 });
-      }
-      const uploadResp = await fetch(`${env.UPLOAD_ORIGIN}/${path.slice(1)}`);
-      if (uploadResp.ok) {
-        return uploadResp;
-      }
+  // Dynamic user content (R490-T8): /uploads/* routes to UPLOAD_ORIGIN,
+  // separate from the build-output static assets on ASSET_ORIGIN. No writer
+  // exists yet — the binding is a reserved seam; absent → clean 404, and a
+  // miss is a real 404 (never the SPA shell or 404.html, which belong to the
+  // static site). Segment-aware: the trailing slash keeps /uploadsfoo out.
+  if (path.startsWith("/uploads/")) {
+    if (!env.UPLOAD_ORIGIN) {
       return new Response("Not Found", { status: 404 });
     }
-
-    // Resolve asset key from URL path
-    let key: string;
-    if (path === "/" || path.endsWith("/")) {
-      key = (path === "/" ? "" : path.slice(1)) + "index.html";
-    } else {
-      key = path.slice(1);
+    const uploadResp = await fetch(`${env.UPLOAD_ORIGIN}/${path.slice(1)}`);
+    if (uploadResp.ok) {
+      return uploadResp;
     }
+    return new Response("Not Found", { status: 404 });
+  }
 
-    // Fetch from asset origin — the common (build-time HTML/asset) hit.
-    const assetResp = await fetch(`${env.ASSET_ORIGIN}/${key}`);
-    if (assetResp.ok) {
-      return assetResp;
-    }
+  // Resolve asset key from URL path
+  let key: string;
+  if (path === "/" || path.endsWith("/")) {
+    key = (path === "/" ? "" : path.slice(1)) + "index.html";
+  } else {
+    key = path.slice(1);
+  }
 
-    // ── static miss ──────────────────────────────────────────────────────────
-    // Only here (never on the static-hit fast path) do we consult the published
-    // manifest, so static-heavy sites pay nothing for the manifest fetch.
-    const manifest = await loadManifest(env.ASSET_ORIGIN);
-
-    // Instance-addressed (deferred) route → resolve through the pointer store.
-    if (matchesDeferredRoute(manifest, path)) {
-      return serveInstance(env, path, manifest);
-    }
-
-    // Clean-URL resolution: an extensionless path (e.g. `/releases`) maps to
-    // its prerendered static asset — try `<key>.html` then `<key>/index.html`,
-    // the same convention the error-page resolver uses (routeToAssetKeys).
-    // This is what lets build-time-static routes serve without a trailing
-    // slash or explicit `.html`. Deferred/instance routes are handled above,
-    // so they keep priority; assets that already carry an extension (fetched
-    // verbatim on the fast path) never reach here.
-    const lastSegment = key.slice(key.lastIndexOf("/") + 1);
-    if (!lastSegment.includes(".")) {
-      for (const candidate of [`${key}.html`, `${key}/index.html`]) {
-        const cleanResp = await fetch(`${env.ASSET_ORIGIN}/${candidate}`);
-        if (cleanResp.ok) {
-          return cleanResp;
+  // ── build-pointer resolution (R330-B44) ──────────────────────────────────
+  // A page is served from the build tree the root manifest points at, in
+  // preference to the flat copy at the prefix root. Both exist: `publish_dist`
+  // writes `<build_id>/html/<key>` and swaps the pointer, while the older flat
+  // publishers write `<key>` directly and never sweep what they replaced.
+  //
+  // Reading the pointer is what makes a push actually land. The revalidate
+  // receiver re-renders a route and publishes a NEW build tree — so an edge
+  // that only ever reads the flat copy shows the last flat publish forever,
+  // and every revalidate is a no-op no matter how correct its output. That is
+  // exactly what froze yah.dev/releases: the data was fresh in R2, the render
+  // was correct on the node, and the page never moved.
+  //
+  // Scoped to PAGE requests on purpose. Hashed bundles and images are
+  // content-addressed and byte-identical in both layouts, so pointer
+  // indirection buys them nothing and would cost every one of them a manifest
+  // fetch — and they are the bulk of a static site's requests.
+  let manifest: EdgeManifest | null = null;
+  let manifestLoaded = false;
+  if (isPageKey(key)) {
+    manifest = await loadManifest(env.ASSET_ORIGIN);
+    manifestLoaded = true;
+    const pageRoot = buildPageRoot(manifest);
+    if (pageRoot) {
+      for (const candidate of assetCandidates(key)) {
+        const resp = await fetch(`${env.ASSET_ORIGIN}/${pageRoot}/${candidate}`);
+        if (resp.ok) {
+          return routePage(resp);
         }
       }
     }
+  }
 
-    // static → error page; spa/ssr → index.html shell (client-side routing).
-    if (env.WORKER_MODE === "static") {
-      return errorResponse(404, env.ASSET_ORIGIN, manifest?.error_routes);
+  // Fetch from asset origin — the common (build-time HTML/asset) hit.
+  const assetResp = await fetch(`${env.ASSET_ORIGIN}/${key}`);
+  if (assetResp.ok) {
+    return assetResp;
+  }
+
+  // ── static miss ──────────────────────────────────────────────────────────
+  // Asset requests still reach the manifest only here, so a site of hashed
+  // bundles pays for it exactly once per miss rather than once per request.
+  if (!manifestLoaded) {
+    manifest = await loadManifest(env.ASSET_ORIGIN);
+  }
+
+  // Instance-addressed (deferred) route → resolve through the pointer store.
+  if (matchesDeferredRoute(manifest, path)) {
+    return serveInstance(env, path, manifest);
+  }
+
+  // Clean-URL resolution: an extensionless path (e.g. `/releases`) maps to
+  // its prerendered static asset — try `<key>.html` then `<key>/index.html`,
+  // the same convention the error-page resolver uses (routeToAssetKeys).
+  // This is what lets build-time-static routes serve without a trailing
+  // slash or explicit `.html`. Deferred/instance routes are handled above,
+  // so they keep priority; assets that already carry an extension (fetched
+  // verbatim on the fast path) never reach here.
+  for (const candidate of assetCandidates(key).slice(1)) {
+    const cleanResp = await fetch(`${env.ASSET_ORIGIN}/${candidate}`);
+    if (cleanResp.ok) {
+      return cleanResp;
     }
-    const shellResp = await fetch(`${env.ASSET_ORIGIN}/index.html`);
-    if (shellResp.ok) {
-      return new Response(shellResp.body, {
-        status: 200,
-        headers: shellResp.headers,
-      });
-    }
+  }
+
+  // static → error page; spa/ssr → index.html shell (client-side routing).
+  if (env.WORKER_MODE === "static") {
     return errorResponse(404, env.ASSET_ORIGIN, manifest?.error_routes);
-  },
-};
+  }
+  const shellResp = await fetch(`${env.ASSET_ORIGIN}/index.html`);
+  if (shellResp.ok) {
+    return new Response(shellResp.body, {
+      status: 200,
+      headers: shellResp.headers,
+    });
+  }
+  return errorResponse(404, env.ASSET_ORIGIN, manifest?.error_routes);
+}
 
 /**
  * Serve an instance-addressed route (`prerender: { deferred: true }`) by
@@ -267,22 +339,144 @@ async function errorResponse(
 }
 
 /**
+ * True when `key` addresses a page rather than a build asset — extensionless
+ * (a clean URL) or an explicit `.html`.
+ *
+ * This is the gate on pointer resolution, so it decides which requests pay a
+ * manifest fetch. Pages are the only mutable output: everything else the
+ * builder emits is content-hashed, so it is byte-identical in the flat and
+ * build-scoped layouts and gains nothing from the indirection.
+ */
+function isPageKey(key: string): boolean {
+  const last = key.slice(key.lastIndexOf("/") + 1);
+  return !last.includes(".") || last.endsWith(".html");
+}
+
+/**
+ * The ordered asset keys a request may resolve to — the clean-URL rule shared
+ * by build-tree lookup, flat lookup, and the error-page resolver: a key that
+ * already carries an extension is taken verbatim, an extensionless one also
+ * tries `<key>.html` then `<key>/index.html`.
+ *
+ * One producer on purpose. These three call sites each grew their own copy of
+ * this rule, and a fourth layout (the build tree) is exactly the kind of change
+ * that makes divergent copies disagree about what a clean URL means.
+ *
+ * The write-side twin is `prerenderKey`
+ * (packages/mesofact-build/src/route-key.ts, ported in
+ * crates/mesofact-render/src/route_key.rs): it names each emitted page by the
+ * public path it serves at, precisely so this function's candidates find it.
+ * R600-B1 was those two disagreeing — do not teach this function any
+ * route-pattern rule; move the write instead.
+ */
+function assetCandidates(key: string): string[] {
+  const last = key.slice(key.lastIndexOf("/") + 1);
+  if (last.includes(".")) return [key];
+  return [key, `${key}.html`, `${key}/index.html`];
+}
+
+/** Re-header a build-tree page for service at its stable route. */
+function routePage(resp: Response): Response {
+  const headers = new Headers(resp.headers);
+  headers.set("Cache-Control", PAGE_CACHE_CONTROL);
+  return new Response(resp.body, { status: resp.status, headers });
+}
+
+/**
  * Resolve a route path (`/404`, `/errors/nf`) to the ordered asset keys a
- * prerendered static route emits — the same clean-URL rule the static-serving
- * paths use: extensionless routes try `<rel>.html` and `<rel>/index.html`.
+ * prerendered static route emits.
  */
 function routeToAssetKeys(routePath: string): string[] {
   const rel = routePath.replace(/^\/+/, "");
   if (rel === "") return ["index.html"];
-  const last = rel.split("/").pop() ?? "";
-  if (last.includes(".")) return [rel];
-  return [rel, `${rel}.html`, `${rel}/index.html`];
+  return assetCandidates(rel);
 }
 
 function defaultStatusText(status: number): string {
   if (status === 410) return "Gone";
   if (status >= 500) return "Internal Server Error";
   return "Not Found";
+}
+
+// ── per-route response headers ──────────────────────────────────────────────
+//
+// The domain manifest is the only place that knows about path routing, so it is
+// also where a path's *response headers* belong — not in a `_headers` file (a
+// Pages/Netlify convention no Worker reads) and not hardcoded here for one
+// site's needs. `ROUTE_HEADERS` carries that table verbatim, in manifest order;
+// the producer is `DomainConfig::route_headers_json` in
+// oss/yubaba/crates/cloud/src/config.rs.
+//
+// FIRST MATCH WINS, with no merging across rules — the same rule the manifest
+// already states for routing ("vec order = match order, first match wins"). One
+// path therefore has one header set, decided where the route was decided.
+
+/** Statuses whose responses must carry a null body (constructing one with a
+ *  body throws in workerd). */
+const NULL_BODY_STATUS = new Set([101, 103, 204, 205, 304]);
+
+/** Memoized parse of the `ROUTE_HEADERS` binding — the value is fixed for the
+ *  isolate's lifetime, so re-parsing it per request buys nothing. */
+let routeHeaderCache: { raw: string; rules: RouteHeaderRule[] } | undefined;
+
+function applyRouteHeaders(
+  resp: Response,
+  path: string,
+  raw: string | undefined,
+): Response {
+  const matched = parseRouteHeaders(raw).find((r) =>
+    matchesRoutePattern(r.path, path),
+  );
+  if (!matched) return resp;
+  const entries = Object.entries(matched.headers);
+  if (entries.length === 0) return resp;
+  const headers = new Headers(resp.headers);
+  for (const [name, value] of entries) headers.set(name, value);
+  return new Response(NULL_BODY_STATUS.has(resp.status) ? null : resp.body, {
+    status: resp.status,
+    statusText: resp.statusText,
+    headers,
+  });
+}
+
+function parseRouteHeaders(raw: string | undefined): RouteHeaderRule[] {
+  if (!raw) return [];
+  if (routeHeaderCache?.raw === raw) return routeHeaderCache.rules;
+  let rules: RouteHeaderRule[] = [];
+  try {
+    const v: unknown = JSON.parse(raw);
+    if (Array.isArray(v)) rules = v.filter(isRouteHeaderRule);
+  } catch {
+    // Malformed binding — serve without extra headers rather than 500 every
+    // request. The Rust side serializes this, so a malformed value is a bug
+    // there, and a dead site is a worse symptom than a missing header.
+    rules = [];
+  }
+  routeHeaderCache = { raw, rules };
+  return rules;
+}
+
+function isRouteHeaderRule(v: unknown): v is RouteHeaderRule {
+  if (!v || typeof v !== "object") return false;
+  const r = v as RouteHeaderRule;
+  return typeof r.path === "string" && !!r.headers && typeof r.headers === "object";
+}
+
+/**
+ * Match a domain-manifest route pattern against a request path.
+ *
+ * `"/*"` matches everything. `"/app/*"` matches `/app`, `/app/` and everything
+ * below — segment-aware (so `/apple` stays out), the same rule SSR_PREFIXES
+ * uses above, and deliberately including the BARE prefix: `/app` is the URL a
+ * link points at, it resolves to `app/index.html` through the clean-URL rule,
+ * and a header set that skipped it would miss the very document it exists for.
+ * Any pattern without a trailing `*` is an exact path match.
+ */
+function matchesRoutePattern(pattern: string, path: string): boolean {
+  if (!pattern.endsWith("*")) return path === pattern;
+  const prefix = pattern.slice(0, -1).replace(/\/+$/, "");
+  if (prefix === "") return true;
+  return path === prefix || path.startsWith(prefix + "/");
 }
 
 function parseResilience(raw: string | undefined): ResilienceMap {

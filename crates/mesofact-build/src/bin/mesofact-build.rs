@@ -34,7 +34,8 @@ enum Command {
         #[arg(long)]
         no_install: bool,
     },
-    /// Install the locked dependency closure (bun.lock) into node_modules.
+    /// Install the locked dependency closure (bun.lock, package-lock.json
+    /// v2/v3, or pnpm-lock.yaml v9) into node_modules.
     Install { project: PathBuf },
     /// Full TypeScript semantic pass via the project's `tsc` (native 10x
     /// checker with typescript@7). Cadence-agnostic — QED / CI / humans decide

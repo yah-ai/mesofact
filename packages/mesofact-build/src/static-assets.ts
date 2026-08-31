@@ -50,6 +50,14 @@ const CONTENT_TYPES: Record<string, string> = {
   ".otf": "font/otf",
   ".pdf": "application/pdf",
   ".webmanifest": "application/manifest+json",
+  // Load-bearing for every WASM site: WebAssembly.instantiateStreaming REJECTS
+  // any response whose Content-Type isn't exactly application/wasm.
+  // wasm-bindgen's loader catches that, warns "your server does not serve Wasm
+  // with application/wasm MIME type", and falls back to arrayBuffer() +
+  // instantiate() — which buffers the whole module before compilation starts
+  // instead of compiling as it streams. Keep in lockstep with the Rust mirror
+  // (R821-B1).
+  ".wasm": "application/wasm",
 };
 
 export function contentTypeFor(relPath: string): string {

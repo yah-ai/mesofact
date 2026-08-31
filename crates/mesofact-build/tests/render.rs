@@ -26,15 +26,15 @@ fn build_native(fixture: &str, out: &Path) -> mesofact_build::pipeline::BuildRes
 }
 
 /// Publish-once instance: `/p/:id` enumerated ids 1 and 2 at build time;
-/// rendering id=3 afterwards emits a brand-new `p_id__3.html` without a
+/// rendering id=3 afterwards emits a brand-new `p/3.html` without a
 /// rebuild — the deferred-param shape a share slug needs.
 #[test]
 fn renders_new_param_instance_without_rebuild() {
     let tmp = tempfile::tempdir().unwrap();
     let dist = tmp.path().join("native");
     build_native("static-only", &dist);
-    assert!(dist.join("html/p_id__1.html").exists());
-    assert!(!dist.join("html/p_id__3.html").exists());
+    assert!(dist.join("html/p/1.html").exists());
+    assert!(!dist.join("html/p/3.html").exists());
 
     let mut params = BTreeMap::new();
     params.insert("id".to_string(), "3".to_string());
@@ -48,14 +48,14 @@ fn renders_new_param_instance_without_rebuild() {
     })
     .expect("render of new instance");
 
-    assert_eq!(outcome.key, "p_id__3");
+    assert_eq!(outcome.key, "p/3");
     assert_eq!(outcome.url, "/p/3");
     assert!(outcome.html.contains("<h1>3</h1>"), "html: {}", outcome.html);
     assert_eq!(outcome.tags, vec!["page:3".to_string()]);
-    let on_disk = std::fs::read_to_string(dist.join("html/p_id__3.html")).unwrap();
+    let on_disk = std::fs::read_to_string(dist.join("html/p/3.html")).unwrap();
     assert_eq!(on_disk, outcome.html);
     // The build-time instances are untouched.
-    assert!(dist.join("html/p_id__1.html").exists());
+    assert!(dist.join("html/p/1.html").exists());
 }
 
 /// Revalidate: `/releases` renders against explicit fresh data (the shape
@@ -122,15 +122,11 @@ fn deferred_route_builds_empty_and_renders_instances_at_publish_time() {
     let dist = tmp.path().join("native");
     let result = build_native("prerender-deferred", &dist);
 
-    // Build emitted the literal route but zero instances of /c/:slug.
+    // Build emitted the literal route but zero instances of /c/:slug. Those
+    // land under `html/c/` now that emissions are path-shaped, so the absence
+    // is the absence of that directory.
     assert!(dist.join("html/index.html").exists());
-    let leftovers: Vec<_> = std::fs::read_dir(dist.join("html"))
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("c_slug"))
-        .collect();
-    assert!(leftovers.is_empty(), "unexpected build-time instances: {leftovers:?}");
+    assert!(!dist.join("html/c").exists(), "unexpected build-time instances under html/c");
 
     // The server bundle + instance-addressed manifest entry exist.
     assert!(dist.join("server/c_slug.js").exists());
@@ -159,11 +155,11 @@ fn deferred_route_builds_empty_and_renders_instances_at_publish_time() {
     })
     .expect("publish-time instance render");
 
-    assert_eq!(outcome.key, "c_slug__abc123");
+    assert_eq!(outcome.key, "c/abc123");
     assert_eq!(outcome.url, "/c/abc123");
     assert!(outcome.html.contains("<h1>Hello Chat</h1>"), "html: {}", outcome.html);
     assert_eq!(outcome.tags, vec!["chat:abc123".to_string()]);
-    assert!(dist.join("html/c_slug__abc123.html").exists());
+    assert!(dist.join("html/c/abc123.html").exists());
 }
 
 /// The revalidate verb (`--all`): a feed change re-expands the instance set
@@ -175,8 +171,8 @@ fn render_all_reexpands_instances_from_fresh_data() {
     let tmp = tempfile::tempdir().unwrap();
     let dist = tmp.path().join("native");
     build_native("prerender-from-data", &dist);
-    assert!(dist.join("html/items_id__a.html").exists());
-    assert!(!dist.join("html/items_id__c.html").exists());
+    assert!(dist.join("html/items/a.html").exists());
+    assert!(!dist.join("html/items/c.html").exists());
 
     // Simulate the feed change: a re-titled, c added.
     let fresh_root = tmp.path().join("proj");
@@ -195,9 +191,9 @@ fn render_all_reexpands_instances_from_fresh_data() {
     .expect("all-instances revalidate render");
 
     assert_eq!(outcomes.len(), 3);
-    let a = std::fs::read_to_string(dist.join("html/items_id__a.html")).unwrap();
+    let a = std::fs::read_to_string(dist.join("html/items/a.html")).unwrap();
     assert!(a.contains("Alpha v2"), "a not re-rendered with fresh data: {a}");
-    let c = std::fs::read_to_string(dist.join("html/items_id__c.html")).unwrap();
+    let c = std::fs::read_to_string(dist.join("html/items/c.html")).unwrap();
     assert!(c.contains("Charlie"), "new instance c missing: {c}");
 }
 

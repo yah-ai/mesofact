@@ -1,0 +1,18 @@
+# Workload manifest — what a deploy tool reads about this project.
+#
+# Only needed for the DEPLOY path (`yah cloud bundle build`, which reads
+# `build.out_dir` + `routes` from here). The local loop —
+# `mesofact-build build .` then `mesofact-dev . --port 3000` — reads
+# mesofact.routes.ts directly and does not need this file at all.
+
+schema_version = 1
+kind = "mesofact-static"
+
+# `routes` is a TOP-LEVEL field. It must stay above [build] — TOML would scope
+# it into that table otherwise, and the manifest would parse with no routes
+# (R658-B1).
+routes = "./mesofact.routes.ts"
+
+[build]
+command = "mesofact-build build ."
+out_dir = "dist"

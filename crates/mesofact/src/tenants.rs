@@ -32,6 +32,8 @@
 //!   - `mirror_key` absent/empty, or matching no tenant → **403** (a tenant with
 //!     no configured bearer is unroutable — reject, never open; multi-tenant has
 //!     no "open" mode because the bearer *is* the tenant selector).
+//!   - an explicit `route` outside the matched tenant's `routes` allowlist →
+//!     **403** (scoping, not authentication — see [`TenantFile::routes`]).
 //!   - a `data_inputs` key that escapes the workload → **400**.
 //!   - matched → enqueue a [`TenantJob`] for that tenant's workload +
 //!     publish_config → **202**.
@@ -63,7 +65,15 @@ use tracing::{error, info, warn};
 use crate::revalidate::{check_data_input_paths, revalidate_once, DataInputs};
 
 /// On-disk shape of one `tenants/<id>.toml` file.
+///
+/// `deny_unknown_fields` on purpose: every optional key here (`mirror_key_env`,
+/// `routes`) fails *open-ish* when absent — no bearer means unroutable, no
+/// routes means unrestricted. A typo (`route = [...]`, `mirror_key = "…"`)
+/// would therefore not error, it would silently produce a tenant the operator
+/// believes is scoped or authenticated and isn't. Rejecting the key is the only
+/// place that mistake is visible.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TenantFile {
     /// Tenant id; must match the filename stem (enforced by [`load_tenants`]).
     pub id: String,
@@ -76,6 +86,18 @@ pub struct TenantFile {
     /// the tenant is unroutable (no poke can select it). Never a literal secret.
     #[serde(default)]
     pub mirror_key_env: Option<String>,
+    /// Route allowlist for this tenant. Empty = every render-eligible route in
+    /// its own manifest.
+    ///
+    /// Same two-place enforcement, and the same reasoning, as the single-tenant
+    /// [`crate::revalidate::RevalidateConfig::routes`] (yah R752-B7): an
+    /// explicit out-of-list route is refused 403, a whole-site poke is NARROWED
+    /// to the list. This is scoping, not authentication — the bearer already
+    /// bounds a poke to one tenant's workload; `routes` bounds it further
+    /// *within* that workload, so a compromised bearer still cannot re-render
+    /// (and republish) a surface the deployment never declared pokeable.
+    #[serde(default)]
+    pub routes: Vec<String>,
 }
 
 /// A tenant with its bearer resolved for the running process.
@@ -86,6 +108,8 @@ pub struct ResolvedTenant {
     pub mirror_key: Option<String>,
     pub workload: PathBuf,
     pub publish_config: PathBuf,
+    /// See [`TenantFile::routes`]. Empty = unrestricted within this tenant.
+    pub routes: Vec<String>,
 }
 
 /// A validated poke routed to a specific tenant, handed from the HTTP handler to
@@ -98,8 +122,14 @@ pub struct TenantJob {
     pub tenant_id: String,
     pub workload: PathBuf,
     pub publish_config: PathBuf,
-    /// The route to revalidate; `None` = every render-eligible route.
+    /// The route to revalidate; `None` = every render-eligible route *within
+    /// [`Self::allow`]*.
     pub route: Option<String>,
+    /// The tenant's route allowlist, carried on the job rather than looked up
+    /// again in the worker — the job is already a self-contained copy of
+    /// everything the render needs, and re-reading the registry there would let
+    /// the enforced scope drift from the scope the handler checked.
+    pub allow: Vec<String>,
     /// Render inputs the poke carried, written into the tenant's workload
     /// before the render. Empty = render from what is on disk.
     pub data_inputs: DataInputs,
@@ -123,6 +153,51 @@ impl TenantRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.tenants.is_empty()
+    }
+
+    /// Every registered tenant, routable or not — for startup logging and
+    /// operator introspection.
+    pub fn tenants(&self) -> &[ResolvedTenant] {
+        &self.tenants
+    }
+
+    /// Reject a registry that cannot route unambiguously. Separate from
+    /// [`Self::new`] so tests and introspection can build any registry they
+    /// like; the binary calls this before serving.
+    ///
+    /// Two tenants sharing a resolved bearer is the dangerous case:
+    /// [`Self::tenant_for`] returns the first match, so one tenant silently
+    /// absorbs every poke meant for the other — and absorbing a poke means
+    /// rendering *its* workload and publishing to *its* bucket. That is
+    /// cross-tenant publication caused by config alone, with a 202 on the wire
+    /// and nothing in the logs to distinguish it from success. Duplicate ids are
+    /// rejected in the same pass because [`load_tenants`] pins id to filename
+    /// stem, so a duplicate can only come from a hand-built registry — but an id
+    /// is what every log line and error message identifies a tenant by.
+    ///
+    /// Errors name the ids, never the bearer.
+    pub fn validate(&self) -> Result<()> {
+        let mut by_id: BTreeMap<&str, usize> = BTreeMap::new();
+        for t in &self.tenants {
+            *by_id.entry(t.id.as_str()).or_default() += 1;
+        }
+        if let Some((id, _)) = by_id.iter().find(|(_, n)| **n > 1) {
+            anyhow::bail!("duplicate tenant id {id:?} in the registry");
+        }
+
+        let mut by_key: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for t in &self.tenants {
+            if let Some(key) = t.mirror_key.as_deref() {
+                by_key.entry(key).or_default().push(t.id.as_str());
+            }
+        }
+        if let Some((_, ids)) = by_key.iter().find(|(_, ids)| ids.len() > 1) {
+            anyhow::bail!(
+                "tenants {} resolve to the same bearer — pokes for one would publish to the other",
+                ids.join(", ")
+            );
+        }
+        Ok(())
     }
 
     /// Select the tenant a poke's bearer authorizes. An empty/absent bearer
@@ -167,6 +242,7 @@ where
                 mirror_key,
                 workload: f.workload,
                 publish_config: f.publish_config,
+                routes: f.routes,
             }
         })
         .collect()
@@ -233,14 +309,30 @@ struct RevalidateBody {
     data_inputs: DataInputs,
 }
 
-/// Build the multi-tenant receiver router: `POST /revalidate` routes by bearer,
-/// `GET /__mesofact/health` for readiness. Decoupled from the render/publish
-/// worker via `tx` so it is unit-testable without V8 or a network publish —
-/// same split the single-tenant [`crate::revalidate`] receiver uses.
+/// Build the multi-tenant receiver router: `POST /dawn` routes by bearer, plus
+/// the [`crate::health`] probes. Decoupled from the render/publish worker via
+/// `tx` so it is unit-testable without V8 or a network publish — same split the
+/// single-tenant [`crate::revalidate`] receiver uses.
+///
+/// Readiness is unconditional for the same reason as the single-tenant
+/// receiver: no isolate, no served tree. Note that it is *not* per-tenant — a
+/// registry entry with a broken workload does not take the whole process out of
+/// rotation, and shouldn't, since every other tenant on it still renders.
 pub fn router(tx: mpsc::Sender<TenantJob>, registry: Arc<TenantRegistry>) -> Router {
+    router_with_health(tx, registry, crate::Health::ready())
+}
+
+pub fn router_with_health(
+    tx: mpsc::Sender<TenantJob>,
+    registry: Arc<TenantRegistry>,
+    health: Arc<crate::Health>,
+) -> Router {
     Router::new()
+        // Same two paths as the single-tenant receiver (yah R752-T10): `/dawn`
+        // is the name, `/revalidate` is the transitional alias kept because
+        // deployed callers roll separately from the receiver.
+        .route("/dawn", post(revalidate_handler))
         .route("/revalidate", post(revalidate_handler))
-        .route("/__mesofact/health", axum::routing::get(|| async { "ok" }))
         // This router accepts `data_inputs` exactly like the single-tenant one,
         // and it is the shape a runner actually hosts — so it needs the same
         // STATED limit rather than axum's inherited 2 MiB default. Sharing the
@@ -249,6 +341,8 @@ pub fn router(tx: mpsc::Sender<TenantJob>, registry: Arc<TenantRegistry>) -> Rou
         // on the next. See [`crate::revalidate::MAX_REVALIDATE_BODY_BYTES`].
         .layer(DefaultBodyLimit::max(crate::revalidate::MAX_REVALIDATE_BODY_BYTES))
         .with_state(ReceiverState { tx, registry })
+        // After `with_state` — see the note in `crate::revalidate::router`.
+        .merge(crate::health::probe_routes(health))
 }
 
 async fn revalidate_handler(
@@ -260,6 +354,22 @@ async fn revalidate_handler(
         return StatusCode::FORBIDDEN;
     };
 
+    // Scope check, after tenant selection because the allowlist is per-tenant.
+    // 403 rather than 404 for the same reason as the single-tenant receiver: the
+    // route may well exist on that tenant's site; what the caller lacks is
+    // authority over it (yah R752-B7).
+    if let Some(ref route) = body.route {
+        if !tenant.routes.is_empty() && !tenant.routes.iter().any(|a| a == route) {
+            warn!(
+                tenant = %tenant.id,
+                route = %route,
+                allowed = %tenant.routes.join(", "),
+                "revalidate rejected — route outside this tenant's allowlist",
+            );
+            return StatusCode::FORBIDDEN;
+        }
+    }
+
     if let Err(e) = check_data_input_paths(&body.data_inputs) {
         warn!(tenant = %tenant.id, err = %e, "revalidate rejected — bad data_inputs path");
         return StatusCode::BAD_REQUEST;
@@ -270,6 +380,7 @@ async fn revalidate_handler(
         workload: tenant.workload.clone(),
         publish_config: tenant.publish_config.clone(),
         route: body.route,
+        allow: tenant.routes.clone(),
         data_inputs: body.data_inputs,
     };
     info!(
@@ -302,9 +413,31 @@ pub async fn serve(
         tenants = registry.len(),
         "mesofact serve revalidate receiver starting (multi-tenant, ephemeral render → publish)",
     );
+    // One line per tenant, for the same reason the single-tenant receiver logs
+    // its resolved allowlist: "which routes may this poke touch" is the first
+    // question when a poke returned 202 and nothing changed, and on a
+    // multi-tenant runner the answer differs per tenant.
+    for t in registry.tenants() {
+        info!(
+            tenant = %t.id,
+            workload = %t.workload.display(),
+            publish_config = %t.publish_config.display(),
+            routable = t.mirror_key.is_some(),
+            allowed_routes = %if t.routes.is_empty() { "<all>".to_string() } else { t.routes.join(", ") },
+            "tenant registered",
+        );
+    }
+    // Not fatal — the binary already refuses an empty registry, and a single
+    // tenant whose bearer env is missing should not take its co-tenants down —
+    // but it must be loud: this process will 403 every poke and still pass
+    // /readyz.
+    if !registry.is_empty() && registry.tenants().iter().all(|t| t.mirror_key.is_none()) {
+        warn!("no tenant has a resolved bearer — every poke will be rejected 403");
+    }
 
     let (tx, mut rx) = mpsc::channel::<TenantJob>(16);
-    let app = router(tx, Arc::new(registry));
+    let health = crate::Health::ready();
+    let app = router_with_health(tx, Arc::new(registry), health.clone());
 
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
@@ -314,6 +447,11 @@ pub async fn serve(
                 &job.publish_config,
                 job.route.clone(),
                 &job.data_inputs,
+                // The tenant's own allowlist. The handler already refused an
+                // explicit out-of-list route; this second pass is what NARROWS a
+                // whole-site poke (`route: None`) to the declared list, exactly
+                // as the single-tenant receiver does (yah R752-B7).
+                &job.allow,
             )
             .await
             {
@@ -335,7 +473,10 @@ pub async fn serve(
         .await
         .with_context(|| format!("multi-tenant revalidate receiver: binding to {addr}"))?;
     info!(%addr, "multi-tenant revalidate receiver listening");
+    // Same drain the single-tenant receiver gained: HTTP side only, worker task
+    // still cut on signal. See `crate::revalidate::serve`.
     axum::serve(listener, app)
+        .with_graceful_shutdown(crate::shutdown_signal_for(health))
         .await
         .context("multi-tenant revalidate receiver: server error")?;
     Ok(())
@@ -356,6 +497,14 @@ mod tests {
             mirror_key: key.map(String::from),
             workload: PathBuf::from(format!("/app/{id}")),
             publish_config: PathBuf::from(format!("/app/{id}/mesofact.config.toml")),
+            routes: Vec::new(),
+        }
+    }
+
+    fn scoped(id: &str, key: &str, routes: &[&str]) -> ResolvedTenant {
+        ResolvedTenant {
+            routes: routes.iter().map(|s| (*s).to_string()).collect(),
+            ..tenant(id, Some(key))
         }
     }
 
@@ -394,6 +543,35 @@ mod tests {
     }
 
     #[test]
+    fn validate_accepts_a_well_formed_registry() {
+        two_tenant_registry().validate().unwrap();
+        // Several unroutable tenants are NOT duplicates of each other: `None` is
+        // "no bearer", not a bearer value they share.
+        TenantRegistry::new(vec![tenant("a", None), tenant("b", None)])
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_two_tenants_sharing_a_bearer() {
+        let reg = TenantRegistry::new(vec![
+            tenant("a", Some("s3cr3t-bearer")),
+            tenant("b", Some("s3cr3t-bearer")),
+        ]);
+        let err = format!("{:#}", reg.validate().unwrap_err());
+        assert!(err.contains("a, b"), "{err}");
+        // The bearer itself must not reach the log an operator pastes into chat.
+        assert!(!err.contains("s3cr3t-bearer"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_ids() {
+        let reg = TenantRegistry::new(vec![tenant("dup", Some("k1")), tenant("dup", Some("k2"))]);
+        let err = format!("{:#}", reg.validate().unwrap_err());
+        assert!(err.contains("duplicate tenant id"), "{err}");
+    }
+
+    #[test]
     fn tenant_without_bearer_is_unroutable() {
         let reg = TenantRegistry::new(vec![tenant("t", None)]);
         assert!(reg.tenant_for(None).is_none());
@@ -415,9 +593,82 @@ mod tests {
                 workload: PathBuf::from("/app/yah-marketing"),
                 publish_config: PathBuf::from("/app/yah-marketing/mesofact.config.toml"),
                 route: Some("/releases".into()),
+                allow: Vec::new(),
                 data_inputs: DataInputs::new(),
             }
         );
+    }
+
+    // ── Per-tenant route allowlist (R446, mirroring yah R752-B7) ─────────────
+
+    fn scoped_registry() -> Arc<TenantRegistry> {
+        Arc::new(TenantRegistry::new(vec![
+            scoped("yah-marketing", "key-mkt", &["/releases"]),
+            // Unrestricted: an allowlist on one tenant must not leak onto another.
+            tenant("acme", Some("key-acme")),
+        ]))
+    }
+
+    #[tokio::test]
+    async fn route_outside_the_tenants_allowlist_is_403_and_does_not_enqueue() {
+        let (tx, mut rx) = mpsc::channel::<TenantJob>(4);
+        let app = router(tx, scoped_registry());
+        let resp = post_json(app, r#"{"route":"/pricing","mirror_key":"key-mkt"}"#).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(rx.try_recv().is_err(), "a refused poke must not enqueue");
+    }
+
+    #[tokio::test]
+    async fn route_inside_the_tenants_allowlist_carries_it_onto_the_job() {
+        let (tx, mut rx) = mpsc::channel::<TenantJob>(4);
+        let app = router(tx, scoped_registry());
+        let resp = post_json(app, r#"{"route":"/releases","mirror_key":"key-mkt"}"#).await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let job = rx.try_recv().unwrap();
+        assert_eq!(job.tenant_id, "yah-marketing");
+        // The worker re-applies it to narrow whole-site pokes; if it did not
+        // travel on the job, the enforced scope would be "<all>".
+        assert_eq!(job.allow, vec!["/releases".to_string()]);
+    }
+
+    /// The allowlist is per-tenant, not per-process: a route one tenant refuses
+    /// is still fine for a tenant that declared none. A shared runner must not
+    /// let one tenant's scoping narrow another's.
+    #[tokio::test]
+    async fn one_tenants_allowlist_does_not_bind_another_tenant() {
+        let (tx, mut rx) = mpsc::channel::<TenantJob>(4);
+        let app = router(tx, scoped_registry());
+        let resp = post_json(app, r#"{"route":"/pricing","mirror_key":"key-acme"}"#).await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let job = rx.try_recv().unwrap();
+        assert_eq!(job.tenant_id, "acme");
+        assert!(job.allow.is_empty());
+    }
+
+    /// A whole-site poke is NARROWED rather than refused — the handler admits
+    /// it and the list rides along for the worker to intersect. Same "empty =
+    /// all routes reads the same from both ends" rule as the single-tenant
+    /// receiver.
+    #[tokio::test]
+    async fn whole_site_poke_at_a_scoped_tenant_is_accepted_and_carries_the_scope() {
+        let (tx, mut rx) = mpsc::channel::<TenantJob>(4);
+        let app = router(tx, scoped_registry());
+        let resp = post_json(app, r#"{"mirror_key":"key-mkt"}"#).await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let job = rx.try_recv().unwrap();
+        assert_eq!(job.route, None);
+        assert_eq!(job.allow, vec!["/releases".to_string()]);
+    }
+
+    /// An unknown bearer is refused before the allowlist is ever consulted —
+    /// a caller must not be able to probe which routes a tenant declares.
+    #[tokio::test]
+    async fn allowlist_is_not_reachable_without_a_valid_bearer() {
+        let (tx, mut rx) = mpsc::channel::<TenantJob>(4);
+        let app = router(tx, scoped_registry());
+        let resp = post_json(app, r#"{"route":"/releases","mirror_key":"intruder"}"#).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(rx.try_recv().is_err());
     }
 
     /// A payload-carrying poke reaches the right tenant with its data intact —
@@ -496,6 +747,7 @@ id = "yah-marketing"
 workload = "/app/yah-marketing"
 publish_config = "/app/yah-marketing/mesofact.config.toml"
 mirror_key_env = "MESOFACT_TENANT_YAH_MARKETING_KEY"
+routes = ["/releases"]
 "#;
 
     #[test]
@@ -514,6 +766,27 @@ mirror_key_env = "MESOFACT_TENANT_YAH_MARKETING_KEY"
             files.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
             vec!["acme", "yah-marketing"]
         );
+        // `routes` is optional: omitted (acme) = unrestricted, declared
+        // (yah-marketing) = exactly that list, and it survives to ResolvedTenant.
+        assert!(files[0].routes.is_empty());
+        assert_eq!(files[1].routes, vec!["/releases".to_string()]);
+        let resolved = resolve_tenants(files, |_| Some("k".to_string()));
+        assert!(resolved[0].routes.is_empty());
+        assert_eq!(resolved[1].routes, vec!["/releases".to_string()]);
+    }
+
+    /// A misspelled optional key must not read as "unset" — `route` instead of
+    /// `routes` would otherwise yield a tenant with no allowlist at all.
+    #[test]
+    fn an_unknown_key_fails_loud() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "acme.toml",
+            "id = \"acme\"\nworkload = \"/app/acme\"\npublish_config = \"/app/acme/c.toml\"\nroute = [\"/releases\"]\n",
+        );
+        let err = format!("{:#}", load_tenants(tmp.path()).unwrap_err());
+        assert!(err.contains("route"), "{err}");
     }
 
     #[test]
