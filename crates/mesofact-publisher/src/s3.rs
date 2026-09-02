@@ -180,10 +180,15 @@ impl ObjectStore for S3Store {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
+        let cache_control = headers
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         Ok(Some(ObjectMeta {
             content_hash,
             content_type,
             size,
+            cache_control,
         }))
     }
 

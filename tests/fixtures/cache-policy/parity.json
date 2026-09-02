@@ -1,0 +1,100 @@
+{
+  "routes": [
+    { "route": "/", "cache_policy": { "ttl": 0 } },
+    { "route": "/issues", "cache_policy": { "ttl": 3600, "swr": 86400 } },
+    { "route": "/app", "requires": ["user"], "cache_policy": { "ttl": 60 } },
+    { "route": "/c/:slug", "cache_policy": { "ttl": 120 } },
+    {
+      "route": "/lang",
+      "cache_policy": { "ttl": 60, "vary": ["accept-language", "cookie"] }
+    },
+    { "route": "/revalidate", "cache_policy": { "ttl": 0, "swr": 60 } },
+    { "route": "/deep/:x", "cache_policy": { "ttl": 0 } },
+    { "route": "/deep/one", "cache_policy": { "ttl": 45 } },
+    { "route": "/nf", "cache_policy": { "ttl": 600, "negative_ttl": 30 } }
+  ],
+  "cases": [
+    {
+      "name": "the declared ttl is the one that ships",
+      "path": "/issues",
+      "cache_control": "public, max-age=3600, stale-while-revalidate=86400"
+    },
+    {
+      "name": "an inert policy declares nothing",
+      "path": "/",
+      "cache_control": null
+    },
+    {
+      "name": "an undeclared path declares nothing",
+      "path": "/nowhere",
+      "cache_control": null
+    },
+    {
+      "name": "a gated route is private, never public",
+      "path": "/app",
+      "cache_control": "private, max-age=60"
+    },
+    {
+      "name": "a param instance inherits its pattern",
+      "path": "/c/abc123",
+      "cache_control": "public, max-age=120"
+    },
+    {
+      "name": "a param segment does not swallow extra segments",
+      "path": "/c/abc123/extra",
+      "cache_control": null
+    },
+    {
+      "name": "a param segment is required, not optional",
+      "path": "/c",
+      "cache_control": null
+    },
+    {
+      "name": "vary rides along with the cache-control it qualifies",
+      "path": "/lang",
+      "cache_control": "public, max-age=60",
+      "vary": "accept-language, cookie"
+    },
+    {
+      "name": "swr at ttl 0 is a declaration, not the absence of one",
+      "path": "/revalidate",
+      "cache_control": "public, max-age=0, stale-while-revalidate=60"
+    },
+    {
+      "name": "an earlier inert route does not shadow a later real one",
+      "path": "/deep/one",
+      "cache_control": "public, max-age=45"
+    },
+    {
+      "name": "the earlier inert route still declares nothing of its own",
+      "path": "/deep/two",
+      "cache_control": null
+    }
+  ],
+  "negative_cases": [
+    {
+      "name": "negative_ttl applies to a miss",
+      "path": "/nf",
+      "status": 404,
+      "cache_control": "public, max-age=30"
+    },
+    {
+      "name": "and to a gone",
+      "path": "/nf",
+      "status": 410,
+      "cache_control": "public, max-age=30"
+    },
+    {
+      "name": "a 500 is nobody's cache entry",
+      "path": "/nf",
+      "status": 500,
+      "cache_control": null
+    },
+    {
+      "name": "a route without negative_ttl caches no miss",
+      "path": "/issues",
+      "status": 404,
+      "cache_control": null
+    }
+  ]
+}

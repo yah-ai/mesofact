@@ -1,0 +1,64 @@
+{
+  "table": [
+    {
+      "path": "/app/*",
+      "headers": {
+        "Cross-Origin-Opener-Policy": "same-origin",
+        "Cross-Origin-Embedder-Policy": "require-corp"
+      }
+    },
+    { "path": "/*", "headers": { "X-Tier": "marketing" } }
+  ],
+  "assets": {
+    "index.html": { "body": "<h1>marketing</h1>", "type": "text/html" },
+    "app/index.html": { "body": "<h1>wasm app</h1>", "type": "text/html" },
+    "app/bundle.wasm": { "body": "\u0000asm", "type": "application/wasm" },
+    "404.html": { "body": "<h1>not found</h1>", "type": "text/html" }
+  },
+  "cases": [
+    {
+      "name": "the apex document takes the catch-all",
+      "path": "/",
+      "status": 200,
+      "expect": { "X-Tier": "marketing" },
+      "absent": ["Cross-Origin-Opener-Policy", "Cross-Origin-Embedder-Policy"]
+    },
+    {
+      "name": "the bare prefix is the URL a link points at",
+      "path": "/app",
+      "status": 200,
+      "expect": {
+        "Cross-Origin-Opener-Policy": "same-origin",
+        "Cross-Origin-Embedder-Policy": "require-corp"
+      },
+      "absent": ["X-Tier"]
+    },
+    {
+      "name": "subresources under the prefix are isolated too",
+      "path": "/app/bundle.wasm",
+      "status": 200,
+      "expect": {
+        "Cross-Origin-Opener-Policy": "same-origin",
+        "Cross-Origin-Embedder-Policy": "require-corp"
+      },
+      "absent": ["X-Tier"]
+    },
+    {
+      "name": "matching is segment-aware — /apple is not under /app/*",
+      "path": "/apple",
+      "status": 404,
+      "expect": { "X-Tier": "marketing" },
+      "absent": ["Cross-Origin-Opener-Policy"]
+    },
+    {
+      "name": "a 404 under the isolated prefix stays isolated",
+      "path": "/app/missing.js",
+      "status": 404,
+      "expect": {
+        "Cross-Origin-Opener-Policy": "same-origin",
+        "Cross-Origin-Embedder-Policy": "require-corp"
+      },
+      "absent": ["X-Tier"]
+    }
+  ]
+}

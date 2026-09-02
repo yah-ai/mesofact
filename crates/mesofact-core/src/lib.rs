@@ -6,14 +6,18 @@
 //! @yah:status(review)
 //! @yah:parent(R009)
 
+pub mod cache_policy;
 pub mod manifest;
+pub mod policy;
 pub mod proxy;
 pub mod validate;
 
+pub use cache_policy::CachePolicyTable;
 pub use manifest::{
     CachePolicy, ErrorRoutes, Hydration, Manifest, Prerender, Requires, Route, RouteMode,
     StaticAsset, MANIFEST_VERSION,
 };
+pub use policy::{check_manifest, PolicyCheckError, PolicyRefusal, PolicySupport, RoutePolicy};
 pub use proxy::cache::{compose_key, CacheEntry, CacheState, KeyInputs, ResponseCache};
 pub use proxy::session::{CookieSessionResolver, SessionResolver, User};
 pub use proxy::source_gen::Generations;

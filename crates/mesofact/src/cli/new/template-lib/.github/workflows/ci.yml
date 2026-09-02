@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: test
+        run: cargo test --release
+
+      # One command, no flags, and it emits BOTH binaries release-optimized.
+      # Dev/prod here is a link-graph distinction, never a build profile: you
+      # always build release, you always build both, and the binary you SHIP is
+      # the discriminator.
+      - name: build
+        run: cargo build --release
+
+      # Only the prod binary is published. `__PROJECT_NAME__-dev` was built a
+      # step ago and is deliberately left on the floor — it links a local
+      # object store and other dev affordances, and nothing outside a developer
+      # laptop should ever run it.
+      #
+      # If you add a deploy step, upload this same single path. The moment a
+      # glob (`target/release/__PROJECT_NAME__*`) appears here, the dev binary
+      # ships with it.
+      - name: upload the prod binary, and only the prod binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: __PROJECT_NAME__
+          path: target/release/__PROJECT_NAME__
+          if-no-files-found: error

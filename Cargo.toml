@@ -15,6 +15,20 @@ members = [
     "crates/mesofact-render",
     "crates/mesofact-ssr",
     "crates/mesofact",
+    # Stage 2 of R757, the npm resolver (W318 / R773). Two crates, split so the
+    # part that is plural is separable from the part that is npm: `jsget` knows
+    # which registries exist and how each spells a package name, `rnpm` knows
+    # the npm protocol and (from R773-F2 on) the resolution algorithm. WORKING
+    # TITLES — R757 names them on the way out, and both carry
+    # `publish = false` until it does.
+    #
+    # The dependency edge runs jsget -> rnpm -> (nothing in this workspace).
+    # `rnpm` must NOT gain a `mesofact-build` dependency: `mesofact-build` will
+    # consume `jsget`, so the reverse edge is a cycle. Tarball acquisition
+    # stays in `mesofact-build`'s `install.rs`/`store.rs`; the resolver's output
+    # is the `dist.integrity` + `dist.tarball` pair that path already takes.
+    "crates/jsget",
+    "crates/rnpm",
 ]
 resolver = "2"
 
@@ -24,7 +38,7 @@ resolver = "2"
 strip = true
 
 [workspace.package]
-version = "0.8.29"
+version = "0.8.30"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"

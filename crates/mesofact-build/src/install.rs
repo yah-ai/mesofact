@@ -34,6 +34,10 @@
 //! - **`file:` deps symlink** to their target, matching bun's behavior for
 //!   workspace-style links (`@mesofact/runtime`) and npm's `"link": true`
 //!   entries.
+//! - **Platform-gated entries are skipped.** A lock entry whose `os`/`cpu`
+//!   metadata excludes this host is dropped by [`host_supports`] rather than
+//!   fetched — the one deliberate omission the walk makes, and the reason a
+//!   `typescript@7` dep costs one 27 MB native compiler instead of twenty.
 //! - **Nothing is fetched unverified.** A registry entry with no sha512
 //!   integrity in the lock is refused by name, never downloaded on trust.
 //!   `PackageSource::Registry` carries the integrity as a required field, so
@@ -152,6 +156,82 @@ pub enum PackageSource {
     Link { target_rel: PathBuf },
 }
 
+/// This host's `(process.platform, process.arch)` — npm's spelling, which is
+/// not Rust's. The table lives in [`crate::check`], which needed it first to
+/// name TypeScript's per-platform native package; sharing it is deliberate,
+/// since an `os`/`cpu` lock field and a `@typescript/typescript-<os>-<arch>`
+/// directory name are the same vocabulary.
+///
+/// `None` on a host that table does not model. The gate then admits
+/// everything, which is the pre-R832-T4 behaviour — no pruning is a fatter
+/// install, but a wrong host name would be an *empty* one.
+pub(crate) fn host_platform_arch() -> Option<(&'static str, &'static str)> {
+    crate::check::node_platform_arch(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// Does an entry's `os` / `cpu` metadata admit this host?
+///
+/// **This is the one place the walk drops a lock entry on purpose** (R832-T4).
+/// The rest of the module installs everything the lock lists — `dev`,
+/// `optional` and `peer` alike — because pruning by *intent* is a resolution
+/// question. Pruning by *platform* is not: a package declaring `"os":
+/// "linux"` cannot execute here whatever the resolver decided, the lock states
+/// that itself, and npm/bun/pnpm all skip it. Installing them anyway was a
+/// wart this module's header used to admit to; `typescript@7` is what made it
+/// unaffordable, since it fans out to twenty native compilers at ~27 MB each
+/// and exactly one of them can run.
+///
+/// Absent fields admit everything, which is the overwhelmingly common case —
+/// this returns `true` for every ordinary package.
+fn host_supports(meta: &Value) -> bool {
+    let Some((os, cpu)) = host_platform_arch() else {
+        return true;
+    };
+    platform_field_admits(meta.get("os"), os) && platform_field_admits(meta.get("cpu"), cpu)
+}
+
+/// One `os`/`cpu` field against one host value. npm allows a bare string, an
+/// array, and `!`-negated entries (`["!win32"]` = anything but Windows); bun
+/// writes the string form, npm the array form, and both write the literal
+/// `"none"` for a platform they do not model — which matches nothing, as
+/// intended.
+fn platform_field_admits(field: Option<&Value>, host: &str) -> bool {
+    let Some(field) = field else {
+        return true;
+    };
+    let values: Vec<&str> = match field {
+        Value::String(s) => vec![s.as_str()],
+        Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+        // Anything else is metadata this walk does not understand; admitting
+        // it keeps an unknown shape from silently emptying an install.
+        _ => return true,
+    };
+    platform_admits(values, host)
+}
+
+/// The `os`/`cpu` list semantics themselves, over already-extracted strings:
+/// a plain entry is an allowlist member, a `!`-prefixed one is a denylist
+/// member, an exclusion beats an inclusion, and an empty list gates nothing.
+///
+/// `pub(crate)` so [`crate::pnpm`]'s gate is the same code rather than the
+/// same idea written twice — the two formats differ in how the list is spelled
+/// (a JSON field vs a YAML sequence), never in what it means.
+pub(crate) fn platform_admits<'a>(values: impl IntoIterator<Item = &'a str>, host: &str) -> bool {
+    let mut required = false;
+    let mut satisfied = false;
+    for v in values {
+        match v.strip_prefix('!') {
+            Some(excluded) if excluded == host => return false,
+            Some(_) => {}
+            None => {
+                required = true;
+                satisfied |= v == host;
+            }
+        }
+    }
+    !required || satisfied
+}
+
 pub(crate) fn parse_bun_lock(lock_path: &Path) -> Result<Vec<LockedPackage>> {
     let raw = std::fs::read_to_string(lock_path)
         .with_context(|| format!("reading {}", lock_path.display()))?;
@@ -209,6 +289,13 @@ pub(crate) fn parse_bun_lock(lock_path: &Path) -> Result<Vec<LockedPackage>> {
                 integrity,
             }
         };
+        // Platform gate. `meta` is the only object in the entry array, and it
+        // is where bun records `os` / `cpu` for a native optional.
+        if let Some(meta) = arr.iter().find(|v| v.is_object()) {
+            if !host_supports(meta) {
+                continue;
+            }
+        }
         // bun.lock keys are relative to the root node_modules; npm's are
         // relative to the project root, which is what the walk wants.
         out.push(LockedPackage {
@@ -339,10 +426,10 @@ fn package_name_from_key(key: &str) -> &str {
 ///   with the key and the fields it does carry in the message.
 ///
 /// Not filtered: `dev`, `optional` and `peer`. The bun.lock walk installs
-/// every entry the lock lists and this stays consistent with it — including
-/// the wart that a platform-gated optional (`os`/`cpu`) is fetched on every
-/// platform. Pruning is a resolution-shaped decision (which closure do you
-/// want?), not a materialization one.
+/// every entry the lock lists and this stays consistent with it — pruning by
+/// intent is a resolution-shaped decision (which closure do you want?), not a
+/// materialization one. Platform (`os`/`cpu`) IS filtered on both paths; see
+/// [`host_supports`] for why that one is different in kind.
 fn parse_package_lock(lock_path: &Path) -> Result<Vec<LockedPackage>> {
     let raw = std::fs::read_to_string(lock_path)
         .with_context(|| format!("reading {}", lock_path.display()))?;
@@ -377,6 +464,10 @@ fn parse_package_lock(lock_path: &Path) -> Result<Vec<LockedPackage>> {
             continue;
         }
         if flag("inBundle") {
+            continue;
+        }
+        // Platform gate — npm records `os` / `cpu` on the entry itself.
+        if !host_supports(entry) {
             continue;
         }
 
@@ -672,6 +763,72 @@ mod tests {
 
     // The base64 codec moved to `crate::store` with the integrity handling
     // that is its only caller (R771-F1); its vectors live there now.
+
+    /// The platform gate, stated against the host rather than a fixture: the
+    /// point is that exactly one of a native fan-out survives, whichever box
+    /// this runs on.
+    #[test]
+    fn the_platform_gate_admits_this_host_and_nothing_else() {
+        let (host_os, host_cpu) = host_platform_arch().expect("a host this table models");
+        assert!(host_supports(&serde_json::json!({ "os": host_os, "cpu": host_cpu })));
+
+        // A real `typescript@7.0.2` fan-out, verbatim from a bun.lock: twenty
+        // natives, one runnable. `"none"` is what bun writes for a platform it
+        // does not model, and it must match nothing.
+        let fan_out = [
+            ("darwin", "arm64"),
+            ("darwin", "x64"),
+            ("linux", "x64"),
+            ("linux", "arm64"),
+            ("linux", "none"),
+            ("win32", "x64"),
+            ("none", "arm64"),
+            ("aix", "ppc64"),
+        ];
+        let admitted = fan_out
+            .iter()
+            .filter(|(os, cpu)| host_supports(&serde_json::json!({ "os": os, "cpu": cpu })))
+            .count();
+        assert!(admitted <= 1, "{admitted} of a native fan-out claim to run here");
+    }
+
+    /// Absent metadata admits everything — the overwhelmingly common case, and
+    /// the one where a regression would empty an install rather than fatten it.
+    #[test]
+    fn the_platform_gate_is_silent_on_ordinary_packages() {
+        assert!(host_supports(&serde_json::json!({})));
+        assert!(host_supports(&serde_json::json!({ "bin": { "tsc": "bin/tsc" } })));
+        // Shapes the walk does not understand are admitted, not dropped.
+        assert!(host_supports(&serde_json::json!({ "os": 7 })));
+    }
+
+    /// npm's array form, including `!` negation, which bun never writes but a
+    /// `package-lock.json` does.
+    #[test]
+    fn the_platform_gate_reads_npms_array_form() {
+        assert!(platform_field_admits(Some(&serde_json::json!(["linux", "darwin"])), "darwin"));
+        assert!(!platform_field_admits(Some(&serde_json::json!(["linux"])), "darwin"));
+        assert!(platform_field_admits(Some(&serde_json::json!(["!win32"])), "darwin"));
+        assert!(!platform_field_admits(Some(&serde_json::json!(["!win32"])), "win32"));
+        assert!(platform_field_admits(None, "darwin"));
+        // A negation wins over a positive naming the same host: npm treats the
+        // exclusion list as authoritative.
+        assert!(!platform_field_admits(Some(&serde_json::json!(["darwin", "!darwin"])), "darwin"));
+    }
+
+    /// The gate and `check`'s native-package resolver must name the host
+    /// identically — they read the same vocabulary, and a divergence would
+    /// mean the installer drops the very compiler the checker then looks for.
+    #[test]
+    fn the_gate_names_the_host_the_way_check_does() {
+        let (os, cpu) = host_platform_arch().expect("a host this table models");
+        assert_eq!(
+            format!("typescript-{os}-{cpu}"),
+            crate::check::node_platform_arch(std::env::consts::OS, std::env::consts::ARCH)
+                .map(|(p, a)| format!("typescript-{p}-{a}"))
+                .unwrap()
+        );
+    }
 
     #[test]
     fn lock_keys_split_into_package_chains() {

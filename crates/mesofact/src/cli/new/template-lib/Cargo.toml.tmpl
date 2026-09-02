@@ -1,0 +1,45 @@
+# One crate, two binaries. This shape is W225 §2's "Consumer DX", and every
+# line of it is load-bearing.
+#
+# `src/lib.rs` is the core — `router()` and the handlers. The two targets under
+# `src/bin/` are three lines each over it, so there is exactly one route table
+# and no way for the dev and prod servers to disagree about what this service
+# does.
+
+[package]
+name = "__PROJECT_NAME__"
+version = "0.8.30"
+edition = "2021"
+publish = false
+
+[dependencies]
+# BOTH plain and non-optional. `cargo build --release` emits both binaries with
+# no flags, and the one you ship is the discriminator — never a build profile,
+# never a feature.
+#
+# Do not "simplify" this into one binary gated on a `dev` feature. Both horns
+# of that choice are bad: default-prod means you type `--features dev` on every
+# build, and default-dev means one forgotten `--no-default-features` ships a
+# binary with dev affordances in it. The two-bin pattern has no default mode to
+# get wrong.
+#
+# Prod stays clean because `src/lib.rs` depends on `mesofact` and never on
+# `mesofact-dev` — the prod binary's reachable graph cannot contain dev code.
+# Keep it that way: a `use mesofact_dev` in `lib.rs` is the one edit that
+# breaks this, and it breaks it silently.
+mesofact = "0.8.30"
+mesofact-dev = "0.8.30"
+
+# A caret requirement, not an `=` pin, and deliberately: these are Rust deps
+# under cargo's semver rules, so a patch release should reach you. (mesofact's
+# *JS* set is pinned exactly — that is the `mesofact new` standalone tier, a
+# different promise about a registry with different rules.)
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+anyhow = "1"
+serde_json = "1"
+tracing-subscriber = "0.3"
+
+[dev-dependencies]
+# `oneshot` — drive the router in a unit test without binding a port.
+tower = { version = "0.5", features = ["util"] }

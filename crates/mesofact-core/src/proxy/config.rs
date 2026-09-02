@@ -58,9 +58,74 @@ pub struct Config {
     /// Mode 2 LRU response-cache capacity (entries).
     #[arg(long, env = "MESOFACT_CACHE_CAPACITY", default_value_t = 4096)]
     pub cache_capacity: usize,
+
+    /// Assert that something in front of this process enforces a route policy
+    /// this tier does not (R749-T1). Comma-separated field names as written in
+    /// `mesofact.routes.ts`.
+    ///
+    /// The proxy tier's standing case is `resilience`: W181 puts retry/timeout
+    /// at the always-up edge (the CF Worker reads them from `SSR_RESILIENCE`),
+    /// and this process implements none of it. Deployed behind that Worker the
+    /// policy really is enforced — by the Worker — so the deployment says so
+    /// here. Run without one and the refusal is correct.
+    ///
+    /// Same spelling and semantics as `mesofact serve`'s flag on purpose: an
+    /// operator moving a workload between tiers should not have to learn a
+    /// second vocabulary for the same assertion.
+    #[arg(
+        long,
+        env = "MESOFACT_POLICY_DELEGATED",
+        value_delimiter = ',',
+        value_parser = parse_policy_field,
+    )]
+    pub policy_delegated: Vec<crate::policy::RoutePolicy>,
+}
+
+/// Parse one `--policy-delegated` field name. A typo is rejected rather than
+/// ignored: a delegation that silently does not apply is a fail-open with a
+/// flag in front of it.
+fn parse_policy_field(raw: &str) -> Result<crate::policy::RoutePolicy, String> {
+    crate::policy::RoutePolicy::parse(raw.trim()).ok_or_else(|| {
+        format!(
+            "unknown route policy {raw:?} — known policies are {}",
+            crate::policy::RoutePolicy::ALL
+                .iter()
+                .map(|p| p.field())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    })
 }
 
 impl Config {
+    /// What `mesofact proxy` implements, advertised (R749-T1). One place, and
+    /// each line has a code site behind it:
+    ///
+    ///   - `requires` — `proxy::router`'s `Requires::User` check, the only
+    ///     session-aware serving path in the system.
+    ///   - `cache_policy` — `proxy::cache::ResponseCache`, built in
+    ///     `cli::proxy::run`.
+    ///   - `concurrency` — the worker pool's per-route semaphore
+    ///     (`packages/mesofact-worker/src/pool.ts`, configured from the
+    ///     manifest at `worker.ts`'s `buildRouteHandlers`). W225 §2c records
+    ///     this row as unenforced everywhere; that is wrong, and the code above
+    ///     is why.
+    ///   - `resilience` — NOT enforced. Nothing in `mesofact-core` reads it;
+    ///     W181's only consumer is the CF Worker
+    ///     (`packages/mesofact-edge/src/router.ts`, from `SSR_RESILIENCE`).
+    ///     Delegate it when that Worker is in front.
+    pub fn policy_support(&self) -> crate::policy::PolicySupport {
+        use crate::policy::RoutePolicy;
+        let mut support = crate::policy::PolicySupport::new("mesofact proxy")
+            .enforces(RoutePolicy::Requires)
+            .enforces(RoutePolicy::CachePolicy)
+            .enforces(RoutePolicy::Concurrency);
+        for policy in &self.policy_delegated {
+            support = support.delegate(*policy);
+        }
+        support
+    }
+
     pub fn worker_count(&self) -> usize {
         self.workers
             .unwrap_or_else(|| (num_cpus::get() / 2).max(1))

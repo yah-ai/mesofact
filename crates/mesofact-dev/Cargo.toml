@@ -5,26 +5,63 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
-description = "Dev-tier affordances for mesofact workloads — rebuild-on-change watcher + a local S3 surface standing in for R2, plus the `mesofact-dev` binary. The serving engine lives in the `mesofact` facade; this crate must never be in a prod binary's dependency closure (W225 §2)."
+# PUBLISHABLE as of R832-T1 (was `publish = false`). W225 §2's library tier
+# prescribes a consumer manifest naming `mesofact` AND `mesofact-dev` as plain
+# non-optional deps; that manifest cannot resolve for anyone outside this
+# monorepo while this crate is unpublishable, which is why the tier was not
+# scaffoldable. `publish = false` was never a deliberate policy call — it was
+# present in the crate's first commit (0aa2077e, a bulk "fix oss links" commit
+# on 2026-06-11) with no rationale anywhere, at a time when this crate was a
+# static-file dev server nobody would depend on.
+#
+# `mesofact-dev` is unclaimed on crates.io (sparse index 404, checked
+# 2026-09-01; `mesofact` and `mesofact-publisher` are both there at 0.8.29).
+# Flipping this does not publish anything by itself — `scripts/oss-publish.sh`
+# is run by hand from a release recipe and simply stops excluding this member.
+#
+# Being publishable is a maintenance commitment: from the first upload this
+# crate's public API is a public API, and crates.io versions can only be
+# yanked, never withdrawn. Publishing it is what W225 §2 asks for; revert this
+# hunk before the next `oss-publish.sh` run if that answer changes.
+description = "Dev-tier affordances for mesofact workloads — a rebuild-on-change watcher, a local S3 surface standing in for R2, and `mesofact_dev::serve_app`, the dev half of a library-tier project's two bin targets. The serving engine lives in the `mesofact` facade; this crate must never be in a prod binary's dependency closure (W225 §2)."
 
 [lib]
 path = "src/lib.rs"
 
-# `mes` is the name. `mesofact-dev` is the same CLI under the old one, kept as
-# a transitional alias — see `src/bin/mesofact-dev.rs` for what still depends
-# on it and when it can go. Both are three lines over `cli::run`.
+# DESCRIPTIVE NAME WHERE YOU READ IT, SHORT NAME WHERE YOU TYPE IT (operator
+# decision, 2026-09-01). Cargo decouples package name from bin name; this crate
+# uses that deliberately, and the two halves have different jobs:
 #
-# The CRATE stays `mesofact-dev`. A dependency line reading `mes = "0.8"` tells
-# a reader nothing, and `mesofact`'s `cli/new/mod.rs` cites this crate's
-# unpublishability as blocker #1 for the library tier — if it ever publishes,
-# it should publish under the descriptive name. Cargo decouples package name
-# from bin name; use that. (`mes` is unclaimed on crates.io as of 2026-08-30 if
-# it is worth a placeholder, but that is a separate decision from this one.)
+# - The PACKAGE stays `mesofact-dev`, permanently — not as a legacy spelling of
+#   `mes`, which is how this comment used to read. It is the meta crate: the
+#   entrypoint to the collection of dev-tier tools `mes` needs that are NOT
+#   mesofact — the rebuild-on-change watcher, the local S3 surface standing in
+#   for R2, and `serve_app`. It DEPENDS ON the `mesofact` facade rather than
+#   being it, and that direction is the whole prod/dev boundary (W225 §2). A
+#   dependency line reading `mes = "0.8"` would say none of that.
+# - The BINARY is `mes`, and only `mes`. Nobody wants to type `mesofact-dev`
+#   as a command.
+#
+# END STATE (MFT-R822): this package emits **no binaries at all** — it becomes
+# a pure library, and a separate thin `mes` package owns the command. That is
+# not tidiness; `cargo install` takes a PACKAGE name, so while the binary lives
+# here `cargo install mes` fails outright and users must somehow know to type
+# `cargo install mesofact-dev`. Splitting makes the guessable command work and
+# avoids two packages racing to write `~/.cargo/bin/mes`.
+#
+# BOTH `[[bin]]` blocks below are therefore ON THE WAY OUT — see MFT-R822. Kept
+# for one deprecation cycle rather than deleted here because ~30 sites in the
+# parent camp resolve the string "mesofact-dev" as an executable name
+# (`crates/yah/plugin/src/source.rs` keys a builtin plugin manifest on it,
+# `crates/yah/bundled/src/lib.rs` registers it, `app/yah/desktop`'s version
+# store does `slot.bin("mesofact-dev")`), and — the sharp edge — ALREADY
+# INSTALLED store slots have a file of that name on disk, so removing it is a
+# migration and not a find-and-replace.
 [[bin]]
 name = "mes"
 path = "src/main.rs"
 
+# Transitional. Removal tracked by MFT-R822; do not add new callers.
 [[bin]]
 name = "mesofact-dev"
 path = "src/bin/mesofact-dev.rs"
@@ -91,9 +128,11 @@ serde_json = "1"
 toml = "0.8"
 # The serving engine. This crate is now a thin dev-affordance layer ON TOP of
 # the facade rather than the crate that owned the engine (W225 §2a).
-mesofact = { path = "../mesofact", version = "0.8.29", default-features = false }
+mesofact = { path = "../mesofact", version = "0.8.30", default-features = false }
 # Direct publisher dep for the dev-S3 round-trip test (drives S3Store itself).
-mesofact-publisher = { path = "../mesofact-publisher", optional = true }
+# `version` is required now that this crate publishes: cargo rejects a path dep
+# without one, since a path means nothing to a downstream consumer.
+mesofact-publisher = { path = "../mesofact-publisher", version = "0.8.30", optional = true }
 # HTTP client for the dev S3 round-trip. Loopback http://127.0.0.1 only — no TLS.
 reqwest = { version = "0.12", default-features = false }
 

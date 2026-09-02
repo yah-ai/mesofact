@@ -156,6 +156,63 @@ pub struct ServeArgs {
         value_parser = parse_truthy,
     )]
     trust_edge_auth: bool,
+
+    /// The domain manifest's **per-route response headers** (R749-F3, W334),
+    /// as the same JSON table the `@mesofact/edge` Worker receives in its
+    /// `ROUTE_HEADERS` binding: `[{"path": "/app/*", "headers": {…}}, …]`,
+    /// applied in manifest order, first match wins.
+    ///
+    /// Without this, a domain that declares headers loses them the moment its
+    /// `front_door` flips `worker` → `passway`, because this process is the
+    /// origin behind passway and had no equivalent of the Worker's table. The
+    /// motivating casualty is cross-origin isolation: drop `COOP`/`COEP` and
+    /// `SharedArrayBuffer` is undefined on the global object, so a wasm app is
+    /// served 200-OK and dead, with no server-side symptom at all.
+    ///
+    /// The env form is how the bundle tier sets it — kamaji forks `serve` with
+    /// a deploy-resolved env (`yah cloud apply` resolves the table from
+    /// `.yah/domains/` via `cloud::config::route_headers_for_service`), so this
+    /// rides the same channel the R2 credentials do rather than needing a new
+    /// argv flag threaded through three crates. Same reasoning as
+    /// [`ServeArgs::trust_edge_auth`] above.
+    ///
+    /// **A malformed table refuses the start** (R749-T1), naming the problem —
+    /// it does NOT degrade to serving without the headers the way the Worker's
+    /// `parseRouteHeaders` does. A declared policy the serving tier does not
+    /// enforce is a hard error; the Worker's catch-and-continue is right for a
+    /// cosmetic header and wrong for the isolation headers above. Empty or
+    /// unset reads as "no route headers configured" and serves normally.
+    #[arg(
+        long,
+        env = "MESOFACT_ROUTE_HEADERS",
+        default_value = "",
+        value_parser = parse_route_headers,
+    )]
+    route_headers: crate::RouteHeaderTable,
+
+    /// Assert that something in front of this process enforces a route policy
+    /// this binary does not (R749-T1) — the general form of
+    /// [`ServeArgs::trust_edge_auth`], which is now sugar for
+    /// `--policy-delegated requires`.
+    ///
+    /// Comma-separated field names as written in `mesofact.routes.ts`
+    /// (`requires`, `cache_policy`, `concurrency`, `resilience`). Without this,
+    /// a workload declaring a policy this tier does not implement makes `serve`
+    /// refuse to start, naming the route and the field.
+    ///
+    /// This is an assertion, not a downgrade: it can be wrong, and being wrong
+    /// still fails open. What it cannot be is silent — the claim is recorded in
+    /// the startup log as a delegation rather than as enforcement, so "the CDN
+    /// does the caching" is a sentence someone typed rather than an assumption
+    /// nobody wrote down. An unknown field name is rejected here rather than
+    /// ignored, since a typo'd delegation is a delegation that does not apply.
+    #[arg(
+        long,
+        env = "MESOFACT_POLICY_DELEGATED",
+        value_delimiter = ',',
+        value_parser = parse_policy_field,
+    )]
+    policy_delegated: Vec<mesofact_core::RoutePolicy>,
 }
 
 /// Parse a human/config truthy string. See [`ServeArgs::trust_edge_auth`].
@@ -167,6 +224,47 @@ fn parse_truthy(raw: &str) -> Result<bool, String> {
             "expected a boolean (1/true/yes/on or 0/false/no/off), got {other:?}"
         )),
     }
+}
+
+/// Parse the route-header table, failing the whole invocation on a malformed
+/// one. See [`ServeArgs::route_headers`].
+///
+/// Returning `Err` here is what turns "the deploy shipped a broken table" into
+/// a refused fork the operator sees, instead of a live site quietly serving
+/// without the policy it declared.
+fn parse_route_headers(raw: &str) -> Result<crate::RouteHeaderTable, String> {
+    crate::RouteHeaderTable::parse(raw).map_err(|e| format!("{e:#}"))
+}
+
+/// Parse one `--policy-delegated` field name. See [`ServeArgs::policy_delegated`].
+fn parse_policy_field(raw: &str) -> Result<mesofact_core::RoutePolicy, String> {
+    mesofact_core::RoutePolicy::parse(raw.trim()).ok_or_else(|| {
+        format!(
+            "unknown route policy {raw:?} — known policies are {}",
+            mesofact_core::RoutePolicy::ALL
+                .iter()
+                .map(|p| p.field())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    })
+}
+
+/// Attach [`ServeArgs::route_headers`] to a server, logging what was declared.
+///
+/// Every `serve` path funnels through here rather than calling
+/// [`Server::with_route_headers`] directly, so a new serving mode inherits the
+/// table (and the log line) instead of quietly starting without it. The log
+/// line matters on its own: "declared and enforced" is otherwise
+/// indistinguishable from "declared and dropped" from outside the process.
+fn with_declared_route_headers(server: Server, args: &ServeArgs) -> Server {
+    if !args.route_headers.is_empty() {
+        info!(
+            rules = args.route_headers.len(),
+            "applying the domain manifest's per-route response headers (MESOFACT_ROUTE_HEADERS)",
+        );
+    }
+    server.with_route_headers(args.route_headers.clone())
 }
 
 impl ServeArgs {
@@ -202,15 +300,22 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     if let Some(bundle) = args.bundle.as_ref() {
         let bundle_abs = bundle.canonicalize().unwrap_or_else(|_| bundle.clone());
         let server = Server::from_bundle(&bundle_abs)?;
-        // R556-B13: a bundle's app tree is `<bundle>/app`; its built route
-        // manifest is what declares the auth gate this binary cannot enforce.
-        assert_declared_auth_is_enforced(&bundle_abs.join("app"), args.trust_edge_auth)?;
+        // R556-B13 / R749-T1: a bundle's app tree is `<bundle>/app`; its built
+        // route manifest is what declares the policies this binary must either
+        // enforce or refuse.
+        let app = bundle_abs.join("app");
+        assert_declared_policy_is_enforced(&app, &serve_policy_support(&args))?;
         // R746-B7: a bundle can declare `mode:"ssr"` routes same as any other
         // workload. `Server::from_bundle` alone never attaches an isolate —
         // either attach one now (ssr feature) or refuse to serve routes this
         // binary cannot execute (static-only build), rather than silently
         // 404ing them one request at a time.
         let server = attach_bundle_ssr(server, &bundle_abs).await?;
+        // R749-F3: the domain manifest's declared response headers, on every
+        // response this bundle serves. The bundle tier is the passway origin —
+        // the front door this table used to be invisible to.
+        let server = with_declared_route_headers(server, &args);
+        let server = with_declared_cache_policy(server, &app)?;
         let idle_ttl = args.idle_ttl.filter(|s| *s > 0).map(Duration::from_secs);
 
         // Prefer an inherited socket-activation fd (kamaji's custodian handoff,
@@ -232,62 +337,114 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     run_workload_modes(args).await
 }
 
-/// R556-B13 — fail CLOSED on a route whose declared auth gate this binary does
-/// not enforce.
+/// What `mesofact serve` implements, advertised (R749-T1).
 ///
-/// `mesofact serve` has no session resolver. `requires: ["user"]` is checked
-/// only by `mesofact_core::proxy::router` (the `mesofact proxy` subcommand),
-/// and the W272 bundle tier forks `serve` — so before this, a route declaring
-/// the gate was served to anything that reached the port, with nothing in any
-/// log saying so. The manifest and the binary disagreed and the binary won
-/// silently.
+/// This is the one place the claim lives, and it is a claim about *this binary*
+/// — `#[cfg]`-sensitive, because a `--no-default-features` build genuinely
+/// enforces less than an `ssr` one. Editing it without a corresponding
+/// enforcement point is how the class this ticket closes comes back, so treat
+/// each line as an assertion with a code site behind it:
 ///
-/// The remedy is a *statement*, not a resolver: auth for these surfaces is an
-/// edge concern (passway terminates TLS and verifies cheers bearers), so the
-/// operator asserts the edge is there with `--trust-edge-auth` /
-/// `MESOFACT_TRUST_EDGE_AUTH`. Wiring a session resolver into `serve` instead
-/// would need more than calling the router — `mesofact_ssr::DispatchRequest`
-/// has no `user` field, so a resolved session has no channel into the V8
-/// isolate (W225 §2b, measured by R637).
+///   - `cache_policy` — [`crate::cache_headers`], since R749-T1.
+///   - `resilience` — the retry/timeout wrapper in [`crate::server`]'s SSR
+///     dispatch, `ssr` builds only. A static-only build has no isolate, so it
+///     refuses `mode:"ssr"` routes wholesale anyway.
+///   - `requires` — NOT enforced. `serve` has no session resolver; that check
+///     lives only in `mesofact_core::proxy::router`, and wiring one in needs
+///     more than calling the router (`mesofact_ssr::DispatchRequest` has no
+///     `user` field, so a resolved session has no channel into the isolate —
+///     W225 §2b, measured by R637). Delegated by `--trust-edge-auth`.
+///   - `concurrency` — NOT enforced, by anything in this binary.
+fn serve_policy_support(args: &ServeArgs) -> mesofact_core::PolicySupport {
+    use mesofact_core::RoutePolicy;
+    let mut support =
+        mesofact_core::PolicySupport::new("mesofact serve").enforces(RoutePolicy::CachePolicy);
+    #[cfg(feature = "ssr")]
+    {
+        support = support.enforces(RoutePolicy::Resilience);
+    }
+    if args.trust_edge_auth {
+        support = support.delegate(RoutePolicy::Requires);
+    }
+    for policy in &args.policy_delegated {
+        support = support.delegate(*policy);
+    }
+    support
+}
+
+/// R749-T1 — fail CLOSED on any route policy this binary will not honour, and
+/// R556-B13 as the case that motivated it.
 ///
-/// **Refusing to start** rather than 401-ing the route: a process that boots
+/// Before the general check, `requires: ["user"]` was served fail-open by this
+/// binary to anything that reached the port, with nothing in any log saying so:
+/// the manifest and the binary disagreed and the binary won silently. That was
+/// found by a human reading two files. The audit that followed (R746-S4, W225
+/// §2c) found two more of the same shape, so the remedy is the mechanism rather
+/// than a third one-off — see [`mesofact_core::policy`].
+///
+/// **Refusing to start** rather than degrading per route: a process that boots
 /// and serves is the state an operator reads as "deployed and fine", and a
-/// per-route 401 buried in a mixed site is easy to miss for weeks. A failed
-/// fork is not. The cost is that one declared-authed route takes down a site
-/// whose other routes are public — deliberate, and one flag away from being
-/// exactly what the operator meant.
-fn assert_declared_auth_is_enforced(
+/// per-route 401 (or a quietly-uncached page) buried in a mixed site is easy to
+/// miss for weeks. A failed fork is not. The cost is that one declared-authed
+/// route takes down a site whose other routes are public — deliberate, and one
+/// `--policy-delegated` away from being exactly what the operator meant.
+fn assert_declared_policy_is_enforced(
     workload: &std::path::Path,
-    trust_edge_auth: bool,
+    support: &mesofact_core::PolicySupport,
 ) -> anyhow::Result<()> {
-    let gated = crate::routes_requiring_user(workload).map_err(|e| {
+    let Some(raw) = crate::read_manifest_bytes(workload).map_err(|e| {
         anyhow::anyhow!(
-            "refusing to start: cannot read the route manifest under {} to check for \
-             declared-authed routes: {e}",
+            "refusing to start: cannot read the route manifest under {} to check for declared \
+             policy this binary does not enforce: {e}",
+            workload.display(),
+        )
+    })?
+    else {
+        // No built manifest is no declared routes — the pre-build / non-mesofact
+        // case, not a workload whose policies we failed to read.
+        return Ok(());
+    };
+    mesofact_core::check_manifest(&raw, support).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let delegated: Vec<&str> = support.delegated().map(|p| p.field()).collect();
+    if !delegated.is_empty() {
+        // Say it out loud, every start. A delegation is the one place this
+        // mechanism still permits a policy to be enforced by nothing at all, so
+        // the log line is what keeps "we asserted an edge is there" from
+        // decaying into "nobody remembers asserting anything".
+        info!(
+            policies = ?delegated,
+            enforced_here = ?support.enforced().map(|p| p.field()).collect::<Vec<_>>(),
+            "route policies asserted to be enforced IN FRONT of this process, not by it",
+        );
+    }
+    Ok(())
+}
+
+/// Attach the workload's declared `cache_policy` to a server (R749-T1).
+///
+/// Paired with [`serve_policy_support`]'s `enforces(CachePolicy)` claim: every
+/// `serve` path funnels through here, so the advertisement stays true by
+/// construction rather than by anyone remembering. A serving mode added without
+/// this call would advertise an enforcement it does not perform — the exact
+/// lie the check exists to catch, one layer up.
+fn with_declared_cache_policy(
+    server: Server,
+    workload: &std::path::Path,
+) -> anyhow::Result<Server> {
+    let table = crate::declared_cache_policy(workload).map_err(|e| {
+        anyhow::anyhow!(
+            "refusing to start: cannot read the route manifest under {} to derive the declared \
+             cache policy: {e}",
             workload.display(),
         )
     })?;
-    if gated.is_empty() {
-        return Ok(());
-    }
-    if trust_edge_auth {
+    if !table.is_empty() {
         info!(
-            routes = ?gated,
-            "serving routes that declare requires:[\"user\"] — this process does NOT enforce \
-             that gate; --trust-edge-auth asserts an authenticating edge is in front",
+            routes = table.len(),
+            "enforcing the manifest's declared cache_policy as response Cache-Control/Vary",
         );
-        return Ok(());
     }
-    anyhow::bail!(
-        "refusing to start: {} route(s) declare `requires: [\"user\"]` but `mesofact serve` \
-         does not enforce it — {}. That check lives only in `mesofact proxy`'s router, so \
-         serving these here would expose a confidential surface to anything that reaches the \
-         port. Either front this process with an authenticating edge (passway cheers-verify) \
-         and pass `--trust-edge-auth` / `MESOFACT_TRUST_EDGE_AUTH=1` to say so, or drop \
-         `requires` from the route if it was never meant to be gated.",
-        gated.len(),
-        gated.join(", "),
-    );
+    Ok(server.with_cache_policy(table))
 }
 
 /// Attach an SSR isolate to a bundle server, same as the SSR-host path does
@@ -319,26 +476,41 @@ async fn attach_bundle_ssr(server: crate::Server, bundle: &std::path::Path) -> a
 /// Static-only build (no V8): refuse rather than silently 404 every
 /// `mode:"ssr"` route in the bundle. R746-B7's minimum-acceptable interim —
 /// a loud refusal at apply time beats a 404 at request time that looks like a
-/// routing typo (same discipline `assert_declared_auth_is_enforced` /
+/// routing typo (same discipline `assert_declared_policy_is_enforced` /
 /// R330-B43 already paid for once).
 #[cfg(not(feature = "ssr"))]
 async fn attach_bundle_ssr(server: crate::Server, bundle: &std::path::Path) -> anyhow::Result<crate::Server> {
-    let app = bundle.join("app");
-    let ssr_routes = crate::routes_declaring_ssr(&app).map_err(|e| {
+    refuse_unservable_ssr_routes(&bundle.join("app"))?;
+    Ok(server)
+}
+
+/// R746-B7's refusal, factored out and applied to the plain-workload path too
+/// (R749-T1).
+///
+/// It was reachable only through `--bundle`, so `mesofact serve <workload>` on
+/// a static-only build logged "serving static only" and then 404'd every
+/// `mode:"ssr"` route one request at a time — the same silent no-op this
+/// ticket's whole mechanism exists to forbid, one axis over from a policy
+/// field. Found by running the real yah-marketing workload through the new
+/// check: it refused on `/api/issues`'s `resilience` block and, once that was
+/// delegated past, started and served `mode:"ssr"` routes it cannot execute.
+#[cfg(not(feature = "ssr"))]
+fn refuse_unservable_ssr_routes(workload: &std::path::Path) -> anyhow::Result<()> {
+    let ssr_routes = crate::routes_declaring_ssr(workload).map_err(|e| {
         anyhow::anyhow!(
             "refusing to start: cannot read the route manifest under {} to check for \
              mode:\"ssr\" routes: {e}",
-            app.display(),
+            workload.display(),
         )
     })?;
     if ssr_routes.is_empty() {
-        return Ok(server);
+        return Ok(());
     }
     anyhow::bail!(
         "refusing to start: {} route(s) declare mode:\"ssr\" ({}) but this `mesofact serve` \
          binary was built without the `ssr` feature (no V8) — it can only serve them as a 404. \
-         Serve this bundle with an ssr-enabled build (the shipped stock runtime is built \
-         `--features deploy`), or drop the ssr route(s) if this bundle is meant to be static.",
+         Serve this workload with an ssr-enabled build (the shipped stock runtime is built \
+         `--features deploy`), or drop the ssr route(s) if it is meant to be static.",
         ssr_routes.len(),
         ssr_routes.join(", "),
     );
@@ -467,10 +639,10 @@ async fn run_workload_modes(args: ServeArgs) -> anyhow::Result<()> {
     // against absolute paths regardless of the container's working directory.
     let workload_abs = workload.canonicalize().unwrap_or(workload);
 
-    // R556-B13. Checked on the SSR-host path too, not just the bundle tier:
-    // `mode: "ssr"` + `requires: ["user"]` is the exact shape the gate is for,
-    // and this path is the one that actually renders it.
-    assert_declared_auth_is_enforced(&workload_abs, args.trust_edge_auth)?;
+    // R556-B13 / R749-T1. Checked on the SSR-host path too, not just the bundle
+    // tier: `mode: "ssr"` + `requires: ["user"]` is the exact shape the gate is
+    // for, and this path is the one that actually renders it.
+    assert_declared_policy_is_enforced(&workload_abs, &serve_policy_support(&args))?;
 
     // Boot the SSR isolate against the already-built dist/. `ssr::spawn`
     // returns Ok(None) for static/SPA-only workloads (no `mode:"ssr"` route or
@@ -495,6 +667,9 @@ async fn run_workload_modes(args: ServeArgs) -> anyhow::Result<()> {
         }
     };
 
+    let server = with_declared_route_headers(server, &args);
+    let server = with_declared_cache_policy(server, &workload_abs)?;
+
     let addr = args.bind_addr();
     info!(%addr, workload = %workload_abs.display(), "mesofact-serve listening");
     server.serve_on(addr).await
@@ -516,10 +691,17 @@ async fn run_workload_modes(args: ServeArgs) -> anyhow::Result<()> {
         .clone()
         .ok_or_else(|| anyhow::anyhow!("a <workload> dir is required (or --bundle to serve a W272 bundle)"))?;
     let server = Server::from_workload(&workload)?;
-    // R556-B13: the static-only build has even less chance of enforcing the
-    // gate than the ssr one — no isolate, no router, nothing that reads a
-    // session. Same refusal.
-    assert_declared_auth_is_enforced(&workload, args.trust_edge_auth)?;
+    // R556-B13 / R749-T1: the static-only build has even less chance of
+    // enforcing a policy than the ssr one — no isolate, no router, nothing that
+    // reads a session. Same refusal, and `serve_policy_support` advertises less
+    // here accordingly.
+    assert_declared_policy_is_enforced(&workload, &serve_policy_support(&args))?;
+    // R746-B7's refusal, which used to be reachable only via `--bundle`: this
+    // build has no isolate, so a `mode:"ssr"` route here is a 404 dressed as a
+    // deploy. See [`refuse_unservable_ssr_routes`].
+    refuse_unservable_ssr_routes(&workload)?;
+    let server = with_declared_route_headers(server, &args);
+    let server = with_declared_cache_policy(server, &workload)?;
     let addr = args.bind_addr();
     info!(%addr, workload = %workload.display(), "mesofact-serve listening (static only, no ssr)");
     server.serve_on(addr).await
@@ -539,13 +721,32 @@ mod tests {
 
     const AUTHED: &str = r#"{"routes":[{"route":"/","mode":"ssr","requires":["user"]}]}"#;
 
+    /// Drive the real clap surface, so these cover the argv/env plumbing and
+    /// not just the function underneath it — a refusal an operator cannot turn
+    /// off because the flag never reached `ServeArgs` is its own outage.
+    #[derive(clap::Parser)]
+    struct Harness {
+        #[command(flatten)]
+        args: ServeArgs,
+    }
+
+    fn args_from(extra: &[&str]) -> ServeArgs {
+        let mut argv = vec!["mesofact-serve"];
+        argv.extend_from_slice(extra);
+        Harness::parse_from(argv).args
+    }
+
+    fn support(extra: &[&str]) -> mesofact_core::PolicySupport {
+        serve_policy_support(&args_from(extra))
+    }
+
     /// R556-B13, the bug itself: a route declaring `requires: ["user"]` was
     /// served by `mesofact serve` to anything that reached the port, because
     /// the check lives only in `mesofact proxy`'s router. Fail closed.
     #[test]
     fn a_declared_authed_route_refuses_to_start_without_an_asserted_edge() {
         let dir = workload_with_manifest(AUTHED);
-        let err = assert_declared_auth_is_enforced(dir.path(), false)
+        let err = assert_declared_policy_is_enforced(dir.path(), &support(&[]))
             .unwrap_err()
             .to_string();
         assert!(err.contains("refusing to start"), "{err}");
@@ -554,7 +755,7 @@ mod tests {
             "the message must name the route the operator has to look at: {err}"
         );
         assert!(
-            err.contains("--trust-edge-auth"),
+            err.contains("--policy-delegated"),
             "and the remedy, or the operator has a refusal with no next move: {err}"
         );
     }
@@ -565,7 +766,14 @@ mod tests {
     #[test]
     fn an_asserted_edge_allows_the_declared_authed_route() {
         let dir = workload_with_manifest(AUTHED);
-        assert!(assert_declared_auth_is_enforced(dir.path(), true).is_ok());
+        assert!(assert_declared_policy_is_enforced(dir.path(), &support(&["--trust-edge-auth"])).is_ok());
+        // R749-T1 generalized the flag; the general spelling must reach the
+        // same policy, or the two grow apart and one of them stops working.
+        assert!(assert_declared_policy_is_enforced(
+            dir.path(),
+            &support(&["--policy-delegated", "requires"]),
+        )
+        .is_ok());
     }
 
     /// The overwhelmingly common case — no route declares the gate — must not
@@ -573,10 +781,66 @@ mod tests {
     #[test]
     fn a_workload_declaring_no_authed_route_starts_unchanged() {
         let dir = workload_with_manifest(r#"{"routes":[{"route":"/","mode":"static"}]}"#);
-        assert!(assert_declared_auth_is_enforced(dir.path(), false).is_ok());
+        assert!(assert_declared_policy_is_enforced(dir.path(), &support(&[])).is_ok());
         // …and so does one with nothing built yet.
         let empty = tempfile::tempdir().unwrap();
-        assert!(assert_declared_auth_is_enforced(empty.path(), false).is_ok());
+        assert!(assert_declared_policy_is_enforced(empty.path(), &support(&[])).is_ok());
+    }
+
+    /// R749-T1's general rule, at the tier that motivated it. `concurrency` is
+    /// read by the `mesofact proxy` worker pool (`packages/mesofact-worker/
+    /// src/pool.ts`) and by nothing in this binary, so declaring it here has to
+    /// stop the start rather than quietly do nothing.
+    #[test]
+    fn a_policy_this_binary_does_not_implement_refuses_to_start() {
+        let dir = workload_with_manifest(
+            r#"{"routes":[{"route":"/busy","mode":"ssr","cache_policy":{"ttl":0},"concurrency":4}]}"#,
+        );
+        let err = assert_declared_policy_is_enforced(dir.path(), &support(&[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("/busy") && err.contains("concurrency"), "{err}");
+        assert!(assert_declared_policy_is_enforced(
+            dir.path(),
+            &support(&["--policy-delegated", "concurrency"]),
+        )
+        .is_ok());
+    }
+
+    /// The half that makes the class impossible rather than merely closed: a
+    /// manifest from a build newer than this binary carries a policy field it
+    /// cannot even name, which is the maximally-silent form of the defect.
+    #[test]
+    fn a_policy_field_this_binary_predates_refuses_to_start() {
+        let dir = workload_with_manifest(
+            r#"{"routes":[{"route":"/x","mode":"ssr","cache_policy":{"ttl":0},"rate_limit":{"rps":10}}]}"#,
+        );
+        let err = assert_declared_policy_is_enforced(dir.path(), &support(&["--trust-edge-auth"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rate_limit") && err.contains("not delegatable"), "{err}");
+    }
+
+    /// `cache_policy` is the field R746-S4 found inert in this tier. It now has
+    /// a consumer ([`crate::cache_headers`]), so declaring it must NOT refuse —
+    /// and the table the server is handed must actually carry the route, or the
+    /// advertisement in `serve_policy_support` is the lie the check exists for.
+    #[test]
+    fn a_declared_cache_policy_is_enforced_rather_than_refused() {
+        let dir = workload_with_manifest(
+            r#"{"routes":[{"route":"/issues","mode":"static","render_entrypoint":"e.js","cache_policy":{"ttl":3600,"swr":86400}}]}"#,
+        );
+        assert!(assert_declared_policy_is_enforced(dir.path(), &support(&[])).is_ok());
+        let table = crate::declared_cache_policy(dir.path()).unwrap();
+        assert_eq!(table.len(), 1, "the advertised enforcement must be real");
+    }
+
+    /// A typo'd delegation is a delegation that silently does not apply, so it
+    /// is a parse error rather than a shrug.
+    #[test]
+    fn an_unknown_delegated_policy_is_rejected_not_ignored() {
+        assert!(parse_policy_field("cache-policy").is_err());
+        assert!(parse_policy_field("requires").is_ok());
     }
 
     /// `MESOFACT_TRUST_EDGE_AUTH=1` is the form a deploy config reaches for
@@ -597,13 +861,84 @@ mod tests {
         assert!(parse_truthy("maybe").is_err());
     }
 
+    // ── R749-F3 / W334: MESOFACT_ROUTE_HEADERS ──────────────────────────────
+
+    /// Flatten `ServeArgs` under a `Parser` so the flag/env plumbing itself is
+    /// under test — `RouteHeaderTable::parse` is exercised in its own module,
+    /// but "clap accepts this and hands the server a table" is a separate claim.
+    #[derive(clap::Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        serve: ServeArgs,
+    }
+    use clap::Parser as _;
+
+    fn parse_args(value: &str) -> Result<TestCli, clap::Error> {
+        TestCli::try_parse_from(["mesofact-serve", "--bundle", "b", "--route-headers", value])
+    }
+
+    #[test]
+    fn a_declared_table_reaches_the_server() {
+        let cli = parse_args(
+            r#"[{"path":"/app/*","headers":{"Cross-Origin-Opener-Policy":"same-origin"}},{"path":"/*","headers":{"X-Tier":"marketing"}}]"#,
+        )
+        .expect("a well-formed table must parse");
+        assert_eq!(cli.serve.route_headers.len(), 2);
+    }
+
+    /// An unset (or exported-but-blank) var is "no route headers configured",
+    /// not a malformed table — same shape `--trust-edge-auth` takes for empty.
+    #[test]
+    fn an_unset_table_starts_normally() {
+        let bare = TestCli::try_parse_from(["mesofact-serve", "--bundle", "b"]).unwrap();
+        assert!(bare.serve.route_headers.is_empty());
+        assert!(parse_args("").unwrap().serve.route_headers.is_empty());
+        assert!(parse_args("  ").unwrap().serve.route_headers.is_empty());
+    }
+
+    /// R749-T1: a declared policy the serving tier cannot enforce is a HARD
+    /// ERROR. The Worker's `parseRouteHeaders` catches a malformed binding and
+    /// serves without the headers; copying that here would mean a wasm site
+    /// served 200-OK with `SharedArrayBuffer` undefined and nothing in any log.
+    ///
+    /// The assertion that matters is the absence of a success path: every
+    /// malformed form below must fail the invocation, and none may come back as
+    /// an empty table.
+    #[test]
+    fn a_malformed_table_refuses_the_start() {
+        for bad in [
+            "{not json",
+            "[",
+            r#"{"path":"/*","headers":{}}"#,
+            r#"[{"path":"/*"}]"#,
+            r#"[{"path":"/*","headers":{"Bad Name":"1"}}]"#,
+        ] {
+            match parse_args(bad) {
+                Ok(cli) => panic!(
+                    "malformed table {bad:?} started anyway with {} rule(s) — that is the \
+                     serve-anyway posture this must not have",
+                    cli.serve.route_headers.len(),
+                ),
+                Err(e) => {
+                    let rendered = e.to_string();
+                    assert!(
+                        rendered.contains("route header table")
+                            || rendered.contains("not a valid HTTP header name")
+                            || rendered.contains("missing field"),
+                        "the refusal must name the problem: {rendered}",
+                    );
+                }
+            }
+        }
+    }
+
     /// A manifest that exists but does not parse is a refusal, not a shrug:
     /// "we could not read the file, therefore nothing is gated" is the same
     /// fail-open wearing a different hat.
     #[test]
     fn an_unreadable_manifest_refuses_to_start() {
         let dir = workload_with_manifest("{ not json");
-        let err = assert_declared_auth_is_enforced(dir.path(), false)
+        let err = assert_declared_policy_is_enforced(dir.path(), &support(&[]))
             .unwrap_err()
             .to_string();
         assert!(err.contains("refusing to start"), "{err}");

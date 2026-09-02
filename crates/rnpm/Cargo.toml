@@ -1,0 +1,56 @@
+# The npm half of the W318 stage-2 resolver: the registry protocol (abbreviated
+# packuments, on-disk cache, conditional revalidation) with the range solver and
+# tree builder to follow in R773-F2/F3/F4.
+#
+# WORKING TITLE ONLY. R757 says the shipped name is chosen on the way out, once
+# the code exists — `publish = false` is what keeps a placeholder name off
+# crates.io in the meantime.
+
+[package]
+name = "rnpm"
+description = "npm registry protocol and resolution (working title — see R757)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+# Exposes `rnpm::testing::FakeTransport` so a downstream crate can prove the
+# no-network-on-a-warm-cache property across its own seam without writing a
+# second fake. Off in a normal build.
+testing = []
+
+[dependencies]
+anyhow = "1"
+# npm's range grammar, which is NOT Cargo's — W318 §8 forbids dtolnay's
+# `semver` here for exactly that reason. Apache-2.0.
+#
+# `=2.2.0`, an exact requirement rather than the usual caret, because the
+# version itself is load-bearing: 2.2.0 is what pacquet pins, and matching it
+# is what stops our range semantics from silently diverging from pnpm's on the
+# same input — the failure R773-F7's conformance corpus would otherwise catch
+# late and expensively. A caret requirement would let a `cargo update` move us
+# off it with nothing to notice, since the divergence shows up as a *different
+# resolved tree*, not as a build error. Bumping this is a deliberate act that
+# should re-run the R773-F2 range table and R773-F7's corpus.
+node-semver = "=2.2.0"
+# Blocking, deliberately: the R773-F3 tree walk is a sequential BFS, so an async
+# client buys nothing and would infect every caller up to `mesofact-build`,
+# which is itself blocking (`install.rs:490`).
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-native-roots",
+    "blocking",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# A self dev-dependency, so this crate's own `tests/` (separate crates, linked
+# against the lib built WITHOUT `cfg(test)`) can see `rnpm::testing`. Without
+# it the counting fake is visible to the unit tests and to `jsget`, but not to
+# rnpm's own integration tests — which is where R773-F3's fetch-accounting
+# proofs live.
+rnpm = { path = ".", features = ["testing"] }
+tempfile = "3"

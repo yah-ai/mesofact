@@ -100,6 +100,8 @@
 // dev-only `watcher` / `s3` modules stayed behind in `mesofact-dev` — the whole
 // point of the split (W225 §2: prod must not link dev affordances).
 use crate::proxy::{ProxyMap, ProxyState};
+use crate::cache_headers::{apply_cache_policy, CachePolicyTable};
+use crate::route_headers::{apply_route_headers, RouteHeaderTable};
 #[cfg(feature = "ssr")]
 use crate::ssr::{ResiliencePolicy, SsrChild, SsrSlot};
 
@@ -230,6 +232,17 @@ pub struct Server {
     /// Whether [`Server::router`] mounts the standard probe routes. Cleared by
     /// [`Server::without_standard_probes`] for a service that mounts its own.
     standard_probes: bool,
+    /// The domain manifest's per-route response headers (R749-F3 / W334), as
+    /// delivered by `MESOFACT_ROUTE_HEADERS`. Empty unless
+    /// [`Server::with_route_headers`] was called; applied by
+    /// [`crate::route_headers::apply_route_headers`] to every response this
+    /// router returns.
+    route_headers: Arc<RouteHeaderTable>,
+    /// Per-route `Cache-Control` / `Vary` derived from the built manifest's
+    /// `cache_policy` (R749-T1). Empty unless [`Server::with_cache_policy`] was
+    /// called; applied by [`crate::cache_headers::apply_cache_policy`] *inside*
+    /// the route-header layer, so a domain-declared header still wins.
+    cache_policy: Arc<CachePolicyTable>,
 }
 
 #[derive(Clone)]
@@ -267,6 +280,8 @@ impl Server {
             #[cfg(feature = "ssr")]
             expects_ssr: false,
             standard_probes: true,
+            route_headers: Arc::new(RouteHeaderTable::default()),
+            cache_policy: Arc::new(CachePolicyTable::default()),
         })
     }
 
@@ -327,6 +342,33 @@ impl Server {
             service: service.into(),
             component: component.into(),
         });
+        self
+    }
+
+    /// Attach the domain manifest's per-route response headers (R749-F3 /
+    /// W334) — the sovereign path's half of the Worker's `ROUTE_HEADERS`
+    /// binding, carrying the same JSON table.
+    ///
+    /// The table is applied as the **outermost** layer of [`Server::router`],
+    /// so there is no response — asset, clean-URL, SPA shell, SSR proxy, or
+    /// branded 404/410/500 — that can be returned without going through it.
+    /// That is deliberate: an error page that drops `COOP`/`COEP` un-isolates
+    /// the document and takes `SharedArrayBuffer` with it, and nothing on the
+    /// server side would say so.
+    pub fn with_route_headers(mut self, table: RouteHeaderTable) -> Self {
+        self.route_headers = Arc::new(table);
+        self
+    }
+
+    /// Enforce the built manifest's `cache_policy` on every response (R749-T1).
+    ///
+    /// The serve tier's consumer for a field that previously had exactly one,
+    /// in a subcommand this binary's bundle path never runs. See
+    /// [`crate::cache_headers`] for the derivation table and why this layer
+    /// sits inside [`with_route_headers`](Self::with_route_headers) and outside
+    /// the handlers.
+    pub fn with_cache_policy(mut self, table: CachePolicyTable) -> Self {
+        self.cache_policy = Arc::new(table);
         self
     }
 
@@ -519,7 +561,29 @@ impl Server {
         } else {
             router
         };
-        router.layer(TraceLayer::new_for_http())
+        // R749-F3 / W334: the domain manifest's per-route response headers, as
+        // the OUTERMOST layer. Wrapping the whole router — rather than stamping
+        // each `return` inside it — is what makes the guarantee total, and it
+        // mirrors the Worker, whose exported `fetch` wraps its own `route()` for
+        // exactly this reason. Every 404/410/500 from `serve_error_page` passes
+        // through here by construction, so no future handler can be added that
+        // silently bypasses a declared policy.
+        // R749-T1: the route's own `cache_policy`, INSIDE the domain table
+        // above — `.layer` wraps, so the last one added is outermost, and a
+        // `Cache-Control` a domain declares for a path is the later and more
+        // specific operator statement. Outside every handler, though: a policy
+        // that silently lost to whatever an SSR handler set for itself would be
+        // unenforced exactly on the routes that run user code.
+        router
+            .layer(axum::middleware::from_fn_with_state(
+                self.cache_policy.clone(),
+                apply_cache_policy,
+            ))
+            .layer(TraceLayer::new_for_http())
+            .layer(axum::middleware::from_fn_with_state(
+                self.route_headers.clone(),
+                apply_route_headers,
+            ))
     }
 
     /// Bind to `127.0.0.1:port` and serve until Ctrl+C / SIGTERM. The dev
@@ -1207,24 +1271,14 @@ async fn matches_deferred_route(dist: &Path, uri_path: &str) -> bool {
 }
 
 /// Segment-aware match of a route pattern (`/c/:slug`) against a concrete path
-/// (`/c/abc123`) — byte-parallel with the worker's `matchRoutePattern`. A
-/// `:param` segment matches any single non-empty segment; segment counts must
-/// be equal, so a trailing `:param` never swallows extra segments.
+/// (`/c/abc123`).
+///
+/// R749-T1 moved the implementation to [`crate::cache_headers`], which needs
+/// the same match in the static-only build this function was `ssr`-gated out
+/// of. One copy, so the deferred-route lookup and the cache-policy lookup
+/// cannot drift into disagreeing about which requests belong to a route.
 #[cfg(feature = "ssr")]
-fn match_route_pattern(pattern: &str, pathname: &str) -> bool {
-    let pat: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
-    let path: Vec<&str> = pathname.split('/').filter(|s| !s.is_empty()).collect();
-    if pat.len() != path.len() {
-        return false;
-    }
-    pat.iter().zip(path.iter()).all(|(seg, actual)| {
-        if seg.starts_with(':') {
-            !actual.is_empty()
-        } else {
-            seg == actual
-        }
-    })
-}
+use crate::cache_headers::match_route_pattern;
 
 /// Serve the manifest's branded error page for `status` (W270 §3, R595-T5/T6),
 /// for parity with `mesofact serve` and the `@mesofact/edge` worker's
@@ -1306,6 +1360,39 @@ async fn read_error_route(dist: &Path, server_error: bool) -> Option<String> {
     } else {
         routes.not_found
     }
+}
+
+/// Raw bytes of a workload's built route manifest, or `None` when it has none.
+///
+/// Deliberately un-deserialized (R749-T1): the policy check that consumes this
+/// has to see the manifest's *actual* key set, and parsing into any struct —
+/// the full [`mesofact_core::Manifest`] or a local slice — silently discards
+/// the one thing it is looking for, a policy field this binary predates.
+pub fn read_manifest_bytes(workload: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    let manifest_path = workload.join("dist").join("manifest.json");
+    match std::fs::read(&manifest_path) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Build the per-route [`CachePolicyTable`] a workload's manifest declares
+/// (R749-T1). An absent manifest yields an empty table; a present-but-broken
+/// one is an error, on [`routes_requiring_user`]'s reasoning.
+pub fn declared_cache_policy(workload: &Path) -> std::io::Result<CachePolicyTable> {
+    let Some(bytes) = read_manifest_bytes(workload)? else {
+        return Ok(CachePolicyTable::default());
+    };
+    CachePolicyTable::from_manifest_json(&bytes).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "parsing {}: {e}",
+                workload.join("dist").join("manifest.json").display()
+            ),
+        )
+    })
 }
 
 /// Routes in a workload's built manifest that declare `requires: ["user"]`
@@ -2134,6 +2221,281 @@ mod tests {
             Some("application/json; charset=utf-8"),
         );
         assert!(body_string(response).await.contains("bundle/yah-marketing"));
+    }
+
+    // ── R749-F3 / W334: per-route response headers on every response ────────
+    //
+    // The cross-door parity assertions live in
+    // `crates/mesofact/tests/route_headers_parity.rs` (shared fixture with the
+    // Worker's miniflare suite). What these cover is the half a fixture cannot
+    // reach from outside: the error-page statuses, which are the responses most
+    // likely to be missed and the ones where a dropped COOP/COEP is silent.
+
+    const ISOLATION_TABLE: &str = r#"[
+        {"path":"/app/*","headers":{"Cross-Origin-Opener-Policy":"same-origin","Cross-Origin-Embedder-Policy":"require-corp"}},
+        {"path":"/*","headers":{"X-Tier":"marketing"}}
+    ]"#;
+
+    fn isolation_table() -> RouteHeaderTable {
+        RouteHeaderTable::parse(ISOLATION_TABLE).unwrap()
+    }
+
+    fn header_of(response: &axum::response::Response, name: &str) -> Option<String> {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    }
+
+    /// The branded 404 is still a document the isolated app may be showing, so
+    /// it carries the route's headers. This is the response most likely to be
+    /// missed by an implementation that stamps headers per happy-path handler.
+    #[tokio::test]
+    async fn the_branded_404_carries_the_route_headers() {
+        let bundle = bundle_with("mesofact/0.8.20", &[("404.html", "<h1>nope</h1>")]);
+        let app = Server::from_bundle(bundle.path())
+            .unwrap()
+            .with_route_headers(isolation_table())
+            .router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/app/missing.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            header_of(&response, "cross-origin-opener-policy").as_deref(),
+            Some("same-origin"),
+        );
+        assert_eq!(
+            header_of(&response, "cross-origin-embedder-policy").as_deref(),
+            Some("require-corp"),
+        );
+        assert!(body_string(response).await.contains("nope"));
+    }
+
+    /// R749-T1: the declared `cache_policy` has to reach a real response, or
+    /// `serve_policy_support`'s `enforces(CachePolicy)` is the lie the whole
+    /// mechanism exists to catch. Router-level rather than table-level for
+    /// exactly that reason — the unit tests in [`crate::cache_headers`] prove
+    /// the derivation, this proves the layer is wired.
+    #[tokio::test]
+    async fn a_declared_cache_policy_reaches_a_served_response() {
+        use crate::cache_headers::CachePolicyTable;
+        use mesofact_core::manifest::{CachePolicy, Route, RouteMode};
+
+        let bundle = bundle_with("mesofact/0.8.20", &[("index.html", "<h1>home</h1>")]);
+        let table = CachePolicyTable::from_routes(&[Route {
+            route: "/".into(),
+            mode: RouteMode::Static,
+            render_entrypoint: "e.js".into(),
+            requires: None,
+            source_reads: None,
+            data_inputs: None,
+            cache_policy: CachePolicy {
+                ttl: 3600,
+                swr: Some(86_400),
+                negative_ttl: None,
+                vary: None,
+            },
+            concurrency: None,
+            hydration: None,
+            prerender: None,
+            placement: None,
+            resilience: None,
+        }]);
+        let app = Server::from_bundle(bundle.path())
+            .unwrap()
+            .with_cache_policy(table)
+            .router();
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            header_of(&response, "cache-control").as_deref(),
+            Some("public, max-age=3600, stale-while-revalidate=86400"),
+        );
+    }
+
+    /// The precedence the layer ordering encodes: a domain manifest declaring
+    /// `Cache-Control` for a path is the later, more specific operator
+    /// statement, so it wins over the route's own policy. Pinned because it is
+    /// a property of `.layer()` nesting order, which is easy to invert by
+    /// accident and invisible when you do.
+    #[tokio::test]
+    async fn a_domain_declared_cache_control_wins_over_the_route_policy() {
+        use crate::cache_headers::CachePolicyTable;
+        use mesofact_core::manifest::{CachePolicy, Route, RouteMode};
+
+        let bundle = bundle_with("mesofact/0.8.20", &[("index.html", "<h1>home</h1>")]);
+        let table = CachePolicyTable::from_routes(&[Route {
+            route: "/".into(),
+            mode: RouteMode::Static,
+            render_entrypoint: "e.js".into(),
+            requires: None,
+            source_reads: None,
+            data_inputs: None,
+            cache_policy: CachePolicy {
+                ttl: 3600,
+                swr: None,
+                negative_ttl: None,
+                vary: None,
+            },
+            concurrency: None,
+            hydration: None,
+            prerender: None,
+            placement: None,
+            resilience: None,
+        }]);
+        let app = Server::from_bundle(bundle.path())
+            .unwrap()
+            .with_cache_policy(table)
+            .with_route_headers(
+                RouteHeaderTable::parse(
+                    r#"[{"path":"/*","headers":{"Cache-Control":"no-store"}}]"#,
+                )
+                .unwrap(),
+            )
+            .router();
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            header_of(&response, "cache-control").as_deref(),
+            Some("no-store"),
+        );
+    }
+
+    /// …and so does the plaintext fallback, when no branded page resolves.
+    #[tokio::test]
+    async fn the_plaintext_404_fallback_carries_them_too() {
+        let bundle = bundle_with("mesofact/0.8.20", &[("index.html", "<h1>home</h1>")]);
+        let app = Server::from_bundle(bundle.path())
+            .unwrap()
+            .with_route_headers(isolation_table())
+            .router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/app/missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            header_of(&response, "cross-origin-opener-policy").as_deref(),
+            Some("same-origin"),
+        );
+    }
+
+    /// The probe routes are merged into the router after `with_state` and
+    /// answer from their own state — a shape that would slip past any
+    /// per-handler stamping. They go through the same outermost layer.
+    #[tokio::test]
+    async fn even_the_probe_routes_go_through_the_layer() {
+        let bundle = bundle_with("mesofact/0.8.20", &[("index.html", "<h1>home</h1>")]);
+        let app = Server::from_bundle(bundle.path())
+            .unwrap()
+            .with_route_headers(isolation_table())
+            .router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(crate::LIVE_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(header_of(&response, "x-tier").as_deref(), Some("marketing"));
+    }
+
+    /// 410 Gone — a deleted instance pointer (W270 §9). Reached only on the
+    /// deferred-route path, hence the `ssr` gate; the 404 tests above cover the
+    /// same guarantee on the static-only build.
+    #[cfg(feature = "ssr")]
+    #[tokio::test]
+    async fn the_410_tombstone_page_carries_the_route_headers() {
+        use mesofact_publisher::{ObjectPointerStore, PointerStore};
+        let dir = deferred_workload(&[("404.html", "<h1>gone-page</h1>")], "");
+        let store = mem_store();
+        flip_instance(&store, "c/abc", "content/abc.html").await;
+        ObjectPointerStore::new(store.clone())
+            .delete("c/abc", Some("2026-07-14T00:00:00Z".into()))
+            .await
+            .unwrap();
+
+        let app = Server::from_workload(dir.path())
+            .unwrap()
+            .with_instance_store(store)
+            .with_route_headers(
+                RouteHeaderTable::parse(
+                    r#"[{"path":"/*","headers":{"Cross-Origin-Opener-Policy":"same-origin"}}]"#,
+                )
+                .unwrap(),
+            )
+            .router();
+        let response = app
+            .oneshot(Request::builder().uri("/c/abc").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GONE);
+        assert_eq!(
+            header_of(&response, "cross-origin-opener-policy").as_deref(),
+            Some("same-origin"),
+        );
+    }
+
+    /// A 500 has no trigger on the static tier (it comes from a pointer-store
+    /// read error on the deferred path), so pin the property the layer gives us
+    /// directly: it is status-blind. `Server::router` applies this exact
+    /// middleware as its outermost layer, so every error page inherits it —
+    /// there is no per-status arm anywhere that could be forgotten.
+    #[tokio::test]
+    async fn the_layer_stamps_any_status_including_5xx() {
+        use crate::route_headers::apply_route_headers;
+        for status in [
+            StatusCode::OK,
+            StatusCode::NOT_FOUND,
+            StatusCode::GONE,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+        ] {
+            let app = Router::new()
+                .route(
+                    "/app/{*rest}",
+                    any(move || async move { (status, "body").into_response() }),
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    Arc::new(isolation_table()),
+                    apply_route_headers,
+                ));
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/app/x")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                header_of(&response, "cross-origin-opener-policy").as_deref(),
+                Some("same-origin"),
+                "status {status}",
+            );
+        }
     }
 
     /// A `.wasm` asset must come back as `application/wasm` and nothing else.

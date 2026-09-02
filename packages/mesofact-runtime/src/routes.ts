@@ -116,6 +116,22 @@ export type PrerenderConfig =
   | { from_data: string; items_key: string; param: string }
   | { deferred: true };
 
+// ─── Adding a field here (R749-T1) ─────────────────────────────────────────
+// Every field below that changes SERVING behaviour is checked at startup
+// against what the serving tier says it implements
+// (`crates/mesofact-core/src/policy.rs`). Declaring one a tier does not enforce
+// refuses the start, naming the route and the field — never a warning, never a
+// skip, because a policy nothing wired looks byte-identical to one that runs.
+//
+// So a new serving field costs two edits, not one: the type here, and either a
+// `RoutePolicy` variant plus an enforcement point per tier, or a
+// `STRUCTURAL_FIELDS` entry saying why ignoring it cannot lose behaviour. The
+// completeness gate (`every_route_field_is_classified`) fails until one of the
+// two exists, and until then the field refuses every manifest that carries it.
+//
+// A field with no consumer ANYWHERE follows `resilience.queue`: keep the type
+// slot so future routes don't break, and reject it at `defineRoutes` today.
+// Declaring something that does nothing is the defect, not the schema.
 export type RouteEntry = {
   route: string;
   mode: RouteMode;

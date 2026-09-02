@@ -566,6 +566,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bytecount"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "175812e0be2bccb6abe50bb8d566126198344f707e304f45c648fd8f2cc0365e"
+
+[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -660,7 +666,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "cheers-core"
-version = "0.8.29"
+version = "0.8.30"
 dependencies = [
  "async-trait",
  "base64",
@@ -671,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "cheers-server"
-version = "0.8.29"
+version = "0.8.30"
 dependencies = [
  "async-trait",
  "base64",
@@ -690,7 +696,7 @@ dependencies = [
 
 [[package]]
 name = "cheers-verify"
-version = "0.8.29"
+version = "0.8.30"
 dependencies = [
  "async-trait",
  "cheers-core",
@@ -1907,7 +1913,7 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "fob"
-version = "0.8.29"
+version = "0.8.30"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2773,6 +2779,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsget"
+version = "0.8.30"
+dependencies = [
+ "anyhow",
+ "rnpm",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "json-escape-simd"
 version = "3.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2996,7 +3012,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact"
-version = "0.8.29"
+version = "0.8.30"
 dependencies = [
  "anyhow",
  "axum",
@@ -3023,7 +3039,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact-build"
-version = "0.8.29"
+version = "0.8.30"
 dependencies = [
  "anyhow",
  "clap",
@@ -3050,7 +3066,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact-core"
-version = "0.8.29"
+version = "0.8.30"
 dependencies = [
  "anyhow",
  "axum",
@@ -3077,7 +3093,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact-dev"
-version = "0.8.29"
+version = "0.8.30"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3103,7 +3119,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact-publisher"
-version = "0.8.29"
+version = "0.8.30"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3125,7 +3141,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact-render"
-version = "0.8.29"
+version = "0.8.30"
 dependencies = [
  "anyhow",
  "mesofact-core",
@@ -3136,7 +3152,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact-ssr"
-version = "0.8.29"
+version = "0.8.30"
 dependencies = [
  "anyhow",
  "deno_core",
@@ -3153,6 +3169,28 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "miette"
+version = "7.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f98efec8807c63c752b5bd61f862c165c115b0a35685bdcfd9238c7aeb592b7"
+dependencies = [
+ "cfg-if",
+ "miette-derive",
+ "unicode-width 0.1.14",
+]
+
+[[package]]
+name = "miette-derive"
+version = "7.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db5b29714e950dbb20d5e6f74f9dcec4edbcc1067bb7f8ed198c097b8c1a818b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -3249,6 +3287,19 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "memoffset",
+]
+
+[[package]]
+name = "node-semver"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b1a233ea5dc37d2cfba31cfc87a5a56cc2a9c04e3672c15d179ca118dae40a7"
+dependencies = [
+ "bytecount",
+ "miette",
+ "nom 7.1.3",
+ "serde",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -3495,7 +3546,7 @@ dependencies = [
  "textwrap",
  "thiserror 2.0.18",
  "unicode-segmentation",
- "unicode-width",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -4707,6 +4758,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rnpm"
+version = "0.8.30"
+dependencies = [
+ "anyhow",
+ "node-semver",
+ "reqwest",
+ "rnpm",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "rolldown"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4768,7 +4832,7 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee296fe9ac0007f2c0eff04d55c980de537aa3d736e873d70c9c47d4c737ea44"
 dependencies = [
- "unicode-width",
+ "unicode-width 0.2.2",
  "yansi",
 ]
 
@@ -5978,7 +6042,7 @@ checksum = "c13547615a44dc9c452a8a534638acdf07120d4b6847c8178705da06306a3057"
 dependencies = [
  "smawk",
  "unicode-linebreak",
- "unicode-width",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -6444,6 +6508,12 @@ name = "unicode-segmentation"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
+
+[[package]]
+name = "unicode-width"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
 
 [[package]]
 name = "unicode-width"
@@ -7281,7 +7351,7 @@ checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"
 
 [[package]]
 name = "yah-almanac"
-version = "0.8.29"
+version = "0.8.30"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7303,7 +7373,7 @@ dependencies = [
 
 [[package]]
 name = "yah-local-driver"
-version = "0.8.29"
+version = "0.8.30"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7321,7 +7391,7 @@ dependencies = [
 
 [[package]]
 name = "yah-mesofact-bundle"
-version = "0.8.29"
+version = "0.8.30"
 dependencies = [
  "blake3",
  "serde",
@@ -7332,7 +7402,7 @@ dependencies = [
 
 [[package]]
 name = "yah-object-store"
-version = "0.8.29"
+version = "0.8.30"
 dependencies = [
  "fob",
  "hex",
@@ -7345,7 +7415,7 @@ dependencies = [
 
 [[package]]
 name = "yah-workload-spec"
-version = "0.8.29"
+version = "0.8.30"
 dependencies = [
  "anyhow",
  "async-trait",

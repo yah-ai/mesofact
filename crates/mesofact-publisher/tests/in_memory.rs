@@ -90,6 +90,80 @@ async fn in_memory_store_round_trip() {
     assert!(store.get("a/b.txt").await.unwrap().is_none());
 }
 
+/// R749-B4 end to end: what the route declared is what lands on the object the
+/// CDN will replay. The unit tests in `publish.rs` cover the derivation; this
+/// covers the wiring, which is the half that was actually missing — the
+/// publisher computed a `Cache-Control` from the path prefix and every declared
+/// `cache_policy` in the manifest stopped at the manifest.
+#[tokio::test]
+async fn publish_dist_stamps_the_declared_cache_policy_on_the_object() {
+    let dir = tempdir().unwrap();
+    let manifest = serde_json::json!({
+        "version": "1",
+        "build_id": BUILD_ID,
+        "routes": [
+            { "route": "/issues", "mode": "static", "render_entrypoint": "e.js",
+              "cache_policy": { "ttl": 3600, "swr": 86400 } },
+            { "route": "/app", "mode": "static", "render_entrypoint": "e.js",
+              "requires": ["user"], "cache_policy": { "ttl": 60 } },
+            { "route": "/plain", "mode": "static", "render_entrypoint": "e.js",
+              "cache_policy": { "ttl": 0 } }
+        ],
+        "static_assets": []
+    })
+    .to_string();
+    fs::write(dir.path().join("manifest.json"), &manifest)
+        .await
+        .unwrap();
+    fs::write(dir.path().join("tag-index.json"), tag_index_json(BUILD_ID))
+        .await
+        .unwrap();
+    fs::create_dir_all(dir.path().join("html")).await.unwrap();
+    for key in ["issues", "app", "plain"] {
+        fs::write(dir.path().join(format!("html/{key}.html")), b"<h1>x</h1>")
+            .await
+            .unwrap();
+    }
+    fs::create_dir_all(dir.path().join("assets")).await.unwrap();
+    fs::write(dir.path().join("assets/app.abc123.js"), b"//x")
+        .await
+        .unwrap();
+
+    let store = InMemoryStore::new();
+    let purger = InMemoryPurger::new();
+    publish_dist(dir.path(), &store, &purger).await.unwrap();
+
+    async fn cc(store: &InMemoryStore, key: &str) -> String {
+        store
+            .head(key)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{key} was not published"))
+            .cache_control
+            .unwrap_or_else(|| panic!("{key} carries no Cache-Control"))
+    }
+
+    assert_eq!(
+        cc(&store, &format!("{BUILD_ID}/html/issues.html")).await,
+        "public, max-age=3600, stale-while-revalidate=86400",
+    );
+    // A gated route's page must not be published shareable.
+    assert_eq!(
+        cc(&store, &format!("{BUILD_ID}/html/app.html")).await,
+        "private, max-age=60",
+    );
+    // The inert policy is not a declaration: prefix default, unchanged.
+    assert_eq!(
+        cc(&store, &format!("{BUILD_ID}/html/plain.html")).await,
+        "public, max-age=86400",
+    );
+    // Content-hashed assets stay immutable regardless of any route's TTL.
+    assert_eq!(
+        cc(&store, &format!("{BUILD_ID}/assets/app.abc123.js")).await,
+        "public, max-age=31536000, immutable",
+    );
+}
+
 #[tokio::test]
 async fn in_memory_purger_records_calls() {
     let purger = InMemoryPurger::new();
@@ -138,9 +212,18 @@ async fn publish_dist_uploads_artifacts_and_pointers() {
     // Cache-Control: assets/* and hydrate/* immutable, html/* long, server/* short,
     // pointers no-cache.
     let pointer_meta = store.head("manifest.json").await.unwrap().unwrap();
-    // We don't expose cache_control on ObjectMeta — content-type is enough to
-    // smoke that the right PutOpts flowed through.
     assert_eq!(pointer_meta.content_type, "application/json");
+    assert_eq!(pointer_meta.cache_control.as_deref(), Some("no-cache"));
+    assert_eq!(
+        store
+            .head(&format!("{BUILD_ID}/server/home.js"))
+            .await
+            .unwrap()
+            .unwrap()
+            .cache_control
+            .as_deref(),
+        Some("public, max-age=3600"),
+    );
 
     // T1 has no CDN purge; T3 will populate this.
     assert!(report.purged_tags.is_empty());

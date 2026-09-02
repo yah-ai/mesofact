@@ -1,0 +1,111 @@
+Third-party notices for `rnpm` (working title — R757)
+=====================================================
+
+pnpm / pacquet
+--------------
+
+W318 §10.1 records an operator decision, adopted 2026-08-15 and binding on
+every ticket under R773: this crate is written having *read* pnpm's Rust port
+of its resolver (the `pnpm/crates/*` members, formerly `pnpm/pacquet`), so we
+carry pnpm's MIT notice rather than claim clean-room. Where a specific routine
+is ported rather than reimplemented, the call site says so and names the
+upstream file.
+
+Which parts of this crate are ports, and which are not, is stated per section
+below — see the orogene section for `src/resolve.rs`'s `place`, and the pnpm
+section for `src/peers.rs`. The R773-F1 layer (registry client, packument
+model, on-disk cache) and the R773-F2 layer (`src/spec.rs`'s parser) are
+**not** ports of pnpm code; they were written against npm's published registry
+protocol and document formats. This pnpm notice is carried because the peer
+post-pass in `src/peers.rs` follows `resolve_peers.rs`'s algorithm, and because
+MIT requires the notice to travel with any substantial copied portion.
+
+**`src/peers.rs` IS a port of the algorithm** (R773-F4), from
+`pnpm/crates/resolving-deps-resolver/src/resolve_peers.rs` and its
+`resolve_peers/{walker,cache}.rs` submodules (MIT). Taken from it: the
+depth-first walk that propagates a parent-refs map down the chain; the
+`peersCache`, keyed on package identity plus the resolved peer context, so that
+a revisit in a compatible context short-circuits; the `purePkgs` fast path,
+where a package with no peers anywhere in its subtree is skipped without
+recursing, populated bottom-up; and the cycle break by an `in_progress` set over
+a post-order traversal. The module header repeats this at the call site.
+
+Not taken, because they belong to pnpm's *model* rather than to the algorithm:
+`depPath` construction and its peer suffix, per-importer and catalog handling,
+`link:` remapping, and the `dedupe_peer_dependents` / `hoist_peers` passes. Our
+layout is npm/bun-style hoisting with nesting (W318 §6's adopted layout call),
+so an instance here is a second *node in the tree* rather than a second
+`depPath` key — which is why `Walker::instantiate` and `deep_copy` have no
+upstream counterpart to name.
+
+Retrieved from https://raw.githubusercontent.com/pnpm/pnpm/main/LICENSE on
+2026-09-01:
+
+    The MIT License (MIT)
+
+    Copyright (c) 2015-2016 Rico Sta. Cruz and other contributors
+    Copyright (c) 2016-2026 Zoltan Kochan and other contributors
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+    THE SOFTWARE.
+
+orogene / oro-package-spec / node-maintainer
+--------------------------------------------
+
+`src/spec.rs` (R773-F2) implements npm's package-specifier grammar. That
+grammar was read off **`oro-package-spec` 0.3.34** (Apache-2.0, orogene) —
+`src/parsers/{package,npm,alias,path,git}.rs` and `src/gitinfo.rs` — and the
+`///` grammar lines above the functions in `spec.rs` quote that crate's
+production rules directly, each naming the file it came from.
+
+The implementation is **not** a port: `oro-package-spec` is built on `nom`
+combinators, `spec.rs` is hand-written, and it diverges deliberately in two
+places, both marked at their sites — direct http(s) tarball URLs are supported
+(oro's grammar has no such form) and oro's `GitInfo::Ssh` is folded into
+`GitSource::Url`. Quoted grammar lines are the extent of what was taken.
+
+**`src/resolve.rs`'s `Resolver::place` IS a port** (R773-F3) — the first one in
+this crate. Upstream is **`node-maintainer` 0.3.34**, `src/resolver.rs:346-440`
+`place_child` (Apache-2.0, orogene), which W318 §5 names as the compact correct
+statement of the phase-1 hoisting walk. Taken from it: the loop that climbs the
+parent chain from the requester, both break conditions (an incompatible
+already-resolvable node whose requester lies inside the candidate level's
+subtree; a candidate level whose own manifest requirement the chosen version
+violates), the reflexive ancestry test that makes the first one land *below*
+the conflicting node rather than on top of it, and the initialisation of the
+target at the requester so that a first-iteration conflict nests by falling out
+of the loop rather than by a special case.
+
+Changed: the data structure (a `Vec` arena here, `petgraph` there), and
+upstream's third break — a lockfile-supplied `target_path` placement hint — is
+dropped, because honouring a previous lock is R773-T5's concern rather than
+phase 1's. The call site carries the same attribution.
+
+`Graph::resolve_dep` and `Graph::is_ancestor` (`src/graph.rs:179-191`) are
+reimplemented rather than copied — they are three lines each over a different
+data structure — but they are named here because `place`'s correctness depends
+on their exact semantics, including that `is_ancestor` is reflexive.
+
+node-semver
+-----------
+
+`node-semver` 2.2.0 (felipesere/node-semver-rs, Apache-2.0) is a normal
+crates.io dependency, not vendored code — no notice is required for it. It is
+recorded here only because W318 §8 pins the exact version deliberately: 2.2.0
+is what pacquet uses, and matching it is what keeps our range semantics from
+diverging from pnpm's on the same input.

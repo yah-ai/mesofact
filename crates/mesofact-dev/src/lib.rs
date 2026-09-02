@@ -14,6 +14,11 @@
 //! - [`watcher`] — the rebuild-on-change file watcher.
 //! - [`s3`] — the local S3 surface that stands in for R2 during `dev`
 //!   (W225 §2 "local pond emulation").
+//! - [`app`] — the **library-tier** dev entry point, [`serve_app`]: the dev
+//!   counterpart of [`mesofact::serve_app`] for a consumer whose routes are
+//!   Rust handlers rather than a built `dist/` tree. Read its module doc for
+//!   what the dev half of that tier is and, just as load-bearing, what it
+//!   deliberately is not.
 //! - [`cli`] — the `mes` toolchain CLI, and the two bin targets over it.
 //!
 //! [`cli`] carries the prod verbs (`serve`, `publish`, `new`) as well as the
@@ -27,10 +32,12 @@
 //!
 //! @arch:see(.yah/docs/working/W225-mesofact-consumer-deployment-model.md)
 
+pub mod app;
 pub mod cli;
 pub mod s3;
 pub mod watcher;
 
+pub use app::{serve_app, DevServer, DEV_STATE_DIR};
 pub use s3::{DevS3, DEFAULT_BUCKET as DEV_S3_BUCKET};
 pub use watcher::{BuildDriver, WatchOptions, Watcher};
 

@@ -65,12 +65,20 @@ carries no compatibility promise. It is the escape hatch, not the main road.
 | `src/api.ts` | `mode: "ssr"` — a Fetch handler run per request in a V8 isolate. Owns status, headers, body. |
 | `src/Page.tsx` | The shared component both modes render through. |
 | `bun.lock` | The shipped, pre-resolved lock. Nothing on this path resolves. |
-| `vendor/mesofact-runtime/` | `@mesofact/runtime` **types**, vended at your mesofact version. The barrel that runs is compiled into the binary; imports of it stay external through every bundler path. |
+| `node_modules/@mesofact/runtime` | The render contract's **types**, pinned in `bun.lock` at your exact mesofact version. The barrel that runs on the server is compiled into the binary; server imports of it stay external through every bundler path, so this is what your editor and `tsc` read. |
 | `workload.toml` | Read by the deploy path only. The local loop ignores it. |
 
 ## Typechecking
 
-`npm run typecheck` (or `bun run typecheck`) runs `tsc --noEmit`. TypeScript
-is in the curated set and installs with everything else — but running it does
-need a JS runtime, so this is the one command in this README that wants `node`
-or `bun` present. The build and the dev server do not.
+```
+mes check
+```
+
+That is the whole semantic pass, and it needs no JS runtime either. TypeScript
+7 ships its compiler as a per-platform **native** binary behind a thin Node
+launcher; `mes check` resolves that binary out of `node_modules` and spawns it
+directly, skipping the launcher. Exit code and diagnostics are the checker's
+own, so it drops straight into CI.
+
+`npm run typecheck` / `bun run typecheck` runs exactly that command — the
+script is there for muscle memory, not because a package manager is involved.

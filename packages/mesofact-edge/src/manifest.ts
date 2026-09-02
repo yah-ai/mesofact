@@ -12,13 +12,23 @@
 // `oss/mesofact/crates/mesofact/src/manifest.rs` (Rust) /
 // `packages/mesofact-runtime/src/manifest.ts` (TS); keep this subset in step.
 
+import {
+  derivePageCacheHeaders,
+  type DerivedCacheHeaders,
+  type EdgeCachePolicy,
+} from "./cache-policy.js";
+
 /** The manifest's `error_routes` — asset keys for the branded error pages. */
 export type EdgeErrorRoutes = { "404"?: string; "5xx"?: string };
 
-/** One route as the edge reads it. Only the deferred marker is consulted; the
- *  other `prerender` shapes are build-time and produce ordinary static HTML. */
+/** One route as the edge reads it. The deferred marker selects pointer
+ *  resolution (the other `prerender` shapes are build-time and produce ordinary
+ *  static HTML); `cache_policy` + `requires` are what a served page's
+ *  `Cache-Control` is derived from (R749-B4). */
 export type EdgeRoute = {
   route: string;
+  requires?: readonly string[];
+  cache_policy?: EdgeCachePolicy;
   prerender?: { deferred?: boolean } | Record<string, unknown>;
 };
 
@@ -91,6 +101,33 @@ export function matchesDeferredRoute(
   return manifest.routes.some(
     (r) => isDeferred(r) && matchRoutePattern(r.route, pathname),
   );
+}
+
+/**
+ * The `Cache-Control` (+ `Vary`) the manifest declares for a page served at
+ * `pathname`, or `null` when no route declared one.
+ *
+ * FIRST MATCH WINS among the routes that actually produce a rule — a route with
+ * the inert `{ ttl: 0 }` does not shadow a later one that declares a real
+ * policy. That is the same order `CachePolicyTable` uses in
+ * `crates/mesofact-core/src/cache_policy.rs`, which drops inert routes when it
+ * builds the table and then takes the first match.
+ */
+export function pageCacheHeaders(
+  manifest: EdgeManifest | null,
+  pathname: string,
+): DerivedCacheHeaders | null {
+  for (const route of manifest?.routes ?? []) {
+    const derived = derivePageCacheHeaders(route.cache_policy, isGated(route));
+    if (derived && matchRoutePattern(route.route, pathname)) {
+      return derived;
+    }
+  }
+  return null;
+}
+
+function isGated(route: EdgeRoute): boolean {
+  return Array.isArray(route.requires) && route.requires.length > 0;
 }
 
 function isDeferred(route: EdgeRoute): boolean {

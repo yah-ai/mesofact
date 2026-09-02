@@ -45,6 +45,7 @@ import {
   buildPageRoot,
   loadManifest,
   matchesDeferredRoute,
+  pageCacheHeaders,
   type EdgeErrorRoutes,
   type EdgeManifest,
 } from "./manifest.js";
@@ -89,12 +90,16 @@ type ResilienceMap = Record<string, ResiliencePolicy>;
 // immutable — the pointer is the only mutable object.
 const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
 
-// A page served out of the build tree is bytes at an IMMUTABLE url (they are
-// published `public, max-age=86400`, correct for `<build_id>/html/x.html`) being
-// served at a MUTABLE one (`/x`, whose content changes when the pointer moves).
+// A page served out of the build tree is bytes at an IMMUTABLE url being served
+// at a MUTABLE one (`/x`, whose content changes when the pointer moves).
 // Passing the object's own header through would let a client hold a day-old
 // release page after a revalidate, which is the freshness bug this indirection
 // exists to fix, reintroduced one layer down.
+//
+// This is the DEFAULT, not the answer: since R749-B4 a route that declares a
+// `cache_policy` gets that policy's derived header instead (`withPageCache`).
+// The default is what a page whose author said nothing about caching gets, and
+// "nothing" cannot safely mean "hold it" at a mutable URL.
 const PAGE_CACHE_CONTROL = "no-cache";
 
 export default {
@@ -210,7 +215,7 @@ async function route(request: Request, env: Env): Promise<Response> {
       for (const candidate of assetCandidates(key)) {
         const resp = await fetch(`${env.ASSET_ORIGIN}/${pageRoot}/${candidate}`);
         if (resp.ok) {
-          return routePage(resp);
+          return routePage(resp, manifest, path);
         }
       }
     }
@@ -219,7 +224,13 @@ async function route(request: Request, env: Env): Promise<Response> {
   // Fetch from asset origin — the common (build-time HTML/asset) hit.
   const assetResp = await fetch(`${env.ASSET_ORIGIN}/${key}`);
   if (assetResp.ok) {
-    return assetResp;
+    // A page here came from the flat layout (no build tree, or no copy of this
+    // key in it); the manifest is already loaded for any page key, so the
+    // declared policy still reaches it. Non-page assets are content-hashed and
+    // keep the publisher's `immutable` verbatim.
+    return isPageKey(key)
+      ? withDeclaredCache(assetResp, manifest, path)
+      : assetResp;
   }
 
   // ── static miss ──────────────────────────────────────────────────────────
@@ -244,7 +255,7 @@ async function route(request: Request, env: Env): Promise<Response> {
   for (const candidate of assetCandidates(key).slice(1)) {
     const cleanResp = await fetch(`${env.ASSET_ORIGIN}/${candidate}`);
     if (cleanResp.ok) {
-      return cleanResp;
+      return withDeclaredCache(cleanResp, manifest, path);
     }
   }
 
@@ -268,6 +279,14 @@ async function route(request: Request, env: Env): Promise<Response> {
  * slash (`/c/abc123` → `c/abc123`); the publisher flips the same key. Present →
  * the render-root bytes with immutable cache headers (content-addressed);
  * deleted → 410; absent → the branded 404 page; malformed record → 5xx.
+ *
+ * "Immutable" is the default here, not the answer: a deferred route that
+ * declares a `cache_policy` gets that policy instead (R749-B4). The default
+ * reads the response as content-addressed, which is true of the bytes and not
+ * of the URL they are served at — so a route whose author put a TTL on it is
+ * saying something the default is otherwise free to ignore for a year, and a
+ * declaration nothing can override the tier default with is the silent no-op
+ * this relay exists to remove.
  */
 async function serveInstance(
   env: Env,
@@ -296,7 +315,7 @@ async function serveInstance(
       return errorResponse(404, env.ASSET_ORIGIN, manifest?.error_routes);
     }
     const headers = new Headers(contentResp.headers);
-    headers.set("Cache-Control", IMMUTABLE_CACHE_CONTROL);
+    stampPageCache(headers, manifest, path, IMMUTABLE_CACHE_CONTROL);
     return new Response(contentResp.body, { status: 200, headers });
   }
 
@@ -375,11 +394,78 @@ function assetCandidates(key: string): string[] {
   return [key, `${key}.html`, `${key}/index.html`];
 }
 
-/** Re-header a build-tree page for service at its stable route. */
-function routePage(resp: Response): Response {
+/**
+ * Re-header a page response with the `cache_policy` its route declared
+ * (R749-B4).
+ *
+ * `fallback` is what a page gets when no route declared anything, and is the
+ * only difference between this function's two callers:
+ *
+ *   - a **build-tree** page (`routePage`) falls back to `PAGE_CACHE_CONTROL`,
+ *     because immutable bytes served at a mutable URL must not be held;
+ *   - a **flat-layout** page (`withDeclaredCache`) falls back to the object's
+ *     own header, which is what that path has always returned — the older
+ *     publishers that write the flat copy are not `publish_dist` and never
+ *     saw a route.
+ *
+ * Derived from the manifest, not forwarded from the object, for the reason
+ * `cache-policy.ts` states at length: the object's header describes the
+ * immutable build-scoped URL, and this response is being served at the mutable
+ * route.
+ */
+function withPageCache(
+  resp: Response,
+  manifest: EdgeManifest | null,
+  path: string,
+  fallback: string | null,
+): Response {
   const headers = new Headers(resp.headers);
-  headers.set("Cache-Control", PAGE_CACHE_CONTROL);
+  if (!stampPageCache(headers, manifest, path, fallback)) return resp;
   return new Response(resp.body, { status: resp.status, headers });
+}
+
+/**
+ * Write the declared (or fallback) cache headers into `headers` in place.
+ * Returns false when nothing was written, so a caller holding a response it
+ * would rather not rebuild can hand back the original.
+ *
+ * `serveInstance` uses this directly because it re-statuses its response to 200
+ * anyway; everything else goes through `withPageCache`.
+ */
+function stampPageCache(
+  headers: Headers,
+  manifest: EdgeManifest | null,
+  path: string,
+  fallback: string | null,
+): boolean {
+  const declared = pageCacheHeaders(manifest, path);
+  if (!declared && fallback === null) return false;
+  headers.set("Cache-Control", declared?.cacheControl ?? fallback!);
+  if (declared?.vary) headers.set("Vary", declared.vary);
+  return true;
+}
+
+/** A page out of the build tree, re-headered for service at its stable route. */
+function routePage(
+  resp: Response,
+  manifest: EdgeManifest | null,
+  path: string,
+): Response {
+  return withPageCache(resp, manifest, path, PAGE_CACHE_CONTROL);
+}
+
+/**
+ * A page out of the flat layout. Untouched unless its route declared a policy —
+ * a declaration must not go silently unenforced just because the bytes happened
+ * to resolve through the pre-build-tree layout, but neither may this path start
+ * inventing headers for the sites that declare nothing.
+ */
+function withDeclaredCache(
+  resp: Response,
+  manifest: EdgeManifest | null,
+  path: string,
+): Response {
+  return withPageCache(resp, manifest, path, null);
 }
 
 /**
@@ -444,22 +530,113 @@ function parseRouteHeaders(raw: string | undefined): RouteHeaderRule[] {
   if (routeHeaderCache?.raw === raw) return routeHeaderCache.rules;
   let rules: RouteHeaderRule[] = [];
   try {
-    const v: unknown = JSON.parse(raw);
-    if (Array.isArray(v)) rules = v.filter(isRouteHeaderRule);
-  } catch {
+    rules = validateRouteHeaderTable(raw);
+  } catch (err) {
     // Malformed binding — serve without extra headers rather than 500 every
     // request. The Rust side serializes this, so a malformed value is a bug
     // there, and a dead site is a worse symptom than a missing header.
+    //
+    // R749-T1: this is the ONE place in the system where a declared policy is
+    // still allowed not to run, and it stays that way deliberately — the Rust
+    // origin refuses the start for the same input (`RouteHeaderTable::parse`),
+    // so the strictness belongs at the producer, not on the last hop before a
+    // user. What changed is that it is no longer silent, and no longer
+    // *partial*: a table with one bad rule used to apply the other rules, so a
+    // site looked configured while one path was not. All-or-nothing plus a log
+    // line is the honest version of "we could not enforce this".
+    //
+    // R749-T5: the producer-side check that makes this posture defensible now
+    // exists — `DomainConfig::validate_route_headers`
+    // (`oss/yubaba/crates/cloud/src/config.rs`) fails `yah cloud apply` at
+    // manifest load on anything `validateRouteHeaderTable` would throw on, so
+    // reaching this catch means a hand-edited binding, not a normal deploy.
+    console.error(
+      `mesofact: ROUTE_HEADERS binding is malformed, serving with NO route headers — ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
     rules = [];
   }
   routeHeaderCache = { raw, rules };
   return rules;
 }
 
+/**
+ * Parse and fully validate a `ROUTE_HEADERS` table, throwing on anything this
+ * Worker would otherwise have dropped (R749-T1).
+ *
+ * Exported so the producing side can fail a deploy rather than ship a table
+ * whose broken half disappears at the edge — the build-validation direction
+ * R749-F3 named. The Rust half of the same check is
+ * `mesofact::route_headers::RouteHeaderTable::parse`; keep the two agreeing.
+ */
+export function validateRouteHeaderTable(raw: string): RouteHeaderRule[] {
+  const v: unknown = JSON.parse(raw);
+  if (!Array.isArray(v)) {
+    throw new Error("expected a JSON array of {path, headers} rules");
+  }
+  return v.map((rule, i) => {
+    if (!isRouteHeaderRule(rule)) {
+      throw new Error(`rule ${i} is not a {path: string, headers: object}`);
+    }
+    if (rule.path === "") {
+      throw new Error(
+        `rule ${i} has an empty path — a rule that matches nothing (or everything, depending on who reads it) is not a policy`,
+      );
+    }
+    assertSettableHeaders(rule, i);
+    return rule;
+  });
+}
+
+/**
+ * R749-T5 — a rule must be *applicable*, not merely shaped like one.
+ *
+ * Shape validation alone let `"Cross Origin Opener Policy"` (spaces, not
+ * hyphens — one keystroke away in the hand-written `.yah/domains/*.toml` this
+ * table comes from) through to `applyRouteHeaders`, where `Headers.set` throws
+ * inside the exported `fetch` and every request 500s. That is precisely the
+ * dead site `parseRouteHeaders`'s catch exists to prevent, so the check belongs
+ * on this side of it: the same input now degrades to serve-without-headers plus
+ * a log line, and the Rust origin still refuses the start.
+ *
+ * A non-string value is the other divergence: `Headers.set` coerces `1` to
+ * `"1"` and serves it, while `RouteHeaderTable::parse` refuses the table — one
+ * door applying a header the other rejects is the failure this fixture set was
+ * built to catch, so reject it here too.
+ */
+function assertSettableHeaders(rule: RouteHeaderRule, i: number): void {
+  const probe = new Headers();
+  for (const [name, value] of Object.entries(rule.headers)) {
+    if (typeof value !== "string") {
+      throw new Error(
+        `rule ${i} declares ${JSON.stringify(name)} = ${JSON.stringify(value)}, which is not a string`,
+      );
+    }
+    try {
+      probe.set(name, value);
+    } catch (err) {
+      throw new Error(
+        `rule ${i} declares ${JSON.stringify(name)} = ${JSON.stringify(value)}, which cannot be set as a response header — ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+}
+
 function isRouteHeaderRule(v: unknown): v is RouteHeaderRule {
   if (!v || typeof v !== "object") return false;
   const r = v as RouteHeaderRule;
-  return typeof r.path === "string" && !!r.headers && typeof r.headers === "object";
+  return (
+    typeof r.path === "string" &&
+    !!r.headers &&
+    typeof r.headers === "object" &&
+    // An array passes `typeof === "object"` and would then be walked by its
+    // indices, so `[["a","b"]]` becomes the settable header `0` at the edge
+    // while the Rust side rejects the table outright.
+    !Array.isArray(r.headers)
+  );
 }
 
 /**

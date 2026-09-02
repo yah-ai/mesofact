@@ -1,5 +1,6 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { Miniflare } from "miniflare";
+import { readFileSync } from "node:fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 
@@ -896,6 +897,65 @@ describe("per-route response headers", () => {
   });
 });
 
+// ── R749-F3: front-door parity ───────────────────────────────────────────────
+//
+// The SAME fixture the sovereign path asserts in
+// `crates/mesofact/tests/route_headers_parity.rs`. One description of what a
+// domain's declared headers must do, asserted against both front doors, because
+// the defect this exists to stop is the two doors disagreeing: until R749-F3
+// only this Worker read the table, so flipping `front_door` from `worker` to
+// `passway` silently dropped COOP/COEP — correct bytes, 200 OK, dead wasm app.
+// See tests/fixtures/route-headers/README.md.
+type ParityFixture = {
+  table: { path: string; headers: Record<string, string> }[];
+  assets: Assets;
+  cases: {
+    name: string;
+    path: string;
+    status: number;
+    expect: Record<string, string>;
+    absent?: string[];
+  }[];
+};
+
+// `join(__dirname, …)` rather than `fileURLToPath(new URL(…))`: this package's
+// tsconfig pulls in the DOM `URL`, which is not assignable to node's, so the
+// URL form fails `bun run typecheck` while the test itself passes. A red
+// typecheck nobody can act on costs the gate its signal.
+const PARITY: ParityFixture = JSON.parse(
+  readFileSync(join(__dirname, "../../../tests/fixtures/route-headers/parity.json"), "utf8"),
+);
+
+describe("route-header front-door parity fixture", () => {
+  let setup: MfSetup;
+
+  beforeAll(async () => {
+    setup = await makeMf({
+      mode: "static",
+      assets: PARITY.assets,
+      routeHeaders: PARITY.table,
+    });
+  });
+
+  afterAll(async () => {
+    await setup.mf.dispose();
+    setup.stop();
+  });
+
+  for (const c of PARITY.cases) {
+    test(`${c.name} (${c.path})`, async () => {
+      const resp = await setup.mf.dispatchFetch(`http://w.test${c.path}`);
+      expect(resp.status).toBe(c.status);
+      for (const [name, value] of Object.entries(c.expect)) {
+        expect(resp.headers.get(name)).toBe(value);
+      }
+      for (const name of c.absent ?? []) {
+        expect(resp.headers.get(name)).toBeNull();
+      }
+    });
+  }
+});
+
 describe("no ROUTE_HEADERS binding", () => {
   let setup: MfSetup;
 
@@ -941,5 +1001,96 @@ describe("malformed ROUTE_HEADERS binding", () => {
     const resp = await setup.mf.dispatchFetch("http://w.test/");
     expect(resp.status).toBe(200);
     expect(await resp.text()).toContain("hello");
+  });
+});
+
+// R749-T1. A table with one bad rule used to have its OTHER rules applied, so
+// the site looked configured while one path silently was not — the exact shape
+// of "declared and not enforced" this ticket forbids, one rule deep instead of
+// one field deep. All-or-nothing: if the table cannot be trusted, none of it is
+// applied, and the log line says so.
+describe("partially malformed ROUTE_HEADERS binding", () => {
+  let setup: MfSetup;
+
+  beforeAll(async () => {
+    setup = await makeMf({
+      mode: "static",
+      assets: { "index.html": { body: "<h1>hello</h1>", type: "text/html" } },
+      rawRouteHeaders: JSON.stringify([
+        { path: "/*", headers: { "X-Good": "1" } },
+        { path: 42, headers: {} },
+      ]),
+    });
+  });
+
+  afterAll(async () => {
+    await setup.mf.dispose();
+    setup.stop();
+  });
+
+  test("applies none of the table rather than the half that parsed", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/");
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get("X-Good")).toBeNull();
+  });
+});
+
+// R749-T5. A shape-valid rule whose header cannot actually be SET used to pass
+// validation and then throw inside the exported `fetch`, so the whole site
+// 500'd — the dead site the catch above exists to prevent, reached by the most
+// likely typo in the hand-written manifest that produces this table. The
+// producer now refuses it at `yah cloud apply`
+// (`DomainConfig::validate_route_headers`); the edge degrades if one gets past.
+describe("ROUTE_HEADERS binding whose header cannot be set", () => {
+  let setup: MfSetup;
+
+  beforeAll(async () => {
+    setup = await makeMf({
+      mode: "static",
+      assets: { "index.html": { body: "<h1>hello</h1>", type: "text/html" } },
+      rawRouteHeaders: JSON.stringify([
+        { path: "/*", headers: { "Cross Origin Opener Policy": "same-origin" } },
+      ]),
+    });
+  });
+
+  afterAll(async () => {
+    await setup.mf.dispose();
+    setup.stop();
+  });
+
+  test("serves without the headers instead of throwing out of fetch", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/");
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toContain("hello");
+    // Not asserted by reading the header back: `Headers.get` rejects the name
+    // too, which is the whole reason the edge could not have applied it.
+  });
+});
+
+// A non-string value is where the two doors disagree in the DANGEROUS
+// direction: `Headers.set` coerces it and serves the header, while
+// `RouteHeaderTable::parse` refuses the table, so the same manifest is enforced
+// at one front door and refused at the other.
+describe("ROUTE_HEADERS binding with a non-string header value", () => {
+  let setup: MfSetup;
+
+  beforeAll(async () => {
+    setup = await makeMf({
+      mode: "static",
+      assets: { "index.html": { body: "<h1>hello</h1>", type: "text/html" } },
+      rawRouteHeaders: JSON.stringify([{ path: "/*", headers: { "X-Count": 1 } }]),
+    });
+  });
+
+  afterAll(async () => {
+    await setup.mf.dispose();
+    setup.stop();
+  });
+
+  test("applies nothing rather than serving a coerced value the origin rejects", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/");
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get("X-Count")).toBeNull();
   });
 });

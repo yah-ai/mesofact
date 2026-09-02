@@ -18,15 +18,36 @@
 //! the watcher, the dev S3 surface and rolldown into the prod closure, and is
 //! exactly what §2 forbids. `mesofact` stays a standalone binary.
 //!
-//! Two verbs are deliberately absent:
+//! **Why not spawn the `mesofact` binary for the prod verbs instead of linking
+//! it?** (Asked more than once; the answer is not "in-process is tidier".) It
+//! would save nothing. `mes dev` — the 95% command — is built directly on the
+//! facade's engine: [`mesofact::Server::from_workload`],
+//! [`mesofact::ssr::spawn`], [`mesofact::SsrSpawnOptions`],
+//! [`mesofact::ProxyMap`]. The facade is linked into this binary for the DEV
+//! loop whether or not `serve` is in-process, so process-calling removes zero
+//! bytes and adds a runtime dependency on finding `mesofact` on `PATH` —
+//! `cargo install mesofact-dev` would yield a `mes` whose `serve` fails until
+//! you separately install `mesofact`. It would also hand us exit-code and
+//! signal forwarding for no gain. The link-graph direction is what carries the
+//! security property here; the process boundary carries none of it.
 //!
-//! - **`proxy`** — Mode-2 deployment plumbing (worker pool, manifest reload on
-//!   SIGHUP). It has no dev-loop meaning; `mesofact proxy` remains its home.
-//! - **`check`** (`tsc --noEmit`) — running TypeScript needs node or bun on
-//!   `PATH`, and the entire point of the build path is that it does not. A
-//!   `mes check` that dies with `bun: command not found` on precisely the
-//!   machines this design promises don't need bun would be a worse affordance
-//!   than the `npm run typecheck` the scaffold already documents.
+//! One verb is absent: **`proxy`** — Mode-2 deployment plumbing (worker pool,
+//! manifest reload on SIGHUP). It has no dev-loop meaning; `mesofact proxy`
+//! remains its home. Deliberate, and still true.
+//!
+//! `check` used to be a second one, for a reason that did
+//! not hold (R451, reported by @Ashguard:dragon 2026-09-01): the note read
+//! "running TypeScript needs node or bun on `PATH`", and it does not —
+//! typescript@7 ships `bin/tsc` as a three-line Node shim over a per-platform
+//! **native Go binary** (`node_modules/@typescript/typescript-<platform>-<arch>/lib/tsc`)
+//! that `mesofact-build`'s `check.rs` resolves and spawns directly.
+//!
+//! **`mes check` is implemented as of R832-T4**, and the reason it had to be
+//! is sharper than "cheap": a scaffolded project's `typecheck` script has to
+//! name a binary the user can actually reach, and the R759-F2 trampoline
+//! vends exactly three names — `mesofact`, `mes`, `mesofact-dev`. Every other
+//! name, `mesofact-build` included, exits 70. So the verb had to appear on one
+//! of those three before `mesofact new` could put it in a `package.json`.
 //!
 //! ## Bare invocation
 //!
@@ -36,6 +57,22 @@
 //! bare form, so the ~30 spawn sites in the parent camp need no flag day. The
 //! one divergence is a workload directory literally named after a subcommand
 //! (`mesofact-dev serve`); spell it `./serve` if that ever comes up.
+//!
+//! @yah:relay(R822, "Retire the mesofact-dev BINARY; mes is the only dev command (the package name stays)")
+//! @yah:at(2026-09-02T06:04:50Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:next("OPERATOR DECISION 2026-09-01, and it is the inverse of the split first proposed: descriptive name where you READ it, short name where you TYPE it. The PACKAGE stays mesofact-dev permanently -- not as a legacy spelling of mes, but as the meta crate, the entrypoint to the dev-tier tools mes needs that are NOT mesofact (the watcher, the local S3 surface standing in for R2, serve_app). It depends on the mesofact facade rather than being it, and that direction IS the W225 section 2 prod/dev boundary. The BINARY mesofact-dev goes: nobody wants to type it, ever.")
+//! @yah:next("SCOPE, measured not guessed: 30 Rust string-literal sites resolve \"mesofact-dev\" as an executable name (grep '\"mesofact-dev\"' app crates --include=*.rs, excluding @yah: annotation prose, which is the other ~170 hits and is history rather than reference). The load-bearing ones: crates/yah/plugin/src/source.rs:112 keys a builtin plugin manifest on it via include_str!; crates/yah/bundled/src/lib.rs:171 registers it as a bundled binary; app/yah/desktop/src/mesofact_versions.rs:80,94 resolve it through yah_bundled::find and slot.bin(); app/yah/cli/src/plugin_host.rs:414 names it as SourceRef::Bundled.")
+//! @yah:next("THE SHARP EDGE, and the reason this is a migration rather than a find-and-replace: ALREADY-INSTALLED store slots have a file literally named mesofact-dev on disk. app/yah/desktop/src/mesofact_versions.rs does slot.bin(\"mesofact-dev\"), so renaming the bin breaks resolution against versions a user already installed. Needs a compat window that accepts either filename, or a store migration -- decide which before touching the 30 sites.")
+//! @yah:next("ALSO IN SCOPE, all naming the bin rather than the package: .yah/qed/release-build.toml builds package=mesofact-dev bin=mesofact-dev (-> bin=mes); scripts/check-mesofact-store.sh asserts a slot holds mesofact AND mesofact-dev and that shims exist for mesofact/mes/mesofact-dev; scripts/check-install-sh-compat.sh compares the mesofact-dev shim; oss/mesofact/scripts/check-mesofact-new.sh copies target/debug/mesofact-dev into the test slot and runs `mesofact-dev .`.")
+//! @yah:next("AND THE LEGACY-FORM LOGIC ITSELF: cli.rs's bare-invocation design exists specifically so `mesofact-dev <DIR> --port N` parses as `mes dev <DIR>`, which is what let the parent camp's spawn sites keep working without a flag day. Once the bin is gone that rationale is spent -- the bare form is still right for `mes`, but the module doc's justification for it needs rewriting rather than deleting.")
+//! @yah:next("NOT BLOCKING THE CRATES.IO PUBLISH. Because the package name is unchanged, mesofact-dev@0.8.29 can be published before any of this lands; removing a bin target later is an ordinary deprecation (cargo install at 0.8.29 gets both binaries, at a later version gets only mes). This ticket was originally framed as racing that publish -- it is not.")
+//! @yah:next("END STATE DECIDED BY OPERATOR 2026-09-01, and it supersedes the narrower 'drop the second [[bin]]' framing this ticket opened with: mesofact-dev has NO BIN TARGETS AT ALL. It becomes a pure library -- the meta crate, the entrypoint to the dev-tier tools that are not mesofact. A new thin package `mes` owns the binary: one src/main.rs, three lines over mesofact_dev::cli::run(), depending on mesofact-dev.")
+//! @yah:next("WHY THIS SHAPE RATHER THAN JUST DELETING THE mesofact-dev BIN: `cargo install` takes a PACKAGE name, not a bin name. With the binary living in the mesofact-dev package, `cargo install mes` fails with 'could not find mes in registry' and users must know to type `cargo install mesofact-dev` -- unguessable from the command. Splitting gives library named for what it IS and binary named for what you TYPE, and removes the bin-collision footgun of two packages both emitting ~/.cargo/bin/mes.")
+//! @yah:next("SAFE TO DO: verified 2026-09-01 that NO crate anywhere takes mesofact-dev as a library dependency today -- the only line in the tree is the library-tier scaffold template (crates/mesofact/src/cli/new/template-lib/Cargo.toml:31), which wants the library and is unaffected. So nothing loses a binary it was consuming, and the new mes package is the first real lib consumer.")
+//! @yah:gotcha("SUPERSEDED NOTE, removed rather than left to mislead: an earlier gotcha here said the end state was 'package mesofact-dev while the only [[bin]] is mes'. It is not. The end state is mesofact-dev with ZERO bin targets and a separate `mes` package owning the binary. The cargo package-vs-bin decoupling still matters, but it is now the reason the LIBRARY can keep a descriptive name while the COMMAND gets a short one across a package boundary, not within one.")
+//! @yah:gotcha("FEATURE FORWARDING IS THE FIDDLY PART, and this crate already documents the same trap one level down. mesofact-dev's surface is default = [ssr, build]; ssr = [mesofact/ssr, dep:mesofact-publisher, publish]; publish = [mesofact/publish]; build = [mesofact/build]. The new `mes` package must re-expose these (ssr = [mesofact-dev/ssr], etc.) or `cargo install mes --no-default-features` silently loses the lean static/SPA path that exists so consumers can skip the V8 toolchain. mes itself has no cfgs -- cli.rs's #[cfg(feature = ...)] gates evaluate in mesofact-dev -- so forwarding is all that is required, but omitting it is invisible until someone tries the lean build.")
 
 use std::path::PathBuf;
 #[cfg(feature = "ssr")]
@@ -77,6 +114,9 @@ enum Command {
     /// One-shot production build into `dist/`. No watcher, no server.
     #[cfg(feature = "build")]
     Build(BuildArgs),
+    /// Full TypeScript semantic pass (`tsc --noEmit`) over the project.
+    #[cfg(feature = "build")]
+    Check(CheckArgs),
     /// Scaffold a new mesofact project pinned to this binary's version.
     New(mesofact::cli::new::NewArgs),
     /// Serve a built bundle or host SSR routes — the prod serving path.
@@ -84,6 +124,38 @@ enum Command {
     /// Upload a built dist/ tree, swap the manifest pointer, purge CDN tags.
     #[cfg(feature = "publish")]
     Publish(mesofact::cli::publish::PublishArgs),
+}
+
+/// Full semantic pass (`mes check`) — R832-T4, and the verb the header's
+/// "check is absent" note said belonged to whichever ticket owns the check
+/// surface.
+///
+/// It matters that this exists on the **dev** binary rather than only on
+/// `mesofact-build`. `mesofact-build` ships in the release tarball, but the
+/// R759-F2 trampoline dispatches on the name it was invoked as and knows only
+/// `mesofact`, `mes` and `mesofact-dev` — every other name exits 70. That is
+/// deliberate rather than a gap: `scripts/mesofact-build.sh` reaches that
+/// binary by *path* out of a per-version cache, which is how in-repo consumers
+/// use it. But a scaffolded `package.json` has only `PATH` to work with, so it
+/// can name only a verb the trampoline vends — and `mes check` is one.
+///
+/// A thin forward to `mesofact::build::check`; this crate already links that
+/// crate behind the default-on `build` feature, so it costs a match arm.
+#[cfg(feature = "build")]
+#[derive(clap::Args, Debug)]
+struct CheckArgs {
+    /// Project directory containing `tsconfig.json`. Defaults to the current
+    /// directory, matching `mes dev`.
+    #[arg(default_value = ".")]
+    project: PathBuf,
+
+    /// tsconfig path (default: `<project>/tsconfig.json`).
+    #[arg(long, value_name = "PATH")]
+    tsconfig: Option<PathBuf>,
+
+    /// Extra args forwarded to the checker verbatim, after `--`.
+    #[arg(last = true)]
+    checker_args: Vec<String>,
 }
 
 /// One-shot build (`mes build`).
@@ -172,6 +244,26 @@ pub async fn run() -> std::process::ExitCode {
         Command::Dev(args) => to_exit_code(dev(args).await),
         #[cfg(feature = "build")]
         Command::Build(args) => to_exit_code(build(args).await),
+        // Mirrors `mesofact-build check`'s exit-code contract rather than
+        // to_exit_code's: the checker's own status is the answer, and
+        // collapsing every non-zero to 1 would lose it.
+        #[cfg(feature = "build")]
+        Command::Check(args) => match mesofact::build::check::check(mesofact::build::check::CheckOptions {
+            project_root: args.project,
+            tsconfig: args.tsconfig,
+            extra_args: args.checker_args,
+        }) {
+            Ok(outcome) if outcome.code == 0 => {
+                println!("mes check ok — tsc full semantic pass, no errors");
+                std::process::ExitCode::SUCCESS
+            }
+            // The checker already streamed its diagnostics.
+            Ok(outcome) => std::process::ExitCode::from(outcome.code.clamp(1, 255) as u8),
+            Err(err) => {
+                eprintln!("mes: {err:#}");
+                std::process::ExitCode::FAILURE
+            }
+        },
         Command::New(args) => to_exit_code(mesofact::cli::new::run(args)),
         Command::Serve(args) => to_exit_code(mesofact::cli::serve::run(args).await),
         // `publish` owns its exit codes (2 = missing config, etc.) — pass through.
@@ -469,6 +561,22 @@ mod tests {
         assert_eq!(args.port, DEFAULT_PORT);
     }
 
+    /// `mes check` has to be a real subcommand rather than a directory named
+    /// `check` handed to the bare `dev` form — the bare-form fallthrough makes
+    /// that a live confusion, and a scaffolded `package.json` names this verb.
+    #[cfg(feature = "build")]
+    #[test]
+    fn check_is_a_subcommand_and_defaults_to_here() {
+        let Command::Check(args) = dispatch(&["mes", "check"]) else {
+            panic!("`mes check` did not resolve to the check verb");
+        };
+        assert_eq!(args.project, PathBuf::from("."));
+        let Command::Check(args) = dispatch(&["mes", "check", "site"]) else {
+            panic!("`mes check site` did not resolve to the check verb");
+        };
+        assert_eq!(args.project, PathBuf::from("site"));
+    }
+
     #[test]
     fn bare_form_takes_dev_flags() {
         let Command::Dev(args) = dispatch(&["mes", "site", "--port", "3000"]) else {
@@ -535,5 +643,23 @@ mod tests {
         assert!(matches!(dispatch(&["mes", "new", "hello"]), Command::New(_)));
         #[cfg(feature = "publish")]
         assert!(matches!(dispatch(&["mes", "publish"]), Command::Publish(_)));
+    }
+
+    /// `--lib` (R832-T2) reaches `mesofact::cli::new` through this CLI too.
+    /// The flag is defined on the facade's `NewArgs`, so a `mes new --lib`
+    /// that failed to parse would mean the two CLIs had drifted apart — the
+    /// exact thing the superset exists to prevent.
+    #[test]
+    fn new_takes_the_library_tier_flag() {
+        let Command::New(args) = dispatch(&["mes", "new", "--lib", "hello"]) else {
+            panic!("expected New");
+        };
+        assert!(args.lib);
+        assert_eq!(args.path, PathBuf::from("hello"));
+
+        let Command::New(args) = dispatch(&["mes", "new", "hello"]) else {
+            panic!("expected New");
+        };
+        assert!(!args.lib, "the standalone tier stays the default");
     }
 }

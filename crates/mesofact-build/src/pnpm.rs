@@ -483,41 +483,20 @@ fn rebase_link(requester: &Requester, target: &str) -> Result<PathBuf> {
     Ok(out)
 }
 
-/// npm's `os`/`cpu` gate. A plain list is an allowlist; entries prefixed `!`
-/// are a denylist. `libc` is deliberately not checked — it cannot be detected
-/// reliably from here, and guessing wrong would skip a package the project
-/// needs.
+/// npm's `os`/`cpu` gate. `libc` is deliberately not checked — it cannot be
+/// detected reliably from here, and guessing wrong would skip a package the
+/// project needs.
+///
+/// The list semantics and the host's npm-spelled name both come from
+/// [`crate::install`] (R832-T4). This module used to carry its own copy of
+/// both; they had already drifted — the local table knew nothing of `sunos`,
+/// `ppc64` or `loong64` — which is the drift a second copy always ends in.
 fn platform_supported(meta: &PackageMeta) -> bool {
-    matches(&meta.os, npm_os()) && matches(&meta.cpu, npm_cpu())
-}
-
-fn matches(list: &[String], current: &str) -> bool {
-    if list.is_empty() {
+    let Some((os, cpu)) = crate::install::host_platform_arch() else {
         return true;
-    }
-    let (denied, allowed): (Vec<&String>, Vec<&String>) =
-        list.iter().partition(|v| v.starts_with('!'));
-    if denied.iter().any(|v| &v[1..] == current) {
-        return false;
-    }
-    allowed.is_empty() || allowed.iter().any(|v| v.as_str() == current)
-}
-
-fn npm_os() -> &'static str {
-    match std::env::consts::OS {
-        "macos" => "darwin",
-        "windows" => "win32",
-        other => other,
-    }
-}
-
-fn npm_cpu() -> &'static str {
-    match std::env::consts::ARCH {
-        "x86_64" => "x64",
-        "aarch64" => "arm64",
-        "x86" => "ia32",
-        other => other,
-    }
+    };
+    crate::install::platform_admits(meta.os.iter().map(String::as_str), os)
+        && crate::install::platform_admits(meta.cpu.iter().map(String::as_str), cpu)
 }
 
 /// The string-keyed entries of `value[field]`, or nothing if it is absent.
@@ -816,16 +795,23 @@ snapshots:
         );
     }
 
+    /// Kept here rather than folded into `install`'s copy: this asserts that
+    /// *this module's* gate reads a pnpm `os:` sequence the npm way, which is
+    /// the thing that would break if the delegation were ever unwound.
     #[test]
     fn platform_gates_read_allow_and_deny_lists() {
-        let os = |v: &[&str]| {
-            matches(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>(), npm_os())
+        let (host_os, _) = crate::install::host_platform_arch().expect("a modelled host");
+        let gated = |v: &[&str]| {
+            platform_supported(&PackageMeta {
+                os: v.iter().map(|s| s.to_string()).collect(),
+                ..PackageMeta::default()
+            })
         };
-        assert!(os(&[]), "an empty list gates nothing");
-        assert!(os(&[npm_os()]));
-        assert!(!os(&["plan9"]));
-        assert!(!os(&[&format!("!{}", npm_os())]));
-        assert!(os(&["!plan9"]));
+        assert!(gated(&[]), "an empty list gates nothing");
+        assert!(gated(&[host_os]));
+        assert!(!gated(&["plan9"]));
+        assert!(!gated(&[&format!("!{host_os}")]));
+        assert!(gated(&["!plan9"]));
     }
 
     /// `link:` in an importer is a workspace dependency: a symlink, not a

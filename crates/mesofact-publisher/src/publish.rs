@@ -14,10 +14,19 @@
 //! `/tag-index.json` before commit, diffs added/removed/changed-URL tags
 //! against the new one, and calls [`CdnPurger::purge_tags`] with the union so
 //! only routes whose content actually moved are evicted from the CDN.
+//!
+//! R749-B4 made this a real `cache_policy` consumer. The upload walk now maps
+//! each `html/<key>.html` back to the path it serves at
+//! ([`page_path_for`]) and asks the manifest's
+//! [`CachePolicyTable`](mesofact_core::CachePolicyTable) what that route
+//! declared, instead of choosing a `Cache-Control` from the path prefix alone.
+//! The prefix table survives as the default for pages nobody declared a policy
+//! for. Both serving tiers already honoured the declaration; this is the third
+//! and last front door.
 
 use crate::{CdnPurger, ObjectStore, PurgeError, PutOpts, StoreError};
 use bytes::Bytes;
-use mesofact_core::Manifest;
+use mesofact_core::{CachePolicyTable, Manifest};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -112,6 +121,11 @@ pub async fn publish_dist(
         None => None,
     };
 
+    // R749-B4: the declared `cache_policy` follows the page to the CDN. Built
+    // from the manifest we already parsed, so the header on the object and the
+    // header `mesofact serve` stamps on the same route come out of one table.
+    let cache_policy = CachePolicyTable::from_routes(&manifest.routes);
+
     let mut uploaded: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
 
@@ -131,7 +145,7 @@ pub async fn publish_dist(
             &key,
             body,
             content_type_for(&entry),
-            cache_control_for(&rel_str),
+            cache_control_for(&rel_str, &cache_policy),
             &mut uploaded,
             &mut skipped,
         )
@@ -372,17 +386,67 @@ fn content_type_for(path: &Path) -> String {
 }
 
 /// Per-path Cache-Control. assets/* and hydrate/* are content-hashed so they
-/// can be immutable; html/* gets a long-but-purgeable TTL (CDN evicts by tag);
+/// can be immutable; html/* carries the route's **declared** `cache_policy`
+/// when it has one and a long-but-purgeable TTL otherwise (CDN evicts by tag);
 /// server/* is short-lived (re-uploaded each build, never user-visible).
-fn cache_control_for(rel: &str) -> Option<String> {
-    let cc = if rel.starts_with("assets/") || rel.starts_with("hydrate/") {
-        "public, max-age=31536000, immutable"
-    } else if rel.starts_with("html/") {
+///
+/// R749-B4: the declared branch is the fix. Before it this function knew only
+/// path prefixes, so a route declaring `{ ttl: 3600 }` was published at 86400 —
+/// the serve tier honoured the number, the proxy tier honoured the number, and
+/// the CDN copy of the same page silently did not. The prefix values stay as
+/// the *default* for a page no route declared a policy for, which is every page
+/// on a site that never writes `cache_policy`; nothing changes for them.
+///
+/// The content-hashed prefixes deliberately outrank the declaration: an
+/// `assets/x.<hash>.js` URL cannot serve different bytes, so a route TTL on it
+/// would be strictly worse than `immutable` and is not what the author meant by
+/// putting a TTL on the *page*.
+fn cache_control_for(rel: &str, policy: &CachePolicyTable) -> Option<String> {
+    if rel.starts_with("assets/") || rel.starts_with("hydrate/") {
+        return Some("public, max-age=31536000, immutable".into());
+    }
+    if let Some(path) = page_path_for(rel) {
+        if let Some(declared) = policy.cache_control_for(&path) {
+            return Some(declared.to_string());
+        }
+    }
+    let cc = if rel.starts_with("html/") {
         "public, max-age=86400"
     } else {
         "public, max-age=3600"
     };
     Some(cc.into())
+}
+
+/// The public request path a `dist/` entry serves at, for the emissions that
+/// have one — the inverse of `prerenderKey`
+/// (`packages/mesofact-build/src/route-key.ts`, ported in
+/// `crates/mesofact-render/src/route_key.rs`), which names each page by exactly
+/// that path so the edge can find it from `url.pathname`:
+///
+/// | emitted | serves at |
+/// |---|---|
+/// | `html/index.html` | `/` |
+/// | `html/releases.html` | `/releases` |
+/// | `html/docs/index.html` | `/docs/` |
+/// | `html/issues/abc.html` | `/issues/abc` |
+///
+/// `None` for everything else, which is the honest answer for the two shapes
+/// `prerenderKey` deliberately does *not* name by path — an unexpanded SPA
+/// shell and a wildcard route both keep the flattened `routeKey` name
+/// (`item_id`), because neither serves at one path. Inverting `item_id` would
+/// produce the path `/item_id`, which matches no route and would quietly select
+/// the wrong policy if it ever did; a page whose name is not a path keeps the
+/// prefix default. Non-page assets (`server/`, `hydrate/`) return `None` too.
+fn page_path_for(rel: &str) -> Option<String> {
+    let key = rel.strip_prefix("html/")?.strip_suffix(".html")?;
+    if key == "index" {
+        return Some("/".into());
+    }
+    match key.strip_suffix("/index") {
+        Some(dir) => Some(format!("/{dir}/")),
+        None => Some(format!("/{key}")),
+    }
 }
 
 async fn walk_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
@@ -406,8 +470,110 @@ async fn walk_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
 
 #[cfg(test)]
 mod tests {
-    use super::content_type_for;
+    use super::{cache_control_for, content_type_for, page_path_for};
+    use mesofact_core::CachePolicyTable;
     use std::path::Path;
+
+    fn table(routes_json: &str) -> CachePolicyTable {
+        CachePolicyTable::from_manifest_json(format!(r#"{{"routes":{routes_json}}}"#).as_bytes())
+            .expect("fixture manifest parses")
+    }
+
+    /// The defect R749-B4 names: a declared TTL reached both servers and was
+    /// dropped on the way to the CDN, so the page an author said to hold for an
+    /// hour was published with a day on it.
+    #[test]
+    fn a_declared_ttl_reaches_the_published_object() {
+        let t = table(r#"[{"route":"/issues","cache_policy":{"ttl":3600,"swr":86400}}]"#);
+        assert_eq!(
+            cache_control_for("html/issues.html", &t).as_deref(),
+            Some("public, max-age=3600, stale-while-revalidate=86400"),
+        );
+    }
+
+    /// A gated route's page must not be published shareable — a CDN holding it
+    /// `public` serves one user's render to the next.
+    #[test]
+    fn a_gated_route_publishes_private() {
+        let t = table(r#"[{"route":"/app","requires":["user"],"cache_policy":{"ttl":60}}]"#);
+        assert_eq!(
+            cache_control_for("html/app.html", &t).as_deref(),
+            Some("private, max-age=60"),
+        );
+    }
+
+    /// Every site that never writes `cache_policy` publishes exactly what it
+    /// published before — the declaration is an override, not a new default.
+    #[test]
+    fn an_undeclared_page_keeps_the_prefix_default() {
+        let t = table(r#"[{"route":"/plain","cache_policy":{"ttl":0}}]"#);
+        assert_eq!(
+            cache_control_for("html/plain.html", &t).as_deref(),
+            Some("public, max-age=86400"),
+        );
+        assert_eq!(
+            cache_control_for("server/plain.js", &t).as_deref(),
+            Some("public, max-age=3600"),
+        );
+    }
+
+    /// Content-hashed URLs stay immutable even when their route declares a TTL:
+    /// the bytes at `assets/x.<hash>.js` can never change, so the page's TTL is
+    /// not a statement about them.
+    #[test]
+    fn hashed_assets_outrank_a_declared_policy() {
+        let t = table(r#"[{"route":"/","cache_policy":{"ttl":60}}]"#);
+        for rel in ["assets/app.abc123.js", "hydrate/index.abc123.js"] {
+            assert_eq!(
+                cache_control_for(rel, &t).as_deref(),
+                Some("public, max-age=31536000, immutable"),
+                "{rel}",
+            );
+        }
+    }
+
+    /// Param instances inherit their pattern's policy — the whole point of
+    /// inverting the emitted key back to a path rather than matching key text.
+    #[test]
+    fn a_param_instance_inherits_its_patterns_policy() {
+        let t = table(r#"[{"route":"/issues/:id","cache_policy":{"ttl":120}}]"#);
+        assert_eq!(
+            cache_control_for("html/issues/abc.html", &t).as_deref(),
+            Some("public, max-age=120"),
+        );
+    }
+
+    #[test]
+    fn page_keys_invert_to_the_path_they_serve_at() {
+        assert_eq!(page_path_for("html/index.html").as_deref(), Some("/"));
+        assert_eq!(
+            page_path_for("html/releases.html").as_deref(),
+            Some("/releases")
+        );
+        assert_eq!(
+            page_path_for("html/docs/index.html").as_deref(),
+            Some("/docs/")
+        );
+        assert_eq!(
+            page_path_for("html/issues/abc.html").as_deref(),
+            Some("/issues/abc")
+        );
+        // Not pages: no path to invert to.
+        assert_eq!(page_path_for("assets/app.abc.js"), None);
+        assert_eq!(page_path_for("html/wasm/demo_bg.wasm"), None);
+        assert_eq!(page_path_for("server/index.js"), None);
+    }
+
+    /// A trailing-slash route (`/docs/` → `html/docs/index.html`) matches the
+    /// manifest pattern `/docs`, because both sides drop empty segments.
+    #[test]
+    fn a_directory_index_matches_its_extensionless_pattern() {
+        let t = table(r#"[{"route":"/docs","cache_policy":{"ttl":300}}]"#);
+        assert_eq!(
+            cache_control_for("html/docs/index.html", &t).as_deref(),
+            Some("public, max-age=300"),
+        );
+    }
 
     /// The Content-Type we PUT is the one the CDN stores and replays forever,
     /// and `WebAssembly.instantiateStreaming` accepts exactly `application/wasm`

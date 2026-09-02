@@ -84,9 +84,11 @@ pub use mesofact_publisher as publisher;
 // the file watcher and the dev S3 surface — breaking the dev/prod crate
 // boundary W225 §2 claims. `mesofact-dev` now depends on THIS crate and holds
 // only `watcher` + `s3` + the dev bin, so that boundary finally holds.
+pub mod cache_headers;
 pub mod cli;
 pub mod health;
 pub mod proxy;
+pub mod route_headers;
 pub mod server;
 #[cfg(feature = "ssr")]
 pub mod revalidate;
@@ -95,9 +97,14 @@ pub mod ssr;
 #[cfg(feature = "ssr")]
 pub mod tenants;
 
+pub use cache_headers::CachePolicyTable;
 pub use health::{Health, LEGACY_HEALTH_PATH, LIVE_PATH, READY_PATH};
 pub use proxy::{ProxyMap, ProxyState};
-pub use server::{routes_declaring_ssr, routes_requiring_user, DistPointer, Identity, Server, DEFAULT_PORT};
+pub use route_headers::RouteHeaderTable;
+pub use server::{
+    declared_cache_policy, read_manifest_bytes, routes_declaring_ssr, routes_requiring_user,
+    DistPointer, Identity, Server, DEFAULT_PORT,
+};
 #[cfg(feature = "ssr")]
 pub use ssr::{
     ResiliencePolicy, RetryPolicy, SpawnOptions as SsrSpawnOptions, SsrChild, SsrSlot,

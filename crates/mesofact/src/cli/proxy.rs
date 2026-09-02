@@ -25,10 +25,19 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .init();
 
 
+    // R749-T1: refuse before the pool spawns, on the RAW bytes rather than the
+    // parsed manifest — `load_from_file` deserializes into `Manifest`, and
+    // serde silently drops any key this build predates, which is precisely the
+    // field a check needs to see.
+    let support = cfg.policy_support();
+    assert_declared_policy_is_enforced(&cfg.manifest, &support).await?;
+
     let manifest = Arc::new(load_from_file(&cfg.manifest).await?);
     info!(
         build_id = %manifest.build_id,
         routes = manifest.routes.len(),
+        enforced = ?support.enforced().map(|p| p.field()).collect::<Vec<_>>(),
+        delegated = ?support.delegated().map(|p| p.field()).collect::<Vec<_>>(),
         "manifest loaded"
     );
 
@@ -82,10 +91,22 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         let n = cfg.worker_count();
         let sources_config = cfg.sources_config.clone();
         let metrics = metrics.clone();
+        let manifest_path = cfg.manifest.clone();
+        let support = support.clone();
         tokio::spawn(async move {
             loop {
                 if rx.changed().await.is_err() {
                     break;
+                }
+                // R749-T1: a hot reload can introduce a policy this process
+                // does not enforce just as easily as a cold start can, and it
+                // does so on a running server nobody is watching. Same refusal,
+                // expressed the way a reload can express one — keep the old
+                // manifest, which is the failure mode this loop already has for
+                // a pool that will not spawn.
+                if let Err(e) = assert_declared_policy_is_enforced(&manifest_path, &support).await {
+                    tracing::error!("{e}; keeping the previous manifest");
+                    continue;
                 }
                 let new_manifest = rx.borrow().clone();
                 let json = match serde_json::to_vec(&*new_manifest) {
@@ -127,6 +148,30 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     info!(addr = %cfg.bind, "listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// R749-T1 — refuse a manifest declaring a policy this tier does not enforce.
+///
+/// The proxy's counterpart to `cli::serve`'s check of the same name; the tier's
+/// own claim about what it implements lives on
+/// [`Config::policy_support`](mesofact_core::proxy::config::Config::policy_support).
+///
+/// A manifest that is absent or unreadable is an error here, unlike in `serve`:
+/// `--manifest` is a required argument, so a proxy that cannot read it is not
+/// going to serve anything anyway, and "we could not parse it, therefore
+/// nothing is declared" is the fail-open this whole mechanism is against.
+async fn assert_declared_policy_is_enforced(
+    manifest: &std::path::Path,
+    support: &mesofact_core::PolicySupport,
+) -> anyhow::Result<()> {
+    let raw = tokio::fs::read(manifest).await.map_err(|e| {
+        anyhow::anyhow!(
+            "refusing to serve: cannot read {} to check for declared policy this binary does \
+             not enforce: {e}",
+            manifest.display(),
+        )
+    })?;
+    mesofact_core::check_manifest(&raw, support).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Build a `CookieSessionResolver` when `--session-secret-env` names a set env

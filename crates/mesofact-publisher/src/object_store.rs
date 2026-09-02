@@ -25,6 +25,14 @@ pub struct ObjectMeta {
     pub content_hash: String,
     pub content_type: String,
     pub size: u64,
+    /// The stored `Cache-Control`, which is what the CDN replays to every
+    /// client until the object is replaced.
+    ///
+    /// Readable since R749-B4, because it is now derived from the route's
+    /// declared `cache_policy` rather than from the path prefix — and a header
+    /// nothing can observe is a header nothing can test. `None` when the object
+    /// carries none.
+    pub cache_control: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -87,6 +95,7 @@ impl ObjectStore for InMemoryStore {
             content_hash: opts.content_hash,
             content_type: opts.content_type,
             size: body.len() as u64,
+            cache_control: opts.cache_control,
         };
         self.inner
             .lock()
