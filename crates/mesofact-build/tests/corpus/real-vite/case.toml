@@ -1,0 +1,9 @@
+name = "real-vite"
+description = "vite@5 combines everything the synthetic cases isolate: a deep tree, esbuild's and rollup's platform-gated native fan-outs, and peer dependencies. The single best value-per-byte case in the corpus, and the one most likely to catch a regression nobody predicted."
+recorded_at = "2026-09-03"
+known_divergence = []
+
+
+[compare]
+bun = true
+pnpm = true

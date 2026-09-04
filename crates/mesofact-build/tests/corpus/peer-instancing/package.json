@@ -1,0 +1,9 @@
+{
+  "name": "peer-instancing",
+  "version": "1.0.0",
+  "dependencies": {
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0",
+    "@dnd-kit/core": "^6.3.0"
+  }
+}

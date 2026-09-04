@@ -1,10 +1,11 @@
 //! `mes` — the mesofact dev toolchain.
 //!
 //! The whole CLI lives here in the library rather than in a bin target,
-//! mirroring [`mesofact::cli`], so that the two bin targets — `mes` and the
-//! transitional `mesofact-dev` alias — are each three lines over one
-//! definition. (They cannot simply share one `main.rs`: cargo warns when a
-//! file backs two targets, and it compiles the whole CLI twice.)
+//! mirroring [`mesofact::cli`]. That is what lets the command ship from a
+//! *different package* — `mes`, whose `main.rs` is three lines over
+//! [`run`] — while this crate stays a pure library. `mesofact-dev` emits no
+//! binaries at all (MFT-R822); see `../Cargo.toml` for why the name you type
+//! and the name you depend on are deliberately different.
 //!
 //! ## Why this is a superset of `mesofact`, not an alias of it
 //!
@@ -26,8 +27,8 @@
 //! [`mesofact::ProxyMap`]. The facade is linked into this binary for the DEV
 //! loop whether or not `serve` is in-process, so process-calling removes zero
 //! bytes and adds a runtime dependency on finding `mesofact` on `PATH` —
-//! `cargo install mesofact-dev` would yield a `mes` whose `serve` fails until
-//! you separately install `mesofact`. It would also hand us exit-code and
+//! `cargo install mes` would yield a `mes` whose `serve` fails until you
+//! separately install `mesofact`. It would also hand us exit-code and
 //! signal forwarding for no gain. The link-graph direction is what carries the
 //! security property here; the process boundary carries none of it.
 //!
@@ -52,16 +53,24 @@
 //! ## Bare invocation
 //!
 //! `mes` with no subcommand is `mes dev .` — the 95% command, so it is what
-//! you get for typing the least. This is also what keeps the legacy
-//! `mesofact-dev <DIR> --port N …` form working verbatim: it parses as the
-//! bare form, so the ~30 spawn sites in the parent camp need no flag day. The
-//! one divergence is a workload directory literally named after a subcommand
-//! (`mesofact-dev serve`); spell it `./serve` if that ever comes up.
+//! you get for typing the least. The one divergence is a workload directory
+//! literally named after a subcommand (`mes serve`); spell it `./serve` if
+//! that ever comes up.
+//!
+//! This form also did a second job that is now spent, and the distinction
+//! matters because deleting the form along with the job would be wrong. While
+//! the binary was still named `mesofact-dev`, the bare form is what made the
+//! legacy `mesofact-dev <DIR> --port N …` invocation parse unchanged, so the
+//! ~30 spawn sites in the parent camp needed no flag day when `mes` arrived
+//! beside it. MFT-R822 retired that binary and migrated those sites, so no
+//! caller depends on the bare form for compatibility any more — but it is
+//! still the right default for `mes` on its own merits, which is the first
+//! paragraph and always was.
 //!
 //! @yah:relay(R822, "Retire the mesofact-dev BINARY; mes is the only dev command (the package name stays)")
-//! @yah:at(2026-09-02T06:04:50Z)
-//! @yah:status(open)
-//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:status(review)
+//! @yah:at(2026-09-03T08:13:42Z)
+//! @yah:assignee(bundle-anthropic-ashguard)
 //! @yah:next("OPERATOR DECISION 2026-09-01, and it is the inverse of the split first proposed: descriptive name where you READ it, short name where you TYPE it. The PACKAGE stays mesofact-dev permanently -- not as a legacy spelling of mes, but as the meta crate, the entrypoint to the dev-tier tools mes needs that are NOT mesofact (the watcher, the local S3 surface standing in for R2, serve_app). It depends on the mesofact facade rather than being it, and that direction IS the W225 section 2 prod/dev boundary. The BINARY mesofact-dev goes: nobody wants to type it, ever.")
 //! @yah:next("SCOPE, measured not guessed: 30 Rust string-literal sites resolve \"mesofact-dev\" as an executable name (grep '\"mesofact-dev\"' app crates --include=*.rs, excluding @yah: annotation prose, which is the other ~170 hits and is history rather than reference). The load-bearing ones: crates/yah/plugin/src/source.rs:112 keys a builtin plugin manifest on it via include_str!; crates/yah/bundled/src/lib.rs:171 registers it as a bundled binary; app/yah/desktop/src/mesofact_versions.rs:80,94 resolve it through yah_bundled::find and slot.bin(); app/yah/cli/src/plugin_host.rs:414 names it as SourceRef::Bundled.")
 //! @yah:next("THE SHARP EDGE, and the reason this is a migration rather than a find-and-replace: ALREADY-INSTALLED store slots have a file literally named mesofact-dev on disk. app/yah/desktop/src/mesofact_versions.rs does slot.bin(\"mesofact-dev\"), so renaming the bin breaks resolution against versions a user already installed. Needs a compat window that accepts either filename, or a store migration -- decide which before touching the 30 sites.")
@@ -73,6 +82,20 @@
 //! @yah:next("SAFE TO DO: verified 2026-09-01 that NO crate anywhere takes mesofact-dev as a library dependency today -- the only line in the tree is the library-tier scaffold template (crates/mesofact/src/cli/new/template-lib/Cargo.toml:31), which wants the library and is unaffected. So nothing loses a binary it was consuming, and the new mes package is the first real lib consumer.")
 //! @yah:gotcha("SUPERSEDED NOTE, removed rather than left to mislead: an earlier gotcha here said the end state was 'package mesofact-dev while the only [[bin]] is mes'. It is not. The end state is mesofact-dev with ZERO bin targets and a separate `mes` package owning the binary. The cargo package-vs-bin decoupling still matters, but it is now the reason the LIBRARY can keep a descriptive name while the COMMAND gets a short one across a package boundary, not within one.")
 //! @yah:gotcha("FEATURE FORWARDING IS THE FIDDLY PART, and this crate already documents the same trap one level down. mesofact-dev's surface is default = [ssr, build]; ssr = [mesofact/ssr, dep:mesofact-publisher, publish]; publish = [mesofact/publish]; build = [mesofact/build]. The new `mes` package must re-expose these (ssr = [mesofact-dev/ssr], etc.) or `cargo install mes --no-default-features` silently loses the lean static/SPA path that exists so consumers can skip the V8 toolchain. mes itself has no cfgs -- cli.rs's #[cfg(feature = ...)] gates evaluate in mesofact-dev -- so forwarding is all that is required, but omitting it is invisible until someone tries the lean build.")
+//! @yah:notify_on(R556-F6, "R556-F6 swept MFT-R822 rename fallout you had not reached: oss/qed/crates/qed/images/mesofact-musl-builder/build-mesofact.sh still built `-p mesofact-dev --bin mesofact-dev` and killed a live `yah qed run mesofact-musl` with \"error: no bin target named mesofact-dev in mesofact-dev package\". Fixed there to `-p mes --bin mes`, staged filename now `mes` (install.sh prefers `mes`, keeps `mesofact-dev` only as the declared pre-rename support window). The W225 §2 closure grep was deliberately left alone — `mesofact-dev` is still the right PACKAGE name and only the bin moved. STILL DRIFTING, LEFT FOR YOU because it is the release surface: scripts/publish-mesofact-release.sh (~148-149 cross-build-guarded.sh mesofact-dev, ~171 BINS=(mesofact mesofact-dev mesofact-build)) and .github/workflows/release.yml (~996-1001 --param package=mesofact-dev --param bin=mesofact-dev). Also worth a look: cdn.yah.dev/mesofact/latest.json is 0.8.30 published 2026-09-03T00:38Z and still advertises bins [mesofact, mesofact-dev, mesofact-build] — check whether that publish produced a mesofact-dev binary or whether the manifest now describes a tarball that no longer matches.")
+//! @yah:handoff("SPLIT LANDED. New package oss/mesofact/crates/mes — one Cargo.toml, one three-line src/main.rs over mesofact_dev::cli::run(), added to workspace members. mesofact-dev now emits ZERO bin targets: both [[bin]] blocks gone, src/main.rs and src/bin/mesofact-dev.rs deleted, manifest comment rewritten to say why there must never be one again (a bin here re-breaks `cargo install mes`, and a second package emitting `mes` races ../mes for ~/.cargo/bin/mes). cli.rs's module doc no longer claims two bin targets, and its bare-invocation section keeps the form while retiring the spent justification — MFT-R822 migrated the spawn sites, so the bare form now stands on its own merits, which it always did.")
+//! @yah:handoff("THE SHARP EDGE, ANSWERED: compat window, not store migration. A slot is a directory a past install.sh untarred and nothing rewrites it, so pre-rename slots hold `mesofact-dev` forever. crates/yah/mesofact-store gains LEGACY_BIN_NAMES + bin_candidates(); Slot::bin resolves the current name through them and falls back to the name asked for, and inspect_slot reports missing under the CURRENT name while accepting the old file. EXPECTED_BINS is now [\"mesofact\", \"mes\"] — a list of current names, which is why it is two constants and not one. mesofact-shim.sh (and its verbatim copy inside install.sh) does the same two-step probe: `$slot/mes`, else `$slot/mesofact-dev`, with the COMPLETENESS check using the resolved path so an old slot reads Complete rather than \"partially installed\". Retiring the fallback is a support-window decision; the shim and LEGACY_BIN_NAMES retire together or not at all, and both say so.")
+//! @yah:handoff("PARENT CAMP, all 30 exec-name sites: yah_bundled::BUNDLED's entry is `mes` (that one field is simultaneously the cargo -p, the bin, the staged file and the bundled: source_ref); tauri.conf.json externalBin follows and its drift test passes; desktop mesofact_versions does find(\"mes\") + slot.bin(\"mes\"); .yah/qed/{dashboard-e2e,dashboard-e2e-auth}.toml build and run -p mes --bin mes; scripts/publish-mesofact-release.sh ships BINS=(mesofact mes mesofact-build); .github/workflows/release.yml's leg B, its Package step and both manifest `bins` arrays follow; release-build.toml / mesofact-musl.toml / oss-publish.toml prose corrected. THREE THINGS DELIBERATELY DID NOT MOVE, each for a reason at the site: the plugin ID stays `mesofact-dev` (it keys the PINNED catalog, the discovery index, the Run-tab entry and .yah/jit/mesofact-dev-n — only its source_ref names a binary); MESOFACT_DEV_BIN stays (yubaba's mesofact-static reconciler and `cargo run -p desktop` read it, and renaming a documented env var buys nothing); and `mesofact-dev` stays in SHIM_NAMES as a pure PATH alias onto the same slot binary.")
+//! @yah:handoff("THE BUILTIN MANIFEST WAS RE-SIGNED, and that is the one step that needed a secret. source_ref = \"bundled:mesofact-dev\" -> \"bundled:mes\" invalidates the Ed25519 signature, and supervise_plugin verifies BEFORE it spawns and fails closed — so an unsigned edit would have silently stopped the Run tab supervising mesofact-dev at all. Ran the documented ceremony: YAH_PLUGIN_RELEASE_KEY=\"$(yah keys get yah-plugin-release-key)\" cargo run -p xtask -- plugin-sign. The key was never printed and the other three manifests report \"already signed, unchanged\". Proven by desktop::plugins::tests::every_shipped_builtin_verifies_under_the_real_release_key, which is green.")
+//! @yah:handoff("DISCOVERED + FIXED, outside the ticket's file list. (1) xtask/src/main.rs check_staged_sidecars was PRESENCE-ONLY, and app/yah/desktop/build.rs deliberately writes a ZERO-BYTE placeholder for any unstaged registry entry so `cargo check -p desktop` passes tauri-build's resource check — so the gate happily passed a staging where the real 82 MB binary sat under the OLD name and a 0-byte `mes-<triple>` sat beside it. `cargo tauri build` would have bundled the empty file. Now a zero-length staged file counts as missing; the fn's doc records the mechanism and how this was found. Verified both ways: red before staging, green after. (2) Staged the real sidecar (cargo run -p xtask -- build-mes-sidecar) and removed the orphaned mesofact-dev-aarch64-apple-darwin, which nothing references any more.")
+//! @yah:handoff("THE GOTCHA'S FEATURE FORWARDING IS NOW MECHANICAL, not a promise. mes re-exposes default/ssr/publish/build over mesofact-dev, INCLUDING the ssr->publish implication, and mes/src/main.rs carries a test that parses both manifests and asserts the two [features] tables have identical keys, identical defaults, that every non-default feature forwards `mesofact-dev/<same>`, and that any implication between mesofact-dev's own features is mirrored. It skips silently when the sibling manifest is absent (a packaged .crate). That is the check the gotcha asked for: forgetting a forward is otherwise invisible — mes still builds and silently ignores the flag.")
+//! @yah:verify("cargo check --workspace --all-targets (root) -> exit 0. cargo clippy -p yah-mesofact-store -p yah-bundled -p yah-plugin -p xtask --all-targets and -p mes -p mesofact-dev (oss/mesofact) -> exit 0, ZERO warnings in any crate this ticket changed (the ones printed are pre-existing, in yubaba's mesofact_static.rs, xtask/src/install.rs:276, mesofact-core and mesofact-build).")
+//! @yah:verify("cargo test — yah-mesofact-store 25 (2 new: a_pre_rename_slot_is_complete_and_resolves_to_the_file_it_holds, the_new_shim_runs_a_pre_rename_slot), yah-bundled 12, yah-plugin 69, xtask --test main bundled 3 (incl. tauri_external_bin_matches_the_bundled_registry), desktop --lib mesofact_versions 5 (1 new: a_slot_installed_before_the_rename_still_resolves) + plugins:: 8, yah --lib plugin_host 11, mesofact-dev 28, mes 1. All 0 failed.")
+//! @yah:verify("bash scripts/check-mesofact-store.sh -> 21 passed, 0 failed, driving the REAL embedded install.sh against a local CDN. Two of those cells are new and are the compat window end-to-end: a 0.8.29 tarball whose dev binary is named mesofact-dev installs as a COMPLETE slot, and the CURRENT shim runs it under both `mes` and `mesofact-dev`. bash scripts/dev/run-install-compat-nocosign.sh -> 24 passed, 0 failed, which is what proves the shim re-pasted into install.sh is byte-identical to mesofact-shim.sh.")
+//! @yah:verify("Feature forwarding measured, not assumed, via cargo tree -e normal on -p mes: default -> 79 lines matching deno_core|rolldown|mesofact-publisher; --no-default-features -> 0; --no-default-features --features ssr -> deno_core back (9). So the lean static/SPA path that exists to let a consumer skip the V8 toolchain survives the package split.")
+//! @yah:gotcha("NOT DONE, AND DELIBERATELY: `mes` is not published to crates.io. The name was unclaimed when this landed (sparse index 404 on /3/m/mes, 2026-09-02) and nothing here reserves it — the first `scripts/oss-publish.sh oss/mesofact` run picks it up on its own, because that script enumerates no members and `cargo publish --workspace` orders by dependency topology, so `mes` lands after `mesofact-dev`. Until then `cargo install mes` still fails for an outside user, which is the very problem this split exists to fix. cdn.yah.dev/mesofact/latest.json is 0.8.30 and advertises bins [mesofact, mesofact-dev, mesofact-build]; that is CORRECT, not drift — it was cut before this landed and its tarball really does hold a file of that name. The compat window covers it; nothing needs republishing, and the next cut ships `mes`.")
+//! @yah:gotcha("TWO THINGS LEFT ALONE ON PURPOSE, so nobody re-derives them as omissions. (1) `cargo test --workspace` in oss/mesofact is 194 passed / 3 FAILED, and none of the three are from this change — filed and attributed as R824. They are curated.rs's DELIBERATE red-until-publish alarm firing because the 0.8.31 bump's npm/crates.io publishes have not run (the barrel is still 0.8.29, so it was already red at 0.8.30 too). Do not silence it. (2) ~20 W###/A### docs still contain the string `mesofact-dev`. Checked rather than assumed: every one is either @yah: annotation prose (history, out of scope by the ticket's own framing) or a reference to the PACKAGE / the plugin id / the .mesofact-dev state dir — all three of which are still correct. W225's body needs no edit.")
+//! @yah:gotcha("SHARED-TREE NOTE. @Glimmerstone:griffin (R556-F6) fixed oss/qed/crates/qed/images/mesofact-musl-builder/build-mesofact.sh independently on 2026-09-03 after hitting this rename as a LIVE fleet-build failure — `yah qed run mesofact-musl` died ~6 min in with \"no bin target named mesofact-dev in mesofact-dev package\". Their hunks are correct and untouched here, including their decision NOT to change the W225 §2 closure grep (it greps `cargo tree` for the PACKAGE `mesofact-dev`, which is still right — only the bin moved). They also moved the script into mesofact-musl.toml's source_context so the digest-pinned image stops carrying a frozen copy that a rename can silently break. All my edits landed in commit 202fd70a (\"0.8.31\") — a peer's wip-commit swept them in mid-session; nothing was lost, but `git diff` will not show them.")
 
 use std::path::PathBuf;
 #[cfg(feature = "ssr")]
@@ -526,14 +549,18 @@ mod tests {
         Cli::command().debug_assert();
     }
 
-    /// THE compatibility contract. Every `mesofact-dev` spawn site in the
-    /// parent camp (kamaji, desktop, `serve_build.rs`, `local.sh`, …) uses
-    /// this shape; the rename is only safe while it keeps parsing. A failure
-    /// here means the second `[[bin]]` target is a lie.
+    /// THE compatibility contract, and it outlived the binary it was written
+    /// for. Every dev-server spawn site in the parent camp (kamaji, desktop,
+    /// `serve_build.rs`, `local.sh`, …) passes this argv SHAPE — a bare
+    /// directory followed by `--port`/`--no-watch`/`--service`/`--component`,
+    /// no subcommand. MFT-R822 renamed the executable those sites exec from
+    /// `mesofact-dev` to `mes`; argv[0] is the only thing that moved, which is
+    /// why this test is spelled with the new name and asserts the same
+    /// bindings. A failure here breaks every one of those sites at once.
     #[test]
-    fn legacy_mesofact_dev_invocation_still_parses() {
+    fn bare_directory_spawn_shape_still_parses() {
         let Command::Dev(args) = dispatch(&[
-            "mesofact-dev",
+            "mes",
             "app/yah/web",
             "--port",
             "8080",
@@ -543,7 +570,7 @@ mod tests {
             "--component",
             "web",
         ]) else {
-            panic!("legacy invocation did not resolve to `dev`");
+            panic!("bare-directory spawn shape did not resolve to `dev`");
         };
         assert_eq!(args.workload, PathBuf::from("app/yah/web"));
         assert_eq!(args.port, 8080);

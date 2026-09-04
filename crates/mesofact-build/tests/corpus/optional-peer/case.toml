@@ -1,0 +1,9 @@
+name = "optional-peer"
+description = "debug@4 declares supports-color as a peer marked optional in peerDependenciesMeta. The tree must contain it only because the root asked for it directly — an implementation that auto-installs optional peers produces the same package for the wrong reason, and only the second case (where nothing asks) tells them apart."
+recorded_at = "2026-09-03"
+known_divergence = []
+
+
+[compare]
+bun = true
+pnpm = true

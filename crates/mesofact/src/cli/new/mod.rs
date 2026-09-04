@@ -48,7 +48,7 @@
 //!    (`mesofact-dev/src/app.rs`), the dev counterpart of
 //!    [`crate::serve_app`]. W225 §2 sketched `mesofact_dev::serve(…)` and
 //!    nothing implemented it, because the dev affordances were composed in
-//!    `mesofact-dev`'s own `main.rs` around a *workload* — a built `dist/`
+//!    the dev CLI's own entry point around a *workload* — a built `dist/`
 //!    tree plus a watcher — not around a caller's `axum::Router`. That
 //!    module's doc records what R832-T1 settled: for a Rust-handler consumer
 //!    the watcher and live-reload cannot carry over at all (a `.rs` edit

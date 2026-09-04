@@ -1,0 +1,9 @@
+name = "npm-alias"
+description = "An npm: alias installs lodash into a directory called lodash-alias. The install path carries the alias and the lock carries the registry name, which is the one place those two vocabularies provably differ — a diff keyed on the wrong one passes every other case in this corpus."
+recorded_at = "2026-09-03"
+known_divergence = []
+
+
+[compare]
+bun = true
+pnpm = true

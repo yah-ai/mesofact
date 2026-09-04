@@ -4,10 +4,11 @@
 //! `mesofact-publish`). The dev binary stays separate on purpose — see
 //! [`mesofact::cli`] for why that split is load-bearing rather than stylistic.
 //!
-//! Subcommand availability tracks features: `new`, `serve` and `proxy` are
-//! always present (all V8-free at `default`; the SSR paths inside `serve` are
-//! `ssr`-gated), `publish` needs the `publish` feature — which the `deploy`
-//! preset pulls in via `ssr`.
+//! Subcommand availability tracks features: `new`, `serve`, `proxy` and
+//! `selfcheck` are always present (all V8-free at `default`; the SSR paths
+//! inside `serve` are `ssr`-gated, and `selfcheck ssr` reports that it has no
+//! V8 tier to check rather than vanishing), `publish` needs the `publish`
+//! feature — which the `deploy` preset pulls in via `ssr`.
 //!
 //! `new` is here rather than in `mesofact-dev` on purpose: it writes files and
 //! carries no dev affordance, and the binary that scaffolds a project is then
@@ -45,6 +46,8 @@ enum Command {
     /// Upload a built dist/ tree, swap the manifest pointer, purge CDN tags.
     #[cfg(feature = "publish")]
     Publish(mesofact::cli::publish::PublishArgs),
+    /// Prove this binary's V8 tier works on THIS machine (R823).
+    Selfcheck(mesofact::cli::selfcheck::SelfcheckArgs),
 }
 
 #[tokio::main]
@@ -61,6 +64,8 @@ async fn main() -> ExitCode {
         // `publish` owns its exit codes (2 = missing config, etc.) — pass through.
         #[cfg(feature = "publish")]
         Command::Publish(args) => mesofact::cli::publish::run(args).await,
+        // Synchronous: booting and dropping one isolate, nothing to await.
+        Command::Selfcheck(args) => to_exit_code(mesofact::cli::selfcheck::run(args)),
     }
 }
 

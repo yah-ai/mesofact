@@ -1,0 +1,5 @@
+{
+  "name": "optional-platform-gated",
+  "version": "1.0.0",
+  "dependencies": { "esbuild": "0.24.0" }
+}

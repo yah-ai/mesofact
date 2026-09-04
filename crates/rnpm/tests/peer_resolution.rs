@@ -418,16 +418,10 @@ fn a_missing_non_optional_peer_is_auto_installed_and_warned_about() {
 }
 
 #[test]
-fn an_auto_installed_peers_own_dependencies_are_not_resolved() {
-    // KNOWN GAP, pinned on purpose — R773-B8. Phase 1 is over by the time the
-    // auto-install runs and its BFS has no entry point that extends an
-    // existing tree, so the node lands with no dependency edges. Materializing
-    // this tree gives you `core` and not `helper`, which fails at require()
-    // rather than at resolve time.
-    //
-    // This test asserts the BROKEN behaviour deliberately. When R773-B8 lands
-    // it should start failing, and the fix is to change these three
-    // assertions — not to delete the test.
+fn an_auto_installed_peers_own_dependencies_are_resolved() {
+    // R773-B8. The auto-install re-enters phase 1's BFS seeded with the peer's
+    // own edges, so `core` arrives with `helper` rather than as a node that
+    // resolves cleanly and then fails at require().
     let world = World::new(&[
         ("widget", packument("widget", &[("1.0.0", peers(&[("core", "^1.0.0")]))])),
         ("core", packument("core", &[("1.0.0", deps(&[("helper", "^1.0.0")]))])),
@@ -436,8 +430,145 @@ fn an_auto_installed_peers_own_dependencies_are_not_resolved() {
     let (tree, report) = world.resolve(WIDGET_ROOT);
 
     assert_eq!(report.stats.auto_installed, 1);
-    assert_eq!(paths(&tree), ["core", "widget"], "helper is missing — that is the gap");
-    assert!(at(&tree, "core").1.dependencies.is_empty());
+    assert_eq!(paths(&tree), ["core", "helper", "widget"]);
+    assert_eq!(at(&tree, "core").1.dependencies["helper"], id_at(&tree, "helper"));
+    // Nothing conflicts, so phase 1's ordinary hoist applies to the subtree —
+    // `helper` goes to the root, not under `core`.
+    assert_eq!(resolves_from(&tree, "core", "helper"), "1.0.0");
+    // And the placement of the peer ITSELF is untouched by the expansion.
+    assert_eq!(resolves_from(&tree, "widget", "core"), "1.0.0");
+}
+
+#[test]
+fn an_auto_installed_peers_dependency_nests_rather_than_clobbering_a_hoisted_one() {
+    // The other half of R773-B8: expanding the peer's subtree runs phase 1's
+    // real placement rules, so a dependency that conflicts with something
+    // already hoisted lands nested under the peer. Hoisting it would overwrite
+    // the root's own `helper@1` — an unplacement, which phase 1 forbids.
+    let world = World::new(&[
+        ("widget", packument("widget", &[("1.0.0", peers(&[("core", "^1.0.0")]))])),
+        ("core", packument("core", &[("1.0.0", deps(&[("helper", "^2.0.0")]))])),
+        ("helper", packument("helper", &[("1.0.0", json!({})), ("2.0.0", json!({}))])),
+    ]);
+    let (tree, report) = world.resolve(
+        r#"{ "name": "root", "dependencies": { "widget": "^1.0.0", "helper": "^1.0.0" } }"#,
+    );
+
+    assert_eq!(report.stats.auto_installed, 1);
+    assert_eq!(paths(&tree), ["core", "core/helper", "helper", "widget"]);
+    assert_eq!(version_at(&tree, "helper"), "1.0.0");
+    assert_eq!(version_at(&tree, "core/helper"), "2.0.0");
+    // Each side sees its own, which is the whole point of nesting.
+    assert_eq!(resolves_from(&tree, "core", "helper"), "2.0.0");
+    assert_eq!(resolves_from(&tree, "widget", "helper"), "1.0.0");
+    assert_eq!(resolves_from(&tree, "widget", "core"), "1.0.0");
+}
+
+#[test]
+fn an_auto_installed_peer_gets_its_own_peers_resolved() {
+    // R773-B8's second half: the auto-installed node declares what its manifest
+    // declares, and phase 2 descends into it from the auto-install itself — so
+    // a peer one level *inside* an auto-install is an ordinary peer, not a hole.
+    let world = World::new(&[
+        ("widget", packument("widget", &[("1.0.0", peers(&[("core", "^1.0.0")]))])),
+        ("core", packument("core", &[("1.0.0", peers(&[("shared", "^1.0.0")]))])),
+        ("shared", packument("shared", &[("1.0.0", json!({}))])),
+    ]);
+
+    // (a) The inner peer's provider is already in the tree: matched, no install.
+    let (tree, report) = world.resolve(
+        r#"{ "name": "root", "dependencies": { "widget": "^1.0.0", "shared": "^1.0.0" } }"#,
+    );
+    assert_eq!(report.stats.auto_installed, 1); // `core` only
+    assert_eq!(paths(&tree), ["core", "shared", "widget"]);
+    // The peer map is parsed from the manifest rather than left empty, which is
+    // what makes the lookup below possible at all.
+    assert_eq!(at(&tree, "core").1.peers.len(), 1);
+    assert_eq!(report.providers[&id_at(&tree, "core")]["shared"], id_at(&tree, "shared"));
+    // One warning, for `core` — `shared` was there to be found.
+    match report.issues.as_slice() {
+        [PeerIssue::Missing { at, peer, .. }] => {
+            assert_eq!(at, "widget");
+            assert_eq!(peer, "core");
+        }
+        other => panic!("expected one Missing, got {other:?}"),
+    }
+
+    // (b) Nothing provides it: the inner peer is auto-installed and warned
+    // about in its own right.
+    let (tree, report) = world.resolve(WIDGET_ROOT);
+    assert_eq!(report.stats.auto_installed, 2); // `core`, then `shared`
+    assert_eq!(paths(&tree), ["core", "shared", "widget"]);
+    assert_eq!(report.providers[&id_at(&tree, "core")]["shared"], id_at(&tree, "shared"));
+    let warned: Vec<(&str, &str)> = report
+        .issues
+        .iter()
+        .map(|issue| match issue {
+            PeerIssue::Missing { at, peer, auto_installed, .. } => {
+                assert!(auto_installed, "{peer} should have been auto-installed");
+                (at.as_str(), peer.as_str())
+            }
+            other => panic!("expected only Missing, got {other:?}"),
+        })
+        .collect();
+    // Innermost first: `match_own_peers` pushes its own `Missing` only after
+    // `auto_install` returns, and `auto_install` walks what it installed before
+    // returning — so the peer's peer is warned about before the peer is.
+    assert_eq!(warned, [("core", "shared"), ("widget", "core")]);
+}
+
+#[test]
+fn a_cycle_reachable_only_through_an_auto_installed_subtree_terminates() {
+    // Criterion 3's other entry point. `a_peer_dependency_cycle_terminates`
+    // covers a cycle phase 1 built; this one exists nowhere until the
+    // auto-install of `core` drags it in, so it is reached by the recursion
+    // inside `auto_install` rather than by the outer descent.
+    let world = World::new(&[
+        ("widget", packument("widget", &[("1.0.0", peers(&[("core", "^1.0.0")]))])),
+        ("core", packument("core", &[("1.0.0", deps(&[("a", "^1.0.0")]))])),
+        (
+            "a",
+            packument(
+                "a",
+                &[(
+                    "1.0.0",
+                    json!({
+                        "dependencies": object(&[("b", "^1.0.0")]),
+                        "peerDependencies": object(&[("shared", "^1.0.0")])
+                    }),
+                )],
+            ),
+        ),
+        (
+            "b",
+            packument(
+                "b",
+                &[(
+                    "1.0.0",
+                    json!({
+                        "dependencies": object(&[("a", "^1.0.0")]),
+                        "peerDependencies": object(&[("shared", "^1.0.0")])
+                    }),
+                )],
+            ),
+        ),
+        ("shared", packument("shared", &[("1.0.0", json!({}))])),
+    ]);
+    let (tree, report) = world.resolve(WIDGET_ROOT);
+
+    // Reaching this line is most of the criterion; the rest says it terminated
+    // for the right reason rather than by running out of something.
+    assert_eq!(report.stats.cycle_breaks, 1);
+    assert_eq!(paths(&tree), ["a", "b", "core", "shared", "widget"]);
+    assert_eq!(report.stats.auto_installed, 2); // `core`, and `shared` for `a`
+    assert_eq!(report.stats.instances, 0);
+
+    // The cycle is still a cycle, and both ends got their peer.
+    assert_eq!(at(&tree, "a").1.dependencies["b"], id_at(&tree, "b"));
+    assert_eq!(at(&tree, "b").1.dependencies["a"], id_at(&tree, "a"));
+    let shared = id_at(&tree, "shared");
+    assert_eq!(report.providers[&id_at(&tree, "a")]["shared"], shared);
+    assert_eq!(report.providers[&id_at(&tree, "b")]["shared"], shared);
 }
 
 #[test]

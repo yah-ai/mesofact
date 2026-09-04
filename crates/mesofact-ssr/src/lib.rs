@@ -17,6 +17,7 @@
 //! current-thread tokio runtime; callers talk to it through a small
 //! synchronous handle.
 
+mod ext_sources;
 mod ssg;
 mod ssr;
 

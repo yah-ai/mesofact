@@ -1,0 +1,9 @@
+name = "nested-version-conflict"
+description = "Two requesters force two versions of ansi-styles into one tree: the root wants ^6 and chalk@4 wants ^4, so the hoist must place 6.x at the top and nest 4.x under chalk. The single clearest test that this resolver reproduces bun's LAYOUT and not merely its version choices."
+recorded_at = "2026-09-03"
+known_divergence = []
+
+
+[compare]
+bun = true
+pnpm = true

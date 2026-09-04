@@ -1,0 +1,9 @@
+name = "optional-dep-excluded-here"
+description = "fsevents is darwin-only and sits in the root's optionalDependencies. bun locks it anyway, with its os meta, and so must the resolver: a lock is portable and the install-time filter is what drops it on a linux machine (R773-F9). A resolver that still gated at resolve time would drop it here and diverge from bun by exactly this entry."
+recorded_at = "2026-09-03"
+known_divergence = []
+
+
+[compare]
+bun = true
+pnpm = true

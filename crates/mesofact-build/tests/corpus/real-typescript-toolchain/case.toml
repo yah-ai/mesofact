@@ -1,0 +1,23 @@
+name = "real-typescript-toolchain"
+description = "A plausible outside consumer's devDependencies rather than a single library: typescript, eslint and prettier together. devDependencies are followed for the ROOT only, so a resolver that walked a dependency's devDependencies would explode here and nowhere else."
+recorded_at = "2026-09-03"
+known_divergence = []
+
+[compare]
+bun = true
+pnpm = true
+
+# No waivers. This case carried six until MFT-R773-B1: the aliased
+# `wrap-ansi-cjs` (wrap-ansi@7) and `string-width-cjs` (string-width@4)
+# subtrees are the only place in the corpus where a conflict copy is created
+# two or more levels below the root, which is exactly where the phase-1 hoist
+# used to disagree with bun about depth — bun nests such a copy under its
+# DIRECT requester (`wrap-ansi-cjs/strip-ansi/ansi-regex`), the resolver lifted
+# it to the highest non-conflicting level in the subtree
+# (`wrap-ansi-cjs/ansi-regex`). Both layouts resolve identically under Node, so
+# the divergence was shape-only, but this corpus compares shape. The hoist now
+# matches; see `Resolver::place` in crates/rnpm/src/resolve.rs.
+#
+# Keep it waiver-free. These three nested-alias subtrees are this corpus's only
+# coverage of that depth, so a waiver reappearing here is the same regression
+# wearing a comment.

@@ -52,5 +52,20 @@ serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["rt", "macros", "sync"] }
 tracing = "0.1"
 
+# R823 — build.rs copies the deno extension crates' JS into OUT_DIR so
+# `JsRuntime::new` stops reading it off the build machine's cargo registry.
+#
+# `serde_json` ONLY, and that restraint is load-bearing. The first cut took
+# deno_core + the four extension crates as build-dependencies to read the file
+# lists off real `Extension` values; that made the build SCRIPT link
+# `librusty_v8.a`, i.e. C++, as a HOST unit — and cargo does not apply RUSTFLAGS
+# to host units when `--target` is passed, so the musl builder image's
+# `-lstdc++ -latomic -lgcc` never reached that link and the fleet build died with
+# ~30 undefined libstdc++ symbols (R556-F6 run 8d5023a1, us-west-002). Nothing
+# here may pull deno_core, directly or transitively. build.rs's header has the
+# full account.
+[build-dependencies]
+serde_json = "1"
+
 [dev-dependencies]
 tempfile = "3"

@@ -209,43 +209,21 @@ fn native_package_dir() -> Option<String> {
         .map(|(platform, arch)| format!("typescript-{platform}-{arch}"))
 }
 
-/// Rust's `OS`/`ARCH` in Node's spelling. Split out from
-/// [`native_package_dir`] so the mapping is testable off the host triple, and
-/// `pub(crate)` because [`crate::install`]'s platform gate needs the same
-/// answer — an `os`/`cpu` field in a lockfile is written in this spelling too,
-/// and two copies of this table would drift on the first host either one
-/// learned about.
+/// Rust's `OS`/`ARCH` in Node's spelling.
+///
+/// The table itself moved to [`rnpm::node_platform_arch`] in R773-F6 — an
+/// `os`/`cpu` field is npm manifest grammar, and the resolver reads it too, so
+/// the one copy belongs in the crate that models npm manifests. This alias
+/// stays because [`native_package_dir`] and [`crate::install`]'s gate both call
+/// it by this name, and because the tests below pin the mapping off a host
+/// triple rather than off whatever machine runs them.
+///
+/// Deliberately absent from that table: `mips64`. npm publishes only the
+/// little-endian `mips64el` build and Rust spells both `mips64`, so there is no
+/// honest mapping — such a host falls through to the Node ladder, which still
+/// works.
 pub(crate) fn node_platform_arch(os: &str, arch: &str) -> Option<(&'static str, &'static str)> {
-    let platform = match os {
-        "macos" => "darwin",
-        "windows" => "win32",
-        // Node reports both Solaris and illumos as "sunos".
-        "solaris" | "illumos" => "sunos",
-        "linux" => "linux",
-        "freebsd" => "freebsd",
-        "netbsd" => "netbsd",
-        "openbsd" => "openbsd",
-        "aix" => "aix",
-        _ => return None,
-    };
-    let arch = match arch {
-        "aarch64" => "arm64",
-        "x86_64" => "x64",
-        "arm" => "arm",
-        "loongarch64" => "loong64",
-        "powerpc64" => "ppc64",
-        "riscv64" => "riscv64",
-        "s390x" => "s390x",
-        // Deliberately absent: `mips64`. npm publishes only the
-        // little-endian `mips64el` build and Rust spells both `mips64`, so
-        // there is no honest mapping here — such a host falls through to the
-        // Node ladder, which still works.
-        _ => return None,
-    };
-    // Not every product of these two lists exists upstream (there is no
-    // `typescript-aix-arm64`). That needs no filtering: a name with no
-    // package behind it simply isn't on disk, and `resolve` falls through.
-    Some((platform, arch))
+    rnpm::node_platform_arch(os, arch)
 }
 
 /// Platform executable name (`.exe` suffix on Windows).

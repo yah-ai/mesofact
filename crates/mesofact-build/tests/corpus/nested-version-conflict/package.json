@@ -1,0 +1,5 @@
+{
+  "name": "nested-version-conflict",
+  "version": "1.0.0",
+  "dependencies": { "chalk": "^4.0.0", "ansi-styles": "^6.0.0" }
+}

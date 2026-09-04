@@ -1,0 +1,5 @@
+{
+  "name": "dist-tag",
+  "version": "1.0.0",
+  "dependencies": { "ms": "latest", "escape-string-regexp": "latest" }
+}

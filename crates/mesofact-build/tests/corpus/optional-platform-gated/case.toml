@@ -1,0 +1,9 @@
+name = "optional-platform-gated"
+description = "esbuild@0.24.0 fans out to twenty-four platform-gated optionalDependencies, and a bun.lock records ALL of them with their os/cpu meta. This is the case that proves the resolver does the same (R773-F9): a lock is portable, so resolution records the platform gates instead of applying them and the tree matches bun entry for entry on every machine. It caught the opposite rule directly — under R773-F6 the resolver kept only the host's one variant and diverged from bun by twenty-three entries."
+recorded_at = "2026-09-03"
+known_divergence = []
+
+
+[compare]
+bun = true
+pnpm = true

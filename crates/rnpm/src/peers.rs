@@ -65,8 +65,8 @@ use anyhow::{bail, Result};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::resolve::{
-    describe, link, pick_version, Node, NodeId, NodeSource, PackumentSource, Resolution,
-    ResolvedTree, MAX_NODES,
+    describe, link, peer_requirements, pick_version, Node, NodeId, NodeSource, PackumentSource,
+    ResolveWarning, Resolution, ResolvedTree, Resolver, MAX_NODES,
 };
 use crate::spec::{Version, VersionSpec};
 
@@ -133,6 +133,11 @@ pub fn resolve_peers<S: PackumentSource>(
 ) -> Result<PeerReport> {
     let mut walker = Walker::new(tree);
     walker.walk(tree, ResolvedTree::ROOT, 0, source)?;
+    // This phase adds nodes (auto-installed peers) and re-parents others (peer
+    // instancing), so phase 1's verdict about what is optional no longer
+    // describes this graph. Recomputing is cheaper than maintaining it edge by
+    // edge through a walk that moves things.
+    crate::resolve::recompute_optionality(tree);
     Ok(walker.report)
 }
 
@@ -207,7 +212,7 @@ impl Walker {
         self.seen.insert(key);
         self.report.stats.visited += 1;
 
-        self.match_own_peers(tree, node, source)?;
+        self.match_own_peers(tree, node, depth, source)?;
 
         // Descend. A dependency whose peer context differs from what it
         // currently sees gets its own instance under this node FIRST, so the
@@ -227,10 +232,15 @@ impl Walker {
 
     /// Match `node`'s declared peers against what is visible from its
     /// position, recording a provider or an issue for each.
+    ///
+    /// `depth` is carried purely so [`Self::auto_install`] can descend into
+    /// what it installs at the correct depth — it is `node`'s own walk depth,
+    /// not a second counter.
     fn match_own_peers<S: PackumentSource>(
         &mut self,
         tree: &mut ResolvedTree,
         node: NodeId,
+        depth: usize,
         source: &S,
     ) -> Result<()> {
         for (peer, requirement) in tree.node(node).peers.clone() {
@@ -262,7 +272,7 @@ impl Walker {
                 None if requirement.optional => {}
                 None => {
                     let installed =
-                        self.auto_install(tree, node, &peer, &requirement.range, source)?;
+                        self.auto_install(tree, node, &peer, &requirement.range, depth, source)?;
                     self.report.issues.push(PeerIssue::Missing {
                         at: tree.install_path(node),
                         peer: peer.clone(),
@@ -296,27 +306,35 @@ impl Walker {
     /// package that declared it. Installing beside the declaring package is
     /// what makes it resolvable, which is the behaviour npm actually produces.
     ///
-    /// # KNOWN GAP (R773-B8): the installed node's own dependencies are not
+    /// # The installed node's own subtree (R773-B8)
     ///
-    /// The node created here has no dependency edges, and nothing enqueues it
-    /// into phase 1's BFS — phase 1 is over by the time this runs, and its
-    /// walk loop has no entry point that extends an existing tree. So
-    /// auto-installing `react` gets you `react` and none of what `react`
-    /// itself depends on, which materializes to an install that fails at
-    /// `require()` rather than at resolve time.
+    /// Both phases run against it here, in the order the rest of the resolve
+    /// runs them:
     ///
-    /// Pinned by `an_auto_installed_peers_own_dependencies_are_not_resolved`
-    /// so it is a recorded limitation rather than a surprise. The fix is a
-    /// seam in [`crate::resolve`] — factor the BFS body out of
-    /// `Resolver::resolve` into something that takes an existing tree and a
-    /// seed queue — which is a phase-1 change, and R773-F3 is already in
-    /// review; hence a separate ticket rather than a widened one.
+    /// 1. [`Resolver::expand_dependencies_of`] re-enters phase 1's BFS seeded
+    ///    with the peer's *outgoing* edges. Seeding with an edge pointing
+    ///    **at** the peer would hand it to `place`, which hoists — undoing the
+    ///    deliberate level choice above. So the peer stays exactly where this
+    ///    function put it and only its subtree is placed by phase 1's rules.
+    /// 2. [`Self::walk`] then descends into it, so a peer declared *inside*
+    ///    the new subtree gets resolved like any other. Nothing else reaches
+    ///    this node: it is linked into `level`'s dependency map after that map
+    ///    was cloned for the descent, which is why the recursion has to happen
+    ///    here rather than being left to the outer walk.
+    ///
+    /// That recursion is what `depth` is threaded down for. It is sound for
+    /// the same reasons the ordinary descent is: `in_progress` still breaks
+    /// re-entry onto a node already on the stack, `seen` still short-circuits
+    /// a revisit in a compatible context, `MAX_DEPTH` still bounds the stack,
+    /// and phase 1's own `MAX_NODES` check bounds the arena. The one thing it
+    /// adds is that `pure` must be re-synced first — see below.
     fn auto_install<S: PackumentSource>(
         &mut self,
         tree: &mut ResolvedTree,
         node: NodeId,
         peer: &str,
         range: &VersionSpec,
+        depth: usize,
         source: &S,
     ) -> Result<Option<NodeId>> {
         let level = tree.node(node).parent.unwrap_or(ResolvedTree::ROOT);
@@ -328,39 +346,93 @@ impl Walker {
         let Some(packument) = source.packument(peer)? else {
             return Ok(None);
         };
-        let Some(chosen) = pick_version(&packument, range) else {
+        // Preferences too (R773-T5): an auto-installed peer is a node nobody
+        // asked for by name, so if this one pick ignored the lock it would be
+        // the single entry that made an otherwise unchanged re-resolve differ.
+        let Some(chosen) = pick_version(&packument, range, tree.preferred().get(peer)) else {
             return Ok(None);
         };
         let Ok(version) = Version::parse(&chosen.version) else {
             return Ok(None);
         };
 
+        let registry_name = if packument.name.is_empty() {
+            peer.to_string()
+        } else {
+            packument.name.clone()
+        };
+
+        // No platform gate. R773-F6 declined an auto-install whose
+        // `os`/`cpu`/`libc` excluded the host, because phase 1 was excluding
+        // the same package one code path over and a package must not get two
+        // answers depending on which route found it. R773-F9 removed phase 1's
+        // gate, so keeping this one would recreate exactly that split — the
+        // auto-installed peer would be the one node missing from an otherwise
+        // portable lock. Its `os`/`cpu`/`libc` ride along on the `Resolution`
+        // below and the materializer decides, same as every other node.
+
+        // Phase 1 warns on a deprecated pick and so does this one — an
+        // auto-installed peer is a version this walk chose without anyone
+        // asking for it, which is if anything the case a human most wants told
+        // about (R773-F6).
+        if let Some(reason) = &chosen.deprecated {
+            tree.warn(ResolveWarning::Deprecated {
+                name: registry_name.clone(),
+                version: chosen.version.clone(),
+                reason: reason.clone(),
+            });
+        }
+
+        // A node built by hand from a manifest still has to declare what that
+        // manifest declares. Same parse phase 1 uses, so an auto-installed
+        // package's own peers are ordinary data by the time step 2 walks it.
+        let peers = peer_requirements(&registry_name, chosen)?;
+        let pure = peers.is_empty();
+
         let seed = Node {
             name: peer.to_string(),
             source: NodeSource::Registry(Resolution {
-                name: if packument.name.is_empty() {
-                    peer.to_string()
-                } else {
-                    packument.name.clone()
-                },
+                name: registry_name.clone(),
                 version,
                 tarball: chosen.dist.tarball.clone(),
                 integrity: chosen.dist.integrity.clone(),
+                os: chosen.os.clone(),
+                cpu: chosen.cpu.clone(),
+                libc: chosen.libc.clone(),
             }),
             parent: Some(level),
             children: BTreeMap::new(),
             dependencies: BTreeMap::new(),
             requesters: BTreeSet::new(),
             requirements: BTreeMap::new(),
-            peers: BTreeMap::new(),
+            peers,
+            optional_deps: BTreeSet::new(),
+            // Provisional, like every other creation site: an auto-installed
+            // peer under an optional package is itself optional, and
+            // `recompute_optionality` is what works that out.
             optional: false,
         };
-        // Declares no peers and has no dependency edges, so it is pure by
-        // construction — the walk will reach it and skip it.
-        let id = self.push_node(tree, seed, true)?;
+        // Provisional purity: it has no dependency edges *yet*, so this is only
+        // true until step 1 gives it some. Recomputed below rather than trusted.
+        let id = self.push_node(tree, seed, pure)?;
         tree.node_mut(level).children.insert(peer.to_string(), id);
         link(tree, level, id, peer);
         self.report.stats.auto_installed += 1;
+
+        // 1. Phase 1 over the new subtree. It enforces MAX_NODES as it goes,
+        //    so there is no bound left to re-check afterwards.
+        Resolver::new(source).expand_dependencies_of(tree, id, &registry_name, chosen)?;
+
+        // That walk pushed straight into the arena, and `self.pure` is indexed
+        // by `NodeId` — so it has to catch up before step 2 indexes it.
+        // Recomputed whole rather than extended: a package in the new subtree
+        // may declare a peer, which makes its requesters impure too, and some
+        // of those are nodes that already existed.
+        self.pure = compute_purity(tree);
+
+        // 2. Phase 2 over the new subtree.
+        self.walk(tree, id, depth + 1, source)?;
+
         Ok(Some(id))
     }
 
@@ -434,6 +506,7 @@ impl Walker {
             requesters: BTreeSet::new(),
             requirements: original.requirements.clone(),
             peers: original.peers.clone(),
+            optional_deps: original.optional_deps.clone(),
             optional: original.optional,
         };
         // A copy declares exactly what the original declared, so it inherits

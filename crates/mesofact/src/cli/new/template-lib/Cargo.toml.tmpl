@@ -27,8 +27,14 @@ publish = false
 # `mesofact-dev` — the prod binary's reachable graph cannot contain dev code.
 # Keep it that way: a `use mesofact_dev` in `lib.rs` is the one edit that
 # breaks this, and it breaks it silently.
-mesofact = "0.8.30"
-mesofact-dev = "0.8.30"
+#
+# `__MESOFACT_VERSION__`, not a literal: `expand()` substitutes the scaffolding
+# binary's own CARGO_PKG_VERSION. Hardcoding it drifted twice in a row (0.8.30
+# and 0.8.31 bumps both left this file behind, and the second one scaffolded a
+# manifest naming a version crates.io did not have — check-mesofact-new §7 went
+# red on the resolution error). A version bump can no longer miss this line.
+mesofact = "__MESOFACT_VERSION__"
+mesofact-dev = "__MESOFACT_VERSION__"
 
 # A caret requirement, not an `=` pin, and deliberately: these are Rust deps
 # under cargo's semver rules, so a patch release should reach you. (mesofact's

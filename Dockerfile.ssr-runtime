@@ -77,6 +77,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /build/target/release/mesofact /usr/local/bin/mesofact
 
+# R823 gate, and it is nearly free here: this stage carries no cargo registry, so
+# it is already the "some other machine" the builder stage can never be.
+# `deno_core::extension!` bakes the COMPILING machine's absolute registry paths
+# into the binary and reads them at `JsRuntime::new`, which is why an image that
+# built and started cleanly still died the instant it was asked to host an SSR
+# route — the panic came after the listener was up, so `POST /revalidate` kept
+# answering 202. Boot one real isolate at image-build time instead of finding out
+# in prod.
+RUN mesofact selfcheck ssr
+
 # Workload tree is bind-mounted here at runtime (pond) or COPY'd in (cloud).
 WORKDIR /app
 

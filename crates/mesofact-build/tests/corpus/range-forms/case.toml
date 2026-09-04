@@ -1,0 +1,9 @@
+name = "range-forms"
+description = "Six dependencies spanning tilde, x-ranges, a two-sided comparator range, a bare wildcard, an exact pin and a caret. Range-semantics divergence from pnpm is the specific failure R773-F7 exists to catch, and this is the case that catches it directly rather than as a side effect of some other package's tree."
+recorded_at = "2026-09-03"
+known_divergence = []
+
+
+[compare]
+bun = true
+pnpm = true

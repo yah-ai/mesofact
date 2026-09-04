@@ -34,10 +34,16 @@
 //! - **`file:` deps symlink** to their target, matching bun's behavior for
 //!   workspace-style links (`@mesofact/runtime`) and npm's `"link": true`
 //!   entries.
-//! - **Platform-gated entries are skipped.** A lock entry whose `os`/`cpu`
-//!   metadata excludes this host is dropped by [`host_supports`] rather than
-//!   fetched — the one deliberate omission the walk makes, and the reason a
+//! - **Platform-gated entries are skipped — or refused.** A lock entry whose
+//!   `os`/`cpu`/`libc` metadata excludes this host is dropped rather than
+//!   fetched: the one deliberate omission the walk makes, and the reason a
 //!   `typescript@7` dep costs one 27 MB native compiler instead of twenty.
+//!   Since R773-F9 that is only true of an entry the lock marks **optional**;
+//!   a *required* entry that cannot run here is `EBADPLATFORM`, an error
+//!   naming the package and the host. That refusal used to live in `rnpm`'s
+//!   resolver, where it made every lock host-specific — a lock cut on macOS
+//!   had no linux binaries in it at all. Resolution is now portable and this
+//!   is the layer that knows what it is installing onto.
 //! - **Nothing is fetched unverified.** A registry entry with no sha512
 //!   integrity in the lock is refused by name, never downloaded on trust.
 //!   `PackageSource::Registry` carries the integrity as a required field, so
@@ -57,10 +63,39 @@ use serde_json::Value;
 use sha2::{Digest, Sha512};
 use std::path::{Path, PathBuf};
 
+use rnpm::Host;
+
 use crate::materialize::{self, materialize_tree, Strategy};
 use crate::store::Store;
 
 pub(crate) const REGISTRY: &str = "https://registry.npmjs.org";
+
+/// Cache namespace for [`REGISTRY`]'s packuments, and the directory component
+/// under a packument cache root.
+///
+/// It lives next to the URL it names because every caller that resolves against
+/// this registry has to agree on it: `registry_id` is the cache key's
+/// namespace, so two spellings would read as a total cache miss rather than as
+/// a disagreement. Both the conformance corpus and
+/// [`crate::project_lock`] take it from here.
+pub const REGISTRY_ID: &str = "npm";
+
+/// The endpoint a resolve against the public npm registry runs on.
+pub fn registry_endpoint() -> rnpm::RegistryEndpoint {
+    rnpm::RegistryEndpoint::new(REGISTRY_ID, REGISTRY)
+}
+
+/// A host that admits every platform — the right reader for a lock being read
+/// as *data* rather than as an install plan.
+///
+/// The lock is host-independent (R773-F9): it carries every platform's build of
+/// a native package and the *installer* filters. So anything reading a lock to
+/// learn what it selected — the conformance recorder's packument prune,
+/// [`crate::project_lock`]'s preferences — has to switch the filter off, or it
+/// reads a mac's slice of a portable file and mistakes it for the whole.
+pub(crate) fn admit_every_platform() -> Host {
+    Host { os: None, cpu: None, libc: None }
+}
 
 pub struct InstallReport {
     pub installed: usize,
@@ -149,11 +184,67 @@ pub enum PackageSource {
     /// verification and the store key (W319 §2), so an entry without one
     /// cannot be fetched *or* addressed. Every parser refuses such an entry
     /// by name, and this type is what keeps that from being a convention.
-    Registry { name: String, version: String, integrity: String },
+    Registry {
+        name: String,
+        version: String,
+        integrity: String,
+        /// npm's `os`/`cpu`/`libc` for this package, verbatim (R773-F9).
+        ///
+        /// Carried because a lock this installer *writes* is portable: the
+        /// resolver no longer drops a package that cannot run here, so the
+        /// entry has to say what it can run on or the filter below would have
+        /// nothing to read. Empty on every ordinary package.
+        platform: PlatformGates,
+        /// Is this package's absence tolerable — was it reached only through
+        /// `optionalDependencies`? `None` where the lockfile does not say.
+        ///
+        /// The other half of R773-F9: a platform-mismatched entry is skipped
+        /// when this is `Some(true)` and an `EBADPLATFORM` error when it is
+        /// `Some(false)`. npm's refusal, moved from resolve time (where it made
+        /// the lock host-specific) to install time (where the host is known).
+        ///
+        /// Three-valued rather than a `bool` because **bun's format has no slot
+        /// for this** — bun records optionality on the *requester*, as an
+        /// `optionalDependencies` map inside its meta, so a bun-authored lock
+        /// says nothing about any individual entry. Collapsing that silence to
+        /// `false` would turn every `@esbuild/*` in a lock `bun install` wrote
+        /// into an `EBADPLATFORM` failure on twenty-three of twenty-four hosts.
+        /// `None` therefore behaves as "skip", which is what this installer did
+        /// before there was a flag at all; only a lock that *states* the entry
+        /// is required can produce the error.
+        optional: Option<bool>,
+    },
     /// Symlink to a path relative to the project root (`file:` deps in
     /// bun.lock, `"link": true` entries in package-lock, `link:` specifiers
     /// in pnpm-lock).
     Link { target_rel: PathBuf },
+}
+
+/// A package's declared `os` / `cpu` / `libc`, in npm's grammar (a plain entry
+/// allows, a `!`-prefixed one denies, an empty list gates nothing).
+///
+/// Grouped rather than three fields on [`PackageSource::Registry`] so the
+/// parsers that have nothing to say — the npm and pnpm readers, which prune by
+/// platform as they parse and so only ever emit entries this host admits —
+/// spell that as [`PlatformGates::default`] instead of three empty vectors.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlatformGates {
+    pub os: Vec<String>,
+    pub cpu: Vec<String>,
+    pub libc: Vec<String>,
+}
+
+impl PlatformGates {
+    /// The first of `os` / `cpu` / `libc` that excludes `host`.
+    ///
+    /// A delegation, not a matcher: [`rnpm::gate_mismatch`] owns which axes
+    /// exist, what order they are checked in and what "excludes" means, and
+    /// [`rnpm::manifest_mismatch`] asks it the same question about a packument.
+    /// R773-F6 spent a ticket collapsing two drifted copies of that rule into
+    /// one; this is the call that keeps it at one.
+    fn mismatch(&self, host: &Host) -> Option<rnpm::PlatformMismatch> {
+        rnpm::gate_mismatch(&self.os, &self.cpu, &self.libc, host)
+    }
 }
 
 /// This host's `(process.platform, process.arch)` — npm's spelling, which is
@@ -166,28 +257,64 @@ pub enum PackageSource {
 /// everything, which is the pre-R832-T4 behaviour — no pruning is a fatter
 /// install, but a wrong host name would be an *empty* one.
 pub(crate) fn host_platform_arch() -> Option<(&'static str, &'static str)> {
-    crate::check::node_platform_arch(std::env::consts::OS, std::env::consts::ARCH)
+    rnpm::host_platform_arch()
 }
 
-/// Does an entry's `os` / `cpu` metadata admit this host?
+/// Does an entry's `os` / `cpu` / `libc` metadata admit this host?
 ///
-/// **This is the one place the walk drops a lock entry on purpose** (R832-T4).
-/// The rest of the module installs everything the lock lists — `dev`,
-/// `optional` and `peer` alike — because pruning by *intent* is a resolution
-/// question. Pruning by *platform* is not: a package declaring `"os":
-/// "linux"` cannot execute here whatever the resolver decided, the lock states
-/// that itself, and npm/bun/pnpm all skip it. Installing them anyway was a
-/// wart this module's header used to admit to; `typescript@7` is what made it
+/// The npm reader's gate. The bun reader asks the same question through
+/// [`PlatformGates::mismatch`], which additionally says *which* axis refused so
+/// a required entry can be refused by name; keep the two answering alike.
+///
+/// **This is the one place the npm walk drops a lock entry on purpose**
+/// (R832-T4). The rest of the module installs everything the lock lists —
+/// `dev`, `optional` and `peer` alike — because pruning by *intent* is a
+/// resolution question. Pruning by *platform* is not: a package declaring
+/// `"os": "linux"` cannot execute here whatever the resolver decided, the lock
+/// states that itself, and npm/bun/pnpm all skip it. Installing them anyway was
+/// a wart this module's header used to admit to; `typescript@7` is what made it
 /// unaffordable, since it fans out to twenty native compilers at ~27 MB each
 /// and exactly one of them can run.
 ///
 /// Absent fields admit everything, which is the overwhelmingly common case —
 /// this returns `true` for every ordinary package.
-fn host_supports(meta: &Value) -> bool {
-    let Some((os, cpu)) = host_platform_arch() else {
-        return true;
+///
+/// The host is a parameter rather than `Host::current()` because a portable
+/// lock lists every platform variant of a native (all 24 `@esbuild/*` entries,
+/// each with its own `os`/`cpu` meta), so which subset a read yields is
+/// entirely a function of the host it is asked about — and two callers want to
+/// ask about something other than this machine. R773-F7's conformance corpus
+/// and its recorder both read the bun oracle with every gate *open*, so the
+/// resolver's portable tree and the oracle can be compared entry for entry.
+///
+/// `libc` is checked here too, which `host_platform_arch` cannot express: it
+/// returns only `(os, cpu)`. [`rnpm::Host`] carries all three and
+/// `rnpm::manifest_mismatch` gates on all three, so a bun-side filter that
+/// skipped `libc` would drop a `@img/sharp-linux-*` musl/glibc pair back into
+/// the diff as a phantom divergence.
+fn host_supports(meta: &Value, host: &Host) -> bool {
+    for (field, host_value) in [("os", host.os), ("cpu", host.cpu), ("libc", host.libc)] {
+        let Some(host_value) = host_value else { continue };
+        if !platform_field_admits(meta.get(field), host_value) {
+            return false;
+        }
+    }
+    true
+}
+
+/// A lock entry's meta object, reduced to its three platform lists.
+///
+/// npm allows a bare string or an array on each; bun writes the string form.
+/// Anything else is metadata this reader does not model, and yields an empty
+/// list — which gates nothing, so an unknown shape cannot silently empty an
+/// install.
+fn platform_gates(meta: &Value) -> PlatformGates {
+    let list = |field: &str| match meta.get(field) {
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+        _ => Vec::new(),
     };
-    platform_field_admits(meta.get("os"), os) && platform_field_admits(meta.get("cpu"), cpu)
+    PlatformGates { os: list("os"), cpu: list("cpu"), libc: list("libc") }
 }
 
 /// One `os`/`cpu` field against one host value. npm allows a bare string, an
@@ -213,26 +340,32 @@ fn platform_field_admits(field: Option<&Value>, host: &str) -> bool {
 /// a plain entry is an allowlist member, a `!`-prefixed one is a denylist
 /// member, an exclusion beats an inclusion, and an empty list gates nothing.
 ///
-/// `pub(crate)` so [`crate::pnpm`]'s gate is the same code rather than the
-/// same idea written twice — the two formats differ in how the list is spelled
-/// (a JSON field vs a YAML sequence), never in what it means.
+/// The rule is npm manifest grammar, so it lives in [`rnpm::platform`] and this
+/// is a delegation (R773-F6). It stays `pub(crate)` here because
+/// [`crate::pnpm`] and the tests below call it by this name; what changed is
+/// that there is now one implementation in the crate that models npm manifests
+/// rather than a copy in each consumer that noticed it.
 pub(crate) fn platform_admits<'a>(values: impl IntoIterator<Item = &'a str>, host: &str) -> bool {
-    let mut required = false;
-    let mut satisfied = false;
-    for v in values {
-        match v.strip_prefix('!') {
-            Some(excluded) if excluded == host => return false,
-            Some(_) => {}
-            None => {
-                required = true;
-                satisfied |= v == host;
-            }
-        }
-    }
-    !required || satisfied
+    rnpm::platform_admits(values, host)
 }
 
 pub(crate) fn parse_bun_lock(lock_path: &Path) -> Result<Vec<LockedPackage>> {
+    parse_bun_lock_for_host(lock_path, &Host::current())
+}
+
+/// [`parse_bun_lock`], with the platform gate evaluated against an explicit
+/// host instead of this machine.
+///
+/// Two kinds of caller need the parameter, and neither is an install:
+/// [`crate::conformance`] and its recorder read a lock with every gate *open*
+/// (an all-`None` host), which is what makes a portable lock and the resolver's
+/// portable tree comparable entry for entry; and the tests below state a host
+/// so their assertions do not depend on the box running them. An install always
+/// goes through [`parse_bun_lock`], i.e. `Host::current()`.
+pub(crate) fn parse_bun_lock_for_host(
+    lock_path: &Path,
+    host: &Host,
+) -> Result<Vec<LockedPackage>> {
     let raw = std::fs::read_to_string(lock_path)
         .with_context(|| format!("reading {}", lock_path.display()))?;
     let parsed: Value = serde_json::from_str(&strip_trailing_commas(&raw))
@@ -265,6 +398,12 @@ pub(crate) fn parse_bun_lock(lock_path: &Path) -> Result<Vec<LockedPackage>> {
         // package of that name (a guaranteed 404).
         let name = &locator[..at];
         let version = &locator[at + 1..];
+        // The meta object is the only object in the entry array, and it is
+        // where bun records `os` / `cpu` — and where we record `libc` and
+        // `optional` besides (see [`crate::lock`]).
+        let meta = arr.iter().find(|v| v.is_object());
+        let platform = meta.map(platform_gates).unwrap_or_default();
+        let optional = meta.and_then(|m| m.get("optional")).and_then(Value::as_bool);
         let source = if let Some(rel) = version.strip_prefix("file:") {
             PackageSource::Link { target_rel: PathBuf::from(rel) }
         } else if version.contains("workspace:") || version.starts_with("link:") {
@@ -287,14 +426,28 @@ pub(crate) fn parse_bun_lock(lock_path: &Path) -> Result<Vec<LockedPackage>> {
                 name: name.to_string(),
                 version: version.to_string(),
                 integrity,
+                platform: platform.clone(),
+                optional,
             }
         };
-        // Platform gate. `meta` is the only object in the entry array, and it
-        // is where bun records `os` / `cpu` for a native optional.
-        if let Some(meta) = arr.iter().find(|v| v.is_object()) {
-            if !host_supports(meta) {
+        // The platform gate — the one place this walk drops a lock entry on
+        // purpose, and since R773-F9 also the one place it refuses an install
+        // outright. A portable lock lists every platform's build, so *some*
+        // entry here always fails to match; which failure is tolerable is
+        // exactly what `optional` records.
+        if let Some(mismatch) = platform.mismatch(host) {
+            if optional != Some(false) {
                 continue;
             }
+            bail!(
+                "EBADPLATFORM: {key} ({locator}) cannot run on this host ({}) — its `{}` is [{}] \
+                 and this host's is {}; the lock marks it a required dependency, so it cannot be \
+                 skipped the way an optionalDependency would be",
+                host.describe(),
+                mismatch.field,
+                mismatch.declared.join(", "),
+                mismatch.host,
+            );
         }
         // bun.lock keys are relative to the root node_modules; npm's are
         // relative to the project root, which is what the walk wants.
@@ -359,7 +512,8 @@ fn detect_lockfile(project_root: &Path) -> Result<Lockfile> {
         return Ok(Lockfile::Pnpm(pnpm));
     }
     bail!(
-        "{} has no bun.lock, package-lock.json or pnpm-lock.yaml — the Rust-native install step is lockfile-driven (W174 amendment); run `bun install` (or `npm install`, or `pnpm install`) once to mint the lock, or build against an existing node_modules with --no-install",
+        "{} has no bun.lock, package-lock.json or pnpm-lock.yaml — the Rust-native install step is lockfile-driven (W174 amendment); mint one with `mesofact-build lock {}` (or `bun install` / `npm install` / `pnpm install`), or build against an existing node_modules with --no-install",
+        project_root.display(),
         project_root.display()
     )
 }
@@ -467,7 +621,7 @@ fn parse_package_lock(lock_path: &Path) -> Result<Vec<LockedPackage>> {
             continue;
         }
         // Platform gate — npm records `os` / `cpu` on the entry itself.
-        if !host_supports(entry) {
+        if !host_supports(entry, &Host::current()) {
             continue;
         }
 
@@ -539,6 +693,14 @@ fn parse_package_lock(lock_path: &Path) -> Result<Vec<LockedPackage>> {
                 name: name.to_string(),
                 version: version.to_string(),
                 integrity: integrity.to_string(),
+                // A `package-lock.json` is somebody else's lock, pruned by
+                // platform a few lines above: every entry that reaches here
+                // already runs on this host, so there is no gate left to carry
+                // and nothing downstream would ask about optionality. Only the
+                // bun reader — the format this installer also *writes* — fills
+                // these in.
+                platform: PlatformGates::default(),
+                optional: None,
             },
         });
     }
@@ -602,7 +764,10 @@ pub fn install(project_root: &Path) -> Result<InstallReport> {
                 link_package(&dest, &target)?;
                 linked += 1;
             }
-            PackageSource::Registry { name, version, integrity } => {
+            // `platform` and `optional` were consumed by the parser: an entry
+            // that reaches the walk is one this host can run, or the parse
+            // failed naming it. Nothing here re-decides that.
+            PackageSource::Registry { name, version, integrity, .. } => {
                 install_registry_package(
                     &client, &store, chain, &dest, name, version, integrity,
                 )?;
@@ -770,7 +935,7 @@ mod tests {
     #[test]
     fn the_platform_gate_admits_this_host_and_nothing_else() {
         let (host_os, host_cpu) = host_platform_arch().expect("a host this table models");
-        assert!(host_supports(&serde_json::json!({ "os": host_os, "cpu": host_cpu })));
+        assert!(host_supports(&serde_json::json!({ "os": host_os, "cpu": host_cpu }), &Host::current()));
 
         // A real `typescript@7.0.2` fan-out, verbatim from a bun.lock: twenty
         // natives, one runnable. `"none"` is what bun writes for a platform it
@@ -787,7 +952,7 @@ mod tests {
         ];
         let admitted = fan_out
             .iter()
-            .filter(|(os, cpu)| host_supports(&serde_json::json!({ "os": os, "cpu": cpu })))
+            .filter(|(os, cpu)| host_supports(&serde_json::json!({ "os": os, "cpu": cpu }), &Host::current()))
             .count();
         assert!(admitted <= 1, "{admitted} of a native fan-out claim to run here");
     }
@@ -796,10 +961,10 @@ mod tests {
     /// the one where a regression would empty an install rather than fatten it.
     #[test]
     fn the_platform_gate_is_silent_on_ordinary_packages() {
-        assert!(host_supports(&serde_json::json!({})));
-        assert!(host_supports(&serde_json::json!({ "bin": { "tsc": "bin/tsc" } })));
+        assert!(host_supports(&serde_json::json!({}), &Host::current()));
+        assert!(host_supports(&serde_json::json!({ "bin": { "tsc": "bin/tsc" } }), &Host::current()));
         // Shapes the walk does not understand are admitted, not dropped.
-        assert!(host_supports(&serde_json::json!({ "os": 7 })));
+        assert!(host_supports(&serde_json::json!({ "os": 7 }), &Host::current()));
     }
 
     /// npm's array form, including `!` negation, which bun never writes but a
@@ -1110,6 +1275,123 @@ mod tests {
     }
 
     // ---- the shared walk contract ----------------------------------------
+
+    /// The platform gate reads the PINNED host, not this machine.
+    ///
+    /// This is what makes R773-F7's conformance corpus machine-independent: a
+    /// bun.lock is portable and lists every platform variant of a native
+    /// optional, so which subset comes back is purely a function of the host
+    /// asked about — and so is the lock this crate now writes (R773-F9).
+    ///
+    /// This is also the bun-authored shape: no entry states `optional`, so
+    /// every mismatch here is a skip. That is the compatibility this installer
+    /// cannot lose — a lock `bun install` wrote must keep installing.
+    ///
+    /// Deliberately asserts on THREE hosts rather than one, so the test states
+    /// a property instead of a coincidence — and none of the assertions depends
+    /// on which box runs it.
+    #[test]
+    fn the_bun_platform_gate_reads_the_host_it_is_given_not_this_machine() {
+        let (_tmp, path) = lock_file(
+            "bun.lock",
+            r#"{
+  "lockfileVersion": 1,
+  "packages": {
+    "@esbuild/linux-x64": ["@esbuild/linux-x64@0.24.0", "", { "os": "linux", "cpu": "x64" }, "sha512-linuxx64"],
+    "@esbuild/darwin-arm64": ["@esbuild/darwin-arm64@0.24.0", "", { "os": "darwin", "cpu": "arm64" }, "sha512-darwinarm"],
+    "@esbuild/win32-x64": ["@esbuild/win32-x64@0.24.0", "", { "os": "win32", "cpu": "x64" }, "sha512-win32x64"],
+    "esbuild": ["esbuild@0.24.0", "", {}, "sha512-esbuild"]
+  }
+}"#,
+        );
+
+        let for_host = |os, cpu, libc| {
+            let host = Host { os: Some(os), cpu: Some(cpu), libc };
+            let mut names: Vec<String> = parse_bun_lock_for_host(&path, &host)
+                .unwrap()
+                .iter()
+                .map(|p| p.key.clone())
+                .collect();
+            names.sort();
+            names
+        };
+
+        assert_eq!(
+            for_host("linux", "x64", Some("glibc")),
+            ["@esbuild/linux-x64", "esbuild"],
+            "a host that is not this machine"
+        );
+        assert_eq!(
+            for_host("darwin", "arm64", None),
+            ["@esbuild/darwin-arm64", "esbuild"]
+        );
+        assert_eq!(for_host("win32", "x64", None), ["@esbuild/win32-x64", "esbuild"]);
+    }
+
+    /// R773-F9's install-time half. The resolver no longer refuses to lock a
+    /// package this machine cannot run, so this layer has to — and only for an
+    /// entry the lock says is *required*. Both halves in one test, over one
+    /// lock, because the pair is the rule: drop either and the remaining one
+    /// reads as "skip everything" or "refuse everything".
+    #[test]
+    fn a_required_platform_mismatch_is_an_error_and_an_optional_one_is_a_skip() {
+        let (_tmp, path) = lock_file(
+            "bun.lock",
+            r#"{
+  "lockfileVersion": 1,
+  "packages": {
+    "@esbuild/darwin-arm64": ["@esbuild/darwin-arm64@0.24.0", "", { "os": "darwin", "cpu": "arm64", "optional": true }, "sha512-darwinarm"],
+    "@img/sharp-linuxmusl-x64": ["@img/sharp-linuxmusl-x64@0.33.5", "", { "os": "linux", "cpu": "x64", "libc": "musl", "optional": true }, "sha512-musl"],
+    "esbuild": ["esbuild@0.24.0", "", { "optional": false }, "sha512-esbuild"]
+  }
+}"#,
+        );
+
+        // linux/x64/glibc: both natives are for somewhere else, both optional,
+        // both dropped — including the musl one, which `os`/`cpu` alone cannot
+        // tell from a glibc build.
+        let linux = Host { os: Some("linux"), cpu: Some("x64"), libc: Some("glibc") };
+        let keys: Vec<String> =
+            parse_bun_lock_for_host(&path, &linux).unwrap().iter().map(|p| p.key.clone()).collect();
+        assert_eq!(keys, ["esbuild"]);
+
+        // Same lock, and now the *required* entry is the one that cannot run.
+        let win = Host { os: Some("win32"), cpu: Some("x64"), libc: None };
+        let (_tmp2, required) = lock_file(
+            "bun.lock",
+            r#"{
+  "lockfileVersion": 1,
+  "packages": {
+    "@esbuild/darwin-arm64": ["@esbuild/darwin-arm64@0.24.0", "", { "os": "darwin", "cpu": "arm64", "optional": false }, "sha512-darwinarm"]
+  }
+}"#,
+        );
+        let msg = parse_bun_lock_for_host(&required, &win).unwrap_err().to_string();
+        assert!(msg.contains("EBADPLATFORM"), "{msg}");
+        assert!(msg.contains("@esbuild/darwin-arm64"), "{msg}");
+        assert!(msg.contains("win32/x64"), "{msg}");
+        assert!(msg.contains("`os`"), "{msg}");
+    }
+
+    /// The three-valued `optional` in one assertion: a lock that does not state
+    /// it is a lock that cannot demand the error. bun writes optionality on the
+    /// *requester* rather than the entry, so collapsing "absent" to "required"
+    /// would turn every native in a bun-authored lock into a failed install on
+    /// twenty-three hosts out of twenty-four.
+    #[test]
+    fn an_entry_that_does_not_state_its_optionality_is_skipped_not_refused() {
+        let (_tmp, path) = lock_file(
+            "bun.lock",
+            r#"{
+  "lockfileVersion": 1,
+  "packages": {
+    "@esbuild/darwin-arm64": ["@esbuild/darwin-arm64@0.24.0", "", { "os": "darwin", "cpu": "arm64" }, "sha512-darwinarm"]
+  }
+}"#,
+        );
+        let win = Host { os: Some("win32"), cpu: Some("x64"), libc: None };
+        assert!(parse_bun_lock_for_host(&path, &win).unwrap().is_empty());
+    }
 
     #[test]
     fn bun_lock_keys_become_root_node_modules_paths() {

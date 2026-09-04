@@ -52,8 +52,10 @@
 
 pub mod cache;
 pub mod client;
+mod overrides;
 pub mod packument;
 pub mod peers;
+pub mod platform;
 pub mod resolve;
 pub mod spec;
 #[cfg(any(test, feature = "testing"))]
@@ -64,9 +66,13 @@ pub use cache::{cache_file_name, CachedPackument, PackumentCache};
 pub use client::{CachePolicy, RegistryClient, RegistryEndpoint};
 pub use packument::{Dist, Packument, PeerDependencyMeta, VersionManifest};
 pub use peers::{resolve_peers, PeerIssue, PeerReport, PeerStats};
+pub use platform::{
+    gate_mismatch, host_libc, host_platform_arch, manifest_mismatch, node_platform_arch,
+    platform_admits, Host, PlatformMismatch,
+};
 pub use resolve::{
-    Node, NodeId, NodeSource, PackumentSource, PeerRequirement, RegistrySource, ResolvedTree,
-    Resolution, Resolver, RootManifest,
+    Node, NodeId, NodeSource, PackumentSource, PeerRequirement, PreferredVersions, RegistrySource,
+    ResolveWarning, ResolvedTree, Resolution, Resolver, RootManifest,
 };
 pub use spec::{
     validate_package_name, GitHost, GitSource, GitSpec, PackageSpec, Range, SpecError,

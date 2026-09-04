@@ -336,7 +336,26 @@ impl PnpmLock {
             }));
         }
 
-        let dep_path = format!("{}@{}", edge.name, edge.spec);
+        // An ALIASED dependency is spelled by putting the real package's own
+        // depPath in the value: `string-width-cjs: string-width@4.2.3`, where a
+        // plain dependency's value is a bare version (`4.2.3`, or
+        // `6.3.1(react@18.3.1)` with a peer suffix). Prefixing `edge.name`
+        // unconditionally produced `string-width-cjs@string-width@4.2.3`, which
+        // matches nothing in `packages:` — so `mesofact-build install` refused
+        // any pnpm project reaching an alias, and `rimraf` → `glob` →
+        // `@isaacs/cliui` reaches one, which is about as mainstream as a
+        // dependency chain gets. Found by R773-F7's conformance corpus.
+        //
+        // A version always starts with a digit and a package name never does
+        // (npm refuses a leading digit only after `@`, and a scoped alias target
+        // starts with `@`), so the first byte is a sound discriminator.
+        //
+        // Only the depPath changes. The DIRECTORY still comes from `edge.name`
+        // below, which is what makes the alias install at its alias.
+        let dep_path = match edge.spec.starts_with(|c: char| c.is_ascii_digit()) {
+            true => format!("{}@{}", edge.name, edge.spec),
+            false => edge.spec.clone(),
+        };
         let base = base_identity(&dep_path);
         let Some(meta) = self.packages.get(base) else {
             bail!(
@@ -376,6 +395,11 @@ impl PnpmLock {
                 name: name.to_string(),
                 version: version.to_string(),
                 integrity: integrity.clone(),
+                // As with the npm reader: this format is pruned by platform
+                // during the layout derivation above, so every entry that
+                // survives runs on this host and has no gate left to carry.
+                platform: crate::install::PlatformGates::default(),
+                optional: None,
             },
             identity: dep_path,
             has_snapshot: true,
@@ -571,6 +595,57 @@ mod tests {
         match &pkg.source {
             PackageSource::Registry { version, .. } => version.clone(),
             PackageSource::Link { target_rel } => format!("link:{}", target_rel.display()),
+        }
+    }
+
+    /// An ALIASED dependency: pnpm writes the real package's own depPath as the
+    /// value (`string-width-cjs: string-width@4.2.3`) where a plain dependency
+    /// carries a bare version. Prefixing the edge name unconditionally built
+    /// `string-width-cjs@string-width@4.2.3`, which matches nothing in
+    /// `packages:` — so `install` refused every pnpm project that reached an
+    /// alias, and `rimraf` -> `glob` -> `@isaacs/cliui` reaches one.
+    ///
+    /// Found by R773-F7's conformance corpus. Pinned here as well because the
+    /// corpus would report it as "a case diverges", which points at the wrong
+    /// layer entirely.
+    #[test]
+    fn an_aliased_dep_path_resolves_to_the_real_package() {
+        let pkgs = parse(
+            r#"
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      cliui:
+        specifier: ^8.0.0
+        version: 8.0.2
+packages:
+  cliui@8.0.2:
+    resolution: {integrity: sha512-cliui}
+  string-width@4.2.3:
+    resolution: {integrity: sha512-strwidth}
+snapshots:
+  cliui@8.0.2:
+    dependencies:
+      string-width-cjs: string-width@4.2.3
+  string-width@4.2.3: {}
+"#,
+        )
+        .expect("an aliased depPath must resolve, not 404 against a concatenated name");
+
+        // The DIRECTORY keeps the alias; the package behind it is the real one.
+        // It hoists to the root because nothing else claims that name — the
+        // alias is a directory name, so it can never collide with the real
+        // `string-width`, which is exactly why an alias is the case where
+        // "install name" and "registry name" provably come apart.
+        assert_eq!(version_at(&pkgs, "node_modules/string-width-cjs"), "4.2.3");
+        let aliased = pkgs
+            .iter()
+            .find(|p| p.dest_rel.ends_with("string-width-cjs"))
+            .expect("the alias directory");
+        match &aliased.source {
+            PackageSource::Registry { name, .. } => assert_eq!(name, "string-width"),
+            other => panic!("expected a registry source, got {other:?}"),
         }
     }
 

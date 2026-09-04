@@ -10,9 +10,12 @@
 //!
 //! **Nothing here names a concept the materializer cannot observe.** The seam
 //! carries an install path and a [`PackageSource`] — the same
-//! `Registry{name, version, integrity} | Link{target}` vocabulary the three
-//! parsers already reduce their formats to. No ranges, no peer relationships,
-//! no resolution provenance. Those are real things a resolver knows, and a
+//! `Registry{name, version, integrity, platform, optional} | Link{target}`
+//! vocabulary the three parsers already reduce their formats to. The last two
+//! joined in R773-F9 and belong under this rule rather than beside it: "can
+//! this run here" and "may it be missing" are both questions the materializer
+//! asks and answers. No ranges, no peer relationships, no resolution
+//! provenance. Those are real things a resolver knows, and a
 //! lock that carried them would be a lock only that resolver could write; a
 //! lock that carries only what a materializer reads can be written by hand, by
 //! a competitor, or by `bun install`.
@@ -26,22 +29,49 @@
 //! (`parse_bun_lock`), so the seam is proved by round-tripping through it
 //! rather than by a spec.
 //!
-//! # Deliberately not written
+//! # What goes in the third slot
 //!
 //! bun's own writer puts a package's declared `dependencies`,
-//! `peerDependencies` and `bin` in the third slot of each entry. This writes
-//! `{}` there, because a materializer never reads it and the rule above says
-//! the seam does not carry what the materializer cannot observe. The
-//! consequence, stated so nobody discovers it: the `bun` CLI reading one of
-//! our lockfiles would re-resolve the graph rather than trust it. Our reader
-//! ignores the slot entirely.
+//! `peerDependencies`, `bin`, `os` and `cpu` in the third slot of each entry.
+//!
+//! This used to write `{}` there and say so: a materializer never read it, and
+//! the rule above says the seam does not carry what the materializer cannot
+//! observe. **R773-F9 reversed that**, because the materializer now *does* read
+//! it. The lock is portable — the resolver records every platform's build of a
+//! native package instead of only the one the resolving machine could run — so
+//! each entry has to state what it runs on or an installer has no way to pick.
+//! Three keys are written, and only for a package that declares them:
+//!
+//! - `os` / `cpu`, in bun's own spelling: a bare string for a single value, an
+//!   array for several (verified against `bun install --lockfile-only` 1.3.12
+//!   and the recorded `optional-platform-gated` corpus case, which carries all
+//!   twenty-four `@esbuild/*` variants).
+//! - `libc`, which **bun does not record at all** — checked on a real
+//!   `sharp@0.33.5` lock, where the `linuxmusl` builds are written with `os`
+//!   and `cpu` only. npm's manifest field is the spelling; we write it because
+//!   dropping it would make a musl and a glibc build of the same package
+//!   indistinguishable at install time.
+//! - `optional`, an explicit boolean on every registry entry, and **not a bun
+//!   concept**: bun records optionality on the *requester*, as an
+//!   `optionalDependencies` map. A reader needs it per entry to know whether a
+//!   platform mismatch is a skip or an `EBADPLATFORM` error, and reconstructing
+//!   it from requester maps would mean carrying the whole dependency graph the
+//!   rule above keeps out. `install.rs` treats an entry that does not state it
+//!   as optional, so a bun-authored lock keeps working unchanged.
+//!
+//! bun tolerates all three: `bun install --frozen-lockfile --dry-run` accepts a
+//! lock carrying `libc` and `optional` keys (bun 1.3.12, checked 2026-09-03).
+//! What it still will not do is *trust* one of our locks' graph — the
+//! `dependencies` / `peerDependencies` / `bin` keys are still absent, so the
+//! `bun` CLI would re-resolve rather than install from it. Our reader ignores
+//! those keys entirely.
 
 use anyhow::{bail, Result};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::install::PackageSource;
+use crate::install::{PackageSource, PlatformGates};
 
 /// One decided placement: where it goes, and what goes there.
 ///
@@ -89,9 +119,13 @@ pub struct BunLockWriter {
     pub root_name: String,
 }
 
+/// What [`BunLockWriter`] writes, as a name a caller can join onto a project
+/// root without constructing a writer to ask.
+pub const BUN_LOCK_FILE: &str = "bun.lock";
+
 impl LockWriter for BunLockWriter {
     fn file_name(&self) -> &'static str {
-        "bun.lock"
+        BUN_LOCK_FILE
     }
 
     fn render(&self, entries: &[LockEntry]) -> Result<String> {
@@ -103,15 +137,16 @@ impl LockWriter for BunLockWriter {
                 bail!("a lock entry has an empty install path");
             }
             let value = match &entry.source {
-                PackageSource::Registry { name, version, integrity } => json!([
-                    format!("{name}@{version}"),
-                    // The registry slot: empty means the default one, which
-                    // is the only one this installer fetches from.
-                    "",
-                    // See the module header: intentionally empty.
-                    Map::new(),
-                    integrity,
-                ]),
+                PackageSource::Registry { name, version, integrity, platform, optional } => {
+                    json!([
+                        format!("{name}@{version}"),
+                        // The registry slot: empty means the default one, which
+                        // is the only one this installer fetches from.
+                        "",
+                        entry_meta(platform, *optional),
+                        integrity,
+                    ])
+                }
                 PackageSource::Link { target_rel } => json!([format!(
                     "{}@file:{}",
                     // A link's locator names the package, and the install
@@ -138,6 +173,39 @@ impl LockWriter for BunLockWriter {
     }
 }
 
+/// The third slot of a registry entry: what an installer needs to decide
+/// whether this package belongs on the machine in front of it.
+///
+/// `os` / `cpu` / `libc` are omitted where the package declares none, which is
+/// the overwhelming majority — so an ordinary lock looks exactly as it did
+/// before R773-F9. `optional` is written whenever it is known — which is always
+/// for a resolver-produced entry, and never for one read back out of a
+/// bun-authored lock, since bun does not record it. The reader treats a missing
+/// one as "the lock does not say" and skips rather than refusing, so this
+/// omission round-trips as itself. See the module header.
+fn entry_meta(platform: &PlatformGates, optional: Option<bool>) -> Value {
+    let mut meta = Map::new();
+    for (field, values) in
+        [("os", &platform.os), ("cpu", &platform.cpu), ("libc", &platform.libc)]
+    {
+        match values.as_slice() {
+            [] => {}
+            // bun's own spelling: one value is a bare string, several are an
+            // array. Both are npm's grammar and both read back identically.
+            [only] => {
+                meta.insert(field.to_string(), Value::String(only.clone()));
+            }
+            many => {
+                meta.insert(field.to_string(), json!(many));
+            }
+        }
+    }
+    if let Some(optional) = optional {
+        meta.insert("optional".to_string(), Value::Bool(optional));
+    }
+    Value::Object(meta)
+}
+
 /// The package name a bun.lock key installs: everything after the last
 /// nesting boundary, scope included. `@scope/pkg/react` → `react`,
 /// `@scope/pkg` → `@scope/pkg`.
@@ -158,13 +226,34 @@ fn leaf_name(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::install::parse_bun_lock;
+    use crate::install::{parse_bun_lock, parse_bun_lock_for_host};
 
     fn registry(name: &str, version: &str, integrity: &str) -> PackageSource {
         PackageSource::Registry {
             name: name.to_string(),
             version: version.to_string(),
             integrity: integrity.to_string(),
+            platform: PlatformGates::default(),
+            optional: Some(false),
+        }
+    }
+
+    /// A native binary: the shape the portable lock exists for. `gates` are
+    /// npm's lists verbatim, and `optional` is what makes a mismatch a skip
+    /// rather than an error on the reading side.
+    fn native(
+        name: &str,
+        version: &str,
+        integrity: &str,
+        gates: PlatformGates,
+        optional: bool,
+    ) -> PackageSource {
+        PackageSource::Registry {
+            name: name.to_string(),
+            version: version.to_string(),
+            integrity: integrity.to_string(),
+            platform: gates,
+            optional: Some(optional),
         }
     }
 
@@ -230,6 +319,90 @@ mod tests {
         // is the whole point of the nesting.
         let hoisted = read.iter().find(|p| p.key == "react").unwrap();
         assert_eq!(hoisted.dest_rel, Path::new("node_modules/react"));
+    }
+
+    /// The portable half of the lock (R773-F9): every platform's build is
+    /// written, each stating what it runs on, and the entry survives write →
+    /// read with its gates and its optionality intact.
+    ///
+    /// Read back against a host that admits everything, because a host-filtered
+    /// read is *supposed* to lose most of these — that filtering is the point,
+    /// and it is asserted separately in `install.rs`.
+    #[test]
+    fn platform_gates_and_optionality_survive_the_round_trip() {
+        let gates = |os: &[&str], cpu: &[&str], libc: &[&str]| PlatformGates {
+            os: os.iter().map(|s| s.to_string()).collect(),
+            cpu: cpu.iter().map(|s| s.to_string()).collect(),
+            libc: libc.iter().map(|s| s.to_string()).collect(),
+        };
+        let entries = vec![
+            LockEntry {
+                path: "@esbuild/darwin-arm64".into(),
+                source: native(
+                    "@esbuild/darwin-arm64",
+                    "0.24.0",
+                    "sha512-dddddddddddddddddddddddddddddddddddddddd==",
+                    gates(&["darwin"], &["arm64"], &[]),
+                    true,
+                ),
+            },
+            LockEntry {
+                path: "@img/sharp-linuxmusl-x64".into(),
+                source: native(
+                    "@img/sharp-linuxmusl-x64",
+                    "0.33.5",
+                    "sha512-mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm==",
+                    gates(&["linux"], &["x64"], &["musl"]),
+                    true,
+                ),
+            },
+            // Several values on one axis, and a negation: npm's array form,
+            // which bun collapses to a bare string only when there is one.
+            LockEntry {
+                path: "posix-only".into(),
+                source: native(
+                    "posix-only",
+                    "1.0.0",
+                    "sha512-pppppppppppppppppppppppppppppppppppppppp==",
+                    gates(&["!win32"], &["x64", "arm64"], &[]),
+                    false,
+                ),
+            },
+            LockEntry {
+                path: "react".into(),
+                source: registry("react", "18.3.1", "sha512-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=="),
+            },
+        ];
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path =
+            write_lock(&BunLockWriter { root_name: "demo".into() }, tmp.path(), &entries).unwrap();
+
+        // bun's own spelling, checked against a real `bun install` lock: one
+        // value is a bare string, several are an array.
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            doc["packages"]["@esbuild/darwin-arm64"][2],
+            json!({ "os": "darwin", "cpu": "arm64", "optional": true })
+        );
+        assert_eq!(
+            doc["packages"]["posix-only"][2],
+            json!({ "os": "!win32", "cpu": ["x64", "arm64"], "optional": false })
+        );
+        // An ordinary package declares no gates, so it grows no keys but the
+        // one this format does not have at all.
+        assert_eq!(doc["packages"]["react"][2], json!({ "optional": false }));
+
+        let admit_everything = rnpm::Host { os: None, cpu: None, libc: None };
+        let read = parse_bun_lock_for_host(&path, &admit_everything).unwrap();
+        assert_eq!(read.len(), entries.len());
+        for entry in &entries {
+            let got = read
+                .iter()
+                .find(|p| p.key == entry.path)
+                .unwrap_or_else(|| panic!("{:?} did not survive the round trip", entry.path));
+            assert_eq!(got.source, entry.source, "{:?}", entry.path);
+        }
     }
 
     #[test]

@@ -2,19 +2,24 @@
 # packuments, on-disk cache, conditional revalidation) with the range solver and
 # tree builder to follow in R773-F2/F3/F4.
 #
-# WORKING TITLE ONLY. R757 says the shipped name is chosen on the way out, once
-# the code exists — `publish = false` is what keeps a placeholder name off
-# crates.io in the meantime.
+# NAME IS NOW SHIPPED, not a working title. R757 said the name gets chosen on
+# the way out once the code exists; the way out arrived 2026-09-04 when
+# `mesofact-build` took a path+version dep on this crate and the oss-publish
+# wave died at step 07 — cargo will not package a crate whose path dep has no
+# registry version, so `publish = false` here made `mesofact-build`, `mesofact`,
+# `mesofact-dev` and `mes` all unpublishable. Operator chose `rnpm` (free on
+# crates.io; the npm registry holds a deprecated React Native package under the
+# same name, which R757 already judged acceptable since npm publication is out
+# of scope). crates.io names are never released, so this is not reversible.
 
 [package]
 name = "rnpm"
-description = "npm registry protocol and resolution (working title — see R757)"
+description = "npm registry protocol and resolution in Rust — abbreviated packuments, on-disk cache, range solving, tree building"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
 
 [features]
 # Exposes `rnpm::testing::FakeTransport` so a downstream crate can prove the

@@ -1,0 +1,12 @@
+{
+  "name": "range-forms",
+  "version": "1.0.0",
+  "dependencies": {
+    "semver": "~7.5.0",
+    "ms": "2.x",
+    "debug": ">=4.3.0 <4.4.0",
+    "escape-string-regexp": "*",
+    "ansi-regex": "5.0.1",
+    "strip-ansi": "^6.0.0"
+  }
+}

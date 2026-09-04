@@ -1,0 +1,9 @@
+name = "scoped-deep"
+description = "@babel/core is scoped, deep, and full of @babel/* packages that share transitive dependencies at different ranges — so it exercises the dedupe path at a scale hand-written cases do not reach, and it is the case where a / in a package name has to survive the cache's %2f mangling."
+recorded_at = "2026-09-03"
+known_divergence = []
+
+
+[compare]
+bun = true
+pnpm = true

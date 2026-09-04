@@ -1,0 +1,27 @@
+name = "overrides-redirect"
+description = "An npm-style root overrides table pins chalk's transitive ansi-styles to an exact version its declared ^4.1.0 range would not have selected. Overrides are applied before the spec is parsed, so this also proves the override survives into the hoist rather than being re-decided by it."
+recorded_at = "2026-09-03"
+
+
+[compare]
+bun = true
+pnpm = true
+
+# pnpm 11.24.0 does not apply npm's root `overrides` table at all. Verified
+# directly on 2026-09-03: the identical manifest resolves ansi-styles to 4.3.0
+# under `pnpm install` and to 4.2.1 under `bun install`, and the resolver agrees
+# with bun. That is a tool-policy difference about which field an override lives
+# in, not a resolution one, so the pnpm side of this case is waived and the bun
+# side — the one that actually tests the override — is not.
+#
+# The pinned versions are load-bearing. A pnpm key is a bare package NAME, so
+# without `expected`/`found` this would waive ansi-styles' entire version-set
+# anywhere in the case; with them it excuses exactly the 4.3.0-vs-4.2.1
+# disagreement the override causes and nothing else.
+[[known_divergence]]
+oracle = "pnpm"
+key = "ansi-styles"
+kind = "mismatch"
+expected = "ansi-styles@4.3.0"
+found = "ansi-styles@4.2.1"
+why = "pnpm 11 ignores npm's root overrides table; bun applies it and the resolver matches bun"

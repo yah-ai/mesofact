@@ -15,10 +15,12 @@
 # machine therefore never has `mesofact-build` — R746-F9 changed it and the
 # comment did not follow. Verified 2026-09-02 against the published artifact:
 # cdn.yah.dev/mesofact/0.8.28.1/aarch64-apple-darwin/…tar.gz unpacks to
-# `mesofact`, `mesofact-dev` AND `mesofact-build`.
+# `mesofact`, `mesofact-dev` AND `mesofact-build`. That tarball predates
+# MFT-R822, which renamed the dev binary to `mes`; a tarball cut after it
+# unpacks to `mesofact`, `mes` and `mesofact-build`.
 #
 # `mesofact-build` still stays off `CLEAN_PATH`, and the reason is now the
-# sharper one: `mesofact-dev` builds IN-PROCESS (BuildDriver::InProcess,
+# sharper one: `mes` builds IN-PROCESS (BuildDriver::InProcess,
 # R759-T4), so a run that could reach a `mesofact-build` on PATH would not
 # prove that. Nothing here ever needs it — §6b typechecks through `mes check`,
 # which is the same code linked into the dev binary, because that is the only
@@ -40,6 +42,7 @@ LIB_PID=""
 
 PASS=0
 FAIL=0
+SKIP=0
 
 cleanup() {
   for pid in "$SERVER_PID" "$LIB_PID"; do
@@ -58,13 +61,16 @@ trap cleanup EXIT
 
 ok()   { PASS=$((PASS + 1)); echo "  ok   — $1"; }
 bad()  { FAIL=$((FAIL + 1)); echo "  FAIL — $1"; }
+skip() { SKIP=$((SKIP + 1)); echo "  SKIP — $1"; }
 check() { if [ "$1" = "0" ]; then ok "$2"; else bad "$2"; fi; }
 
 # ── 1. Build the two binaries the release actually ships ────────────────────
-echo "==> building mesofact + mesofact-dev"
+echo "==> building mesofact + mes"
 cargo build --manifest-path "$ROOT/Cargo.toml" -p mesofact --bin mesofact \
   > "$TMP_DIR/build-prod.log" 2>&1 || { cat "$TMP_DIR/build-prod.log"; exit 1; }
-cargo build --manifest-path "$ROOT/Cargo.toml" -p mesofact-dev --bin mesofact-dev \
+# `-p mes`, not `-p mesofact-dev`: MFT-R822 split the command into its own
+# package and `mesofact-dev` now emits no bin targets at all.
+cargo build --manifest-path "$ROOT/Cargo.toml" -p mes --bin mes \
   > "$TMP_DIR/build-dev.log" 2>&1 || { cat "$TMP_DIR/build-dev.log"; exit 1; }
 
 # A store slot holds both binaries under their plain names, which is also what
@@ -73,7 +79,7 @@ cargo build --manifest-path "$ROOT/Cargo.toml" -p mesofact-dev --bin mesofact-de
 SLOT="$TMP_DIR/bin"
 mkdir -p "$SLOT"
 cp "$ROOT/target/debug/mesofact" "$SLOT/mesofact"
-cp "$ROOT/target/debug/mesofact-dev" "$SLOT/mesofact-dev"
+cp "$ROOT/target/debug/mes" "$SLOT/mes"
 
 # ── 2. The scrubbed PATH ────────────────────────────────────────────────────
 # Only the slot plus the base system dirs. Homebrew (/opt/homebrew/bin),
@@ -126,15 +132,15 @@ check $? ".mesofact-version ($PINNED) is the scaffolding binary's version ($BIN_
 check $? "bun.lock pins exact versions (no ^ or ~ locators)"
 
 # ── 4. Build + serve, on the scrubbed PATH ──────────────────────────────────
-echo "==> mesofact-dev (builds in-process, materializes node_modules from the lock)"
-# Deliberately `mesofact-dev .` from inside the project, not an absolute path:
+echo "==> mes (builds in-process, materializes node_modules from the lock)"
+# Deliberately `mes .` from inside the project, not an absolute path:
 # that is the invocation the scaffold's README gives, and it is the one that
 # used to lose every mode:"ssr" route (the watcher's relative gen-dir cannot
 # become a `file://` module URL — R759-T4). The /api/hello assertion below is
 # the regression guard.
 (
   cd "$PROJECT" || exit 1
-  PATH="$CLEAN_PATH" exec mesofact-dev . --port "$PORT"
+  PATH="$CLEAN_PATH" exec mes . --port "$PORT"
 ) > "$TMP_DIR/serve.log" 2>&1 &
 SERVER_PID=$!
 
@@ -152,12 +158,12 @@ for _ in $(seq 1 120); do
   sleep 1
 done
 if [ "$READY" != "0" ]; then
-  bad "mesofact-dev never served / (see below)"
+  bad "mes never served / (see below)"
   tail -n 60 "$TMP_DIR/serve.log"
   echo "FAILED: $PASS passed, $FAIL failed"
   exit 1
 fi
-ok "mesofact-dev built and served with no package manager and no Node on PATH"
+ok "mes built and served with no package manager and no Node on PATH"
 
 [ -d "$PROJECT/node_modules/react" ] && [ -d "$PROJECT/node_modules/react-dom" ]
 check $? "node_modules materialized from the shipped lock (react + react-dom present)"
@@ -199,8 +205,17 @@ check $? "no curated package drifted from its pin"
 
 # The obligation R832-T3 created, asserted on the artifact the registry
 # actually served rather than on the table: a mesofact X.Y.Z binary must
-# install @mesofact/runtime X.Y.Z. Goes red on a version bump whose npm
-# publish has not happened yet, which is the whole reason it is here.
+# install @mesofact/runtime X.Y.Z.
+#
+# This used to say it "goes red on a version bump whose npm publish has not
+# happened yet, which is the whole reason it is here" — written when this
+# script was run by hand. It is now a step inside `yah-release-check`, which
+# the release wizard runs BEFORE `npm-publish`, so under the wizard that red is
+# guaranteed and says nothing: the gate would be asserting a fact the release
+# it gates is what creates. Same treatment as §7a, same three branches — ask
+# npm whether the version exists, SKIP if it does not, assert otherwise. The
+# wizard re-runs this whole pipeline after publishing, and there the version
+# does exist, so nothing skips and the obligation is enforced for real.
 BARREL_VERSION="$(python3 -c "
 import json
 try:
@@ -208,8 +223,14 @@ try:
 except Exception:
     print('')
 ")"
-[ "$BARREL_VERSION" = "$BIN_VERSION" ]
-check $? "@mesofact/runtime on disk is $BARREL_VERSION — the scaffolding binary's version ($BIN_VERSION)"
+BARREL_ON_NPM="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+  "https://registry.npmjs.org/@mesofact%2Fruntime/$BIN_VERSION" 2>/dev/null)"
+if [ "$BARREL_ON_NPM" = "404" ]; then
+  skip "@mesofact/runtime@$BIN_VERSION is not on npm yet (scaffold installed $BARREL_VERSION) — publish it and this asserts again"
+else
+  [ "$BARREL_VERSION" = "$BIN_VERSION" ]
+  check $? "@mesofact/runtime on disk is $BARREL_VERSION — the scaffolding binary's version ($BIN_VERSION)"
+fi
 
 # ── 5. The routes the scaffold declares actually answer ─────────────────────
 BODY="$(curl -fsS "http://127.0.0.1:$PORT/")"
@@ -258,9 +279,9 @@ echo "==> mes check (TypeScript 7's native compiler, still no Node)"
 # nothing new goes on it. That is the point of the verb living on the dev
 # binary: the R759-F2 trampoline vends `mesofact`, `mes` and `mesofact-dev` and
 # exits 70 on any other name, so `mes` is a name a user provably has and
-# `mesofact-build` is not. A store slot holds the dev binary as `mesofact-dev`
-# and the trampoline maps `mes` onto it; a symlink is that shape here.
-ln -sf mesofact-dev "$SLOT/mes"
+# `mesofact-build` is not. The slot already holds the dev binary as `mes`
+# (MFT-R822), so there is nothing left to alias here — the `mesofact-dev` shim
+# name survives only as a PATH alias onto this same file.
 
 grep -q '"typecheck": "mes check"' "$PROJECT/package.json"
 check $? "the emitted typecheck script is 'mes check' — no tsc, so no Node"
@@ -325,6 +346,43 @@ done
 # which is a real defect for every consumer and exactly what this cell exists
 # to catch. Fix the manifest or publish the missing crate.
 
+# ── 7a. Has the pin the scaffold just emitted actually been published? ──────
+# This gate runs inside `yah-release-check`, i.e. BEFORE the release it is
+# gating, and the scaffold pins the scaffolding binary's own version. So between
+# a version bump and the crates.io publish of that version there is a window in
+# which the emitted manifest names a version the registry does not have yet, and
+# the cargo build below cannot succeed for anyone — that is an ordering this
+# cell cannot satisfy, not a defect in the manifest.
+#
+# Told apart by asking the registry rather than by pattern-matching the error:
+#   published     -> build it, and a failure is a real FAIL exactly as before.
+#   not published -> SKIP, loudly, naming the publish that would un-skip it.
+#   can't tell    -> build it. An unreachable index must not silently disarm
+#                    the gate; the run needs network anyway (§4 fetches
+#                    tarballs), so this only fires if the index alone is down.
+#
+# This is NOT the `[patch.crates-io]` escape hatch the §7 header rules out. That
+# one makes an unresolvable manifest look resolvable and reports a pass; this
+# refuses to report anything at all, and says why.
+LIB_PIN="$(sed -n 's/^mesofact = "\([^"]*\)".*/\1/p' "$LIBPROJ/Cargo.toml" | head -1)"
+INDEX_BODY="$(curl -fsS --max-time 20 -A 'check-mesofact-new (human@yah.dev)' \
+  https://index.crates.io/me/so/mesofact 2>/dev/null)"
+PIN_PUBLISHED=unknown
+if [ -n "$INDEX_BODY" ]; then
+  if printf '%s' "$INDEX_BODY" | grep -q "\"vers\":\"$LIB_PIN\""; then
+    PIN_PUBLISHED=yes
+  else
+    PIN_PUBLISHED=no
+  fi
+fi
+
+if [ "$PIN_PUBLISHED" = "no" ]; then
+  echo
+  skip "the library tier — the scaffold pins mesofact/mesofact-dev $LIB_PIN, which is not on crates.io yet"
+  echo "       (latest published: $(printf '%s' "$INDEX_BODY" | sed -n 's/.*"vers":"\([^"]*\)".*/\1/p' | tail -1))"
+  echo "       publish the crates.io wave for $LIB_PIN and this section runs again — nothing here is disabled."
+else
+
 # One invocation, no flags, both binaries — the two-bin pattern's actual claim.
 # Shares the workspace target dir so this reuses artifacts the build at the top
 # of this script already produced rather than compiling V8 a second time.
@@ -384,11 +442,15 @@ check $? "the advertised object-store endpoint answers ($S3_ENDPOINT -> HTTP $S3
 kill "$LIB_PID" 2>/dev/null || true
 wait "$LIB_PID" 2>/dev/null || true
 
+fi  # end §7 library tier
+
 echo
+SKIPNOTE=""
+[ "$SKIP" -gt 0 ] && SKIPNOTE=", $SKIP skipped"
 if [ "$FAIL" -eq 0 ]; then
-  echo "PASSED: $PASS passed, 0 failed"
+  echo "PASSED: $PASS passed, 0 failed$SKIPNOTE"
   exit 0
 fi
-echo "FAILED: $PASS passed, $FAIL failed"
+echo "FAILED: $PASS passed, $FAIL failed$SKIPNOTE"
 tail -n 40 "$TMP_DIR/serve.log"
 exit 1

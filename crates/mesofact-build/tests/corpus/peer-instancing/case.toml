@@ -1,0 +1,9 @@
+name = "peer-instancing"
+description = "react-dom and @dnd-kit/core both declare react as a peer, so the W318 phase-2 post-pass has to satisfy three peer edges against one provider. pnpm mints every lock with autoInstallPeers: true and bun installs peers by default, so a resolver that skipped phase 2 would diverge from BOTH oracles here."
+recorded_at = "2026-09-03"
+known_divergence = []
+
+
+[compare]
+bun = true
+pnpm = true

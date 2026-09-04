@@ -1,0 +1,6 @@
+{
+  "name": "overrides-redirect",
+  "version": "1.0.0",
+  "dependencies": { "chalk": "^4.1.2" },
+  "overrides": { "ansi-styles": "4.2.1" }
+}

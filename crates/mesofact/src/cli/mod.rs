@@ -22,6 +22,9 @@
 
 pub mod new;
 pub mod proxy;
+// R823 — the only check in this binary that proves the V8 tier works on the
+// machine RUNNING it rather than the machine that compiled it.
+pub mod selfcheck;
 pub mod serve;
 #[cfg(feature = "publish")]
 pub mod publish;

@@ -17,7 +17,10 @@ use rnpm::resolve::{
     NodeId, PackumentSource, RegistrySource, ResolvedTree, Resolver, RootManifest,
 };
 use rnpm::testing::FakeTransport;
-use rnpm::{CachePolicy, Node, NodeSource, Packument, RegistryClient, RegistryEndpoint, Version};
+use rnpm::{
+    CachePolicy, Node, NodeSource, Packument, PreferredVersions, RegistryClient, RegistryEndpoint,
+    Version,
+};
 use serde_json::{json, Map, Value};
 use std::cell::RefCell;
 
@@ -124,6 +127,19 @@ impl World {
         let source = self.source();
         let manifest = RootManifest::from_package_json(root_json)?;
         Resolver::new(&source).resolve(&manifest)
+    }
+
+    /// Resolve as if a previous lockfile had chosen `preferred`.
+    fn resolve_preferring(&self, root_json: &str, preferred: &[(&str, &str)]) -> ResolvedTree {
+        let source = self.source();
+        let manifest = RootManifest::from_package_json(root_json).expect("root manifest");
+        let table: PreferredVersions = preferred
+            .iter()
+            .map(|(name, version)| {
+                ((*name).to_string(), Version::parse(version).expect("a test version parses"))
+            })
+            .collect();
+        Resolver::new(&source).preferring(table).resolve(&manifest).expect("resolve")
     }
 
     /// Requests that actually left the process.
@@ -316,6 +332,58 @@ fn a_deep_conflict_nests_at_the_level_that_disagreed() {
     // `mid` itself still hoisted all the way to the root: only the conflicting
     // package nests, not its requester's whole subtree.
     assert_eq!(paths(&tree), ["mid", "mid/shared", "shared", "top"]);
+}
+
+/// MFT-R773-B1. The same conflict, but with the requester itself nested — the
+/// one shape where "the level that disagreed" and "the requester" are different
+/// levels, and the one this resolver used to get wrong.
+///
+/// `outer/mid` wants `dep@^1` and the root holds `dep@2`. Two positions are
+/// legal and Node cannot tell them apart, because `outer/dep` is on the lookup
+/// chain from `outer/mid`: `outer/dep`, the highest level in the subtree that
+/// does not conflict, and `outer/mid/dep`, directly under the requester. bun
+/// picks the second — its `Tree.hoistDependency` only lets the frame that
+/// *declared* the dependency turn a rejection into a placement — so we do too,
+/// and the corpus's `wrap-ansi-cjs/strip-ansi/ansi-regex` is this exact shape
+/// with real packages.
+#[test]
+fn a_conflict_below_a_nested_requester_lands_under_that_requester_not_above_it() {
+    let world = World::new(&[
+        ("outer", packument("outer", &[("1.0.0", deps(&[("mid", "^1.0.0")]))])),
+        (
+            "mid",
+            packument(
+                "mid",
+                &[("1.0.0", deps(&[("dep", "^1.0.0")])), ("2.0.0", json!({}))],
+            ),
+        ),
+        ("dep", packument("dep", &[("1.0.0", json!({})), ("2.0.0", json!({}))])),
+    ]);
+    let (tree, _) = world.resolve(
+        r#"{ "name": "root",
+             "dependencies": { "outer": "^1.0.0", "mid": "^2.0.0", "dep": "^2.0.0" } }"#,
+    );
+
+    // `mid@1` nests because the root took the `mid` slot with `mid@2`; that
+    // much the old hoist got right, because `outer` is a child of the root.
+    // `dep@1` is the interesting one: its requester is two levels down.
+    assert_eq!(
+        paths(&tree),
+        ["dep", "mid", "outer", "outer/mid", "outer/mid/dep"]
+    );
+    assert_eq!(version_at(&tree, "dep"), "2.0.0");
+    assert_eq!(version_at(&tree, "outer/mid"), "1.0.0");
+    assert_eq!(version_at(&tree, "outer/mid/dep"), "1.0.0");
+
+    // Both layouts are correct *as resolution*, which is why only a shape
+    // assertion catches the difference — each side still sees its own copy.
+    let nested = at(&tree, "outer/mid/dep").0;
+    assert_eq!(tree.resolve_from(at(&tree, "outer/mid").0, "dep"), Some(nested));
+    assert_eq!(
+        tree.resolve_from(at(&tree, "outer").0, "dep"),
+        Some(at(&tree, "dep").0),
+        "hoisting the copy to `outer` would have shadowed the root's `dep@2` for `outer` itself"
+    );
 }
 
 /// No backtracking: nothing is ever unplaced or re-parented, so the same input
@@ -615,4 +683,152 @@ fn install_paths_are_bun_lock_key_shaped() {
     let nested = at(&tree, "c/shared").0;
     assert_eq!(tree.path(nested), ["c", "shared"]);
     assert_eq!(tree.install_path(ResolvedTree::ROOT), "");
+}
+
+// ── The `latest` dist-tag preference (R773-F7) ──────────────────────────────
+
+/// [`packument`] always tags the last version listed as `latest`. These two
+/// tests need the case that helper cannot express: a package whose `latest`
+/// points *below* its highest published version, which is what a maintainer
+/// produces by shipping a release without promoting it.
+fn packument_with_latest(name: &str, versions: &[&str], latest: &str) -> String {
+    let map: Map<String, Value> = versions
+        .iter()
+        .map(|version| {
+            (
+                (*version).to_string(),
+                json!({
+                    "version": version,
+                    "dist": {
+                        "tarball": format!("{BASE}/{name}/-/{name}-{version}.tgz"),
+                        "integrity": format!("sha512-{name}-{version}")
+                    }
+                }),
+            )
+        })
+        .collect();
+    json!({ "name": name, "dist-tags": { "latest": latest }, "versions": map }).to_string()
+}
+
+/// The exact shape R773-F7's corpus caught in the wild: `get-intrinsic`
+/// publishes 1.3.1 while `latest` still points at 1.3.0, and `bun install` and
+/// `pnpm install` BOTH lock 1.3.0 against a `^1.2.4` edge. Preferring the
+/// higher version is not a smaller error than preferring the tag — 1.3.1
+/// declares dependencies 1.3.0 does not, so the wrong pick changes the shape of
+/// the tree and not just one version string.
+#[test]
+fn latest_wins_over_a_higher_satisfying_version() {
+    let world = World::new(&[(
+        "pkg",
+        packument_with_latest("pkg", &["1.2.4", "1.3.0", "1.3.1"], "1.3.0"),
+    )]);
+    let (tree, _) = world.resolve(r#"{ "name": "root", "dependencies": { "pkg": "^1.2.4" } }"#);
+
+    assert_eq!(version_at(&tree, "pkg"), "1.3.0");
+}
+
+/// The preference is a preference, not an override: a `latest` outside the
+/// requested range does not get to win, and the highest satisfying version is
+/// still the answer. Without this, the rule above would silently install a
+/// version the manifest forbids.
+#[test]
+fn latest_outside_the_range_falls_back_to_highest_satisfying() {
+    let world = World::new(&[(
+        "pkg",
+        packument_with_latest("pkg", &["1.0.0", "1.4.0", "2.0.0"], "2.0.0"),
+    )]);
+    let (tree, _) = world.resolve(r#"{ "name": "root", "dependencies": { "pkg": "^1.0.0" } }"#);
+
+    assert_eq!(version_at(&tree, "pkg"), "1.4.0");
+}
+
+// ── R773-T5: what a previous lockfile is allowed to decide ──────────────────
+
+/// The lockfile's whole job, in one assertion: the registry published a newer
+/// version the range admits, and the resolve still returns what the lock chose.
+///
+/// Note the preference beats `latest` and not merely max-satisfying — a
+/// lockfile that lost to a tag move would not be a lockfile, and the tag is
+/// consulted first for every unlocked package (see the two tests above).
+#[test]
+fn a_previous_lock_holds_a_version_the_registry_has_moved_past() {
+    let world = World::new(&[(
+        "pkg",
+        packument_with_latest("pkg", &["1.0.0", "1.4.0", "1.9.0"], "1.9.0"),
+    )]);
+    let root = r#"{ "name": "root", "dependencies": { "pkg": "^1.0.0" } }"#;
+
+    // Unlocked, this is 1.9.0 — so the assertion below has teeth.
+    let (fresh, _) = world.resolve(root);
+    assert_eq!(version_at(&fresh, "pkg"), "1.9.0");
+
+    let held = world.resolve_preferring(root, &[("pkg", "1.4.0")]);
+    assert_eq!(version_at(&held, "pkg"), "1.4.0");
+}
+
+/// A preference the edge's own range no longer admits is dropped, not honoured.
+///
+/// This is what makes the preference safe to leave on by default: editing a
+/// manifest to demand a newer major upgrades that dependency with no flag and
+/// no lock deletion, exactly as `npm install` does.
+#[test]
+fn a_preference_outside_the_range_resolves_forward() {
+    let world = World::new(&[(
+        "pkg",
+        packument_with_latest("pkg", &["1.4.0", "2.0.0", "2.3.0"], "2.3.0"),
+    )]);
+    let tree = world.resolve_preferring(
+        r#"{ "name": "root", "dependencies": { "pkg": "^2.0.0" } }"#,
+        &[("pkg", "1.4.0")],
+    );
+
+    assert_eq!(version_at(&tree, "pkg"), "2.3.0");
+}
+
+/// A preference naming a version the registry no longer publishes falls back
+/// rather than locking something unfetchable. Unpublishing is rare and legal,
+/// and a lock that survived it by pinning a 404 would be worse than one that
+/// moved.
+#[test]
+fn a_preference_the_registry_dropped_falls_back() {
+    let world =
+        World::new(&[("pkg", packument_with_latest("pkg", &["1.4.0", "1.9.0"], "1.9.0"))]);
+    let tree = world.resolve_preferring(
+        r#"{ "name": "root", "dependencies": { "pkg": "^1.0.0" } }"#,
+        &[("pkg", "1.5.0")],
+    );
+
+    assert_eq!(version_at(&tree, "pkg"), "1.9.0");
+}
+
+/// Preferences are keyed by the name the *registry* spells, because that is
+/// what a lock entry's locator records. Keyed by install name instead, every
+/// aliased dependency would silently re-resolve on every run.
+#[test]
+fn a_preference_applies_to_an_aliased_dependency_under_its_real_name() {
+    let world =
+        World::new(&[("real", packument_with_latest("real", &["1.0.0", "1.7.0"], "1.7.0"))]);
+    let tree = world.resolve_preferring(
+        r#"{ "name": "root", "dependencies": { "pretend": "npm:real@^1.0.0" } }"#,
+        &[("real", "1.0.0")],
+    );
+
+    assert_eq!(version_at(&tree, "pretend"), "1.0.0");
+}
+
+/// A transitive edge is held too — the preference lives on the tree, so every
+/// pick the walk makes reads it, not just the ones the root manifest names.
+#[test]
+fn a_previous_lock_holds_a_transitive_dependency() {
+    let world = World::new(&[
+        ("top", packument("top", &[("1.0.0", deps(&[("dep", "^1.0.0")]))])),
+        ("dep", packument("dep", &[("1.0.0", json!({})), ("1.6.0", json!({}))])),
+    ]);
+    let root = r#"{ "name": "root", "dependencies": { "top": "^1.0.0" } }"#;
+
+    let (fresh, _) = world.resolve(root);
+    assert_eq!(version_at(&fresh, "dep"), "1.6.0");
+
+    let held = world.resolve_preferring(root, &[("dep", "1.0.0")]);
+    assert_eq!(version_at(&held, "dep"), "1.0.0");
 }

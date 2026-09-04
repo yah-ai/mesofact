@@ -37,6 +37,13 @@ enum Command {
     /// Install the locked dependency closure (bun.lock, package-lock.json
     /// v2/v3, or pnpm-lock.yaml v9) into node_modules.
     Install { project: PathBuf },
+    /// Resolve package.json against the npm registry and write bun.lock.
+    ///
+    /// Re-running on an unchanged manifest rewrites the same bytes: the
+    /// existing lock's selections are preferred, so this is not an
+    /// upgrade-everything button. A range edited to demand a newer version
+    /// resolves forward on its own.
+    Lock { project: PathBuf },
     /// Full TypeScript semantic pass via the project's `tsc` (native 10x
     /// checker with typescript@7). Cadence-agnostic — QED / CI / humans decide
     /// when to fire it (W174 §Full tier).
@@ -123,6 +130,29 @@ fn main() -> Result<()> {
                     report.installed, report.linked
                 );
             }
+            Ok(())
+        }
+        Command::Lock { project } => {
+            let report = mesofact_build::project_lock::write_project_lock(&project)?;
+            // Warnings first: they are about packages the resolve left out or
+            // took anyway, and a line below the summary is where nobody reads.
+            for warning in &report.warnings {
+                eprintln!("warning: {warning}");
+            }
+            println!(
+                "mesofact lock {} — {} package(s) → {}{}",
+                if report.changed { "ok" } else { "unchanged" },
+                report.packages,
+                report.path.display(),
+                if report.preferred > 0 {
+                    format!(
+                        "\n  kept {} name(s) at the versions the previous lock chose",
+                        report.preferred
+                    )
+                } else {
+                    String::new()
+                },
+            );
             Ok(())
         }
         Command::Check { project, tsconfig, checker_args } => {

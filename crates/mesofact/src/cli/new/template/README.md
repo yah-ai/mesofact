@@ -32,7 +32,8 @@ bundler.
 | `mes publish` | Upload `dist/`, swap the manifest pointer, purge CDN tags. |
 | `mesofact …` | The same `serve` / `publish`, plus `proxy`, with no dev weight. |
 
-`mesofact-dev` is the old name for `mes` and still works; it will go away.
+`mesofact-dev` is the old name for `mes`. It still works — the installer
+places it as a third shim onto the same binary — and it will go away.
 
 ```sh
 curl -s localhost:3000/                        # static — identical every time

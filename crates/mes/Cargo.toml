@@ -1,0 +1,64 @@
+[package]
+name = "mes"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+# THE COMMAND, AND NOTHING ELSE. This package exists so that the name you TYPE
+# and the name you READ can differ (operator decision, 2026-09-01; MFT-R822):
+#
+# - `mesofact-dev` is the LIBRARY — the meta crate holding the dev-tier tools
+#   that are not `mesofact` (the rebuild-on-change watcher, the local S3
+#   surface standing in for R2, `serve_app`). A dependency line reading
+#   `mes = "0.8"` would say none of that, so the descriptive name stays where
+#   it is read.
+# - `mes` is the BINARY. Nobody wants to type `mesofact-dev` as a command.
+#
+# WHY A SEPARATE PACKAGE rather than just renaming the `[[bin]]` inside
+# `mesofact-dev`: `cargo install` takes a PACKAGE name, not a bin name. With
+# the binary living in `mesofact-dev`, `cargo install mes` fails outright with
+# "could not find `mes` in registry" and a user has to somehow know to type
+# `cargo install mesofact-dev` — unguessable from the command they were told to
+# run. It also removes the footgun of two packages racing to write
+# `~/.cargo/bin/mes`.
+#
+# `mes` was unclaimed on crates.io when this package was created (sparse index
+# 404 for /3/m/mes, checked 2026-09-02).
+description = "`mes` — the mesofact dev toolchain command. A thin binary over the `mesofact-dev` library, which is where the dev-tier affordances (watcher, local S3 surface, serve_app) actually live."
+
+[[bin]]
+name = "mes"
+path = "src/main.rs"
+
+# EVERY FEATURE `mesofact-dev` DECLARES IS RE-EXPOSED HERE, and that is not
+# boilerplate — it is the only thing this manifest has to get right. Features
+# do not propagate through a package boundary on their own, so a `mes` that
+# forwarded nothing would build `mesofact-dev` with ITS defaults no matter what
+# the installer asked for, and `cargo install mes --no-default-features` would
+# silently keep linking V8 and rolldown. The lean static/SPA path exists so a
+# consumer can skip the V8 toolchain entirely; losing it is invisible until
+# someone tries that build.
+#
+# `mes` itself has no `#[cfg]`s. Every gate — `#[cfg(feature = "ssr")]` on the
+# dispatchable SSR routes, `#[cfg(feature = "publish")]` on the `mes publish`
+# subcommand — evaluates inside `mesofact-dev`, so forwarding is the whole job.
+# Keep this list in lockstep with `../mesofact-dev/Cargo.toml`'s `[features]`,
+# including the `ssr → publish` implication: forwarding `mesofact-dev/ssr`
+# alone would enable the dev crate's `publish` cfg without setting one here.
+[features]
+default = ["ssr", "build"]
+ssr = ["mesofact-dev/ssr", "publish"]
+publish = ["mesofact-dev/publish"]
+build = ["mesofact-dev/build"]
+
+[dependencies]
+mesofact-dev = { path = "../mesofact-dev", version = "0.8.32", default-features = false }
+# The CLI is `async fn`; this is the runtime it is entered on. Same feature set
+# `mesofact-dev` asks for, because the whole toolchain runs on this one runtime.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "process", "time", "sync", "io-util", "net"] }
+
+[dev-dependencies]
+# Reads THIS manifest and `../mesofact-dev/Cargo.toml` to prove the feature
+# forwarding above is complete — see the test in src/main.rs.
+toml = "0.8"

@@ -1,0 +1,9 @@
+name = "real-express"
+description = "A real express@4 tree: ~30 packages, several shared transitives, and a long tail of tiny single-purpose modules. W318 §7's whole point is that arbitrary npm — not this camp's curated fifteen — is what the resolver has to survive."
+recorded_at = "2026-09-03"
+known_divergence = []
+
+
+[compare]
+bun = true
+pnpm = true

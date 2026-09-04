@@ -20,6 +20,7 @@ use crate::transport::{Request, Response, Transport};
 #[derive(Default)]
 pub struct FakeTransport {
     bodies: HashMap<String, (Option<String>, String)>,
+    failures: HashMap<String, String>,
     requests: RefCell<Vec<Request>>,
 }
 
@@ -34,6 +35,19 @@ impl FakeTransport {
     pub fn serving(mut self, url: &str, etag: Option<&str>, body: &str) -> Self {
         self.bodies
             .insert(url.to_string(), (etag.map(str::to_owned), body.to_string()));
+        self
+    }
+
+    /// Fail at `url` with `message`, the way a DNS failure, a TLS error or a
+    /// 500 does.
+    ///
+    /// Distinct from a URL simply being absent from the table, which is a 404
+    /// and therefore a legitimate "no such package" answer. The difference is
+    /// the whole point (R773-F6): a 404 on an `optionalDependency` was already
+    /// a skip, while a transport error aborted the entire resolve — and only a
+    /// fake that can produce one can prove it no longer does.
+    pub fn failing(mut self, url: &str, message: &str) -> Self {
+        self.failures.insert(url.to_string(), message.to_string());
         self
     }
 
@@ -53,6 +67,9 @@ impl FakeTransport {
 impl Transport for FakeTransport {
     fn get(&self, request: &Request) -> Result<Response> {
         self.requests.borrow_mut().push(request.clone());
+        if let Some(message) = self.failures.get(&request.url) {
+            return Err(anyhow::anyhow!("{message}"));
+        }
         let Some((etag, body)) = self.bodies.get(&request.url) else {
             return Ok(Response::NotFound);
         };

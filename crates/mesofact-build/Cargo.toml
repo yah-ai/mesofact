@@ -8,6 +8,11 @@
 [package]
 name = "mesofact-build"
 description = "Rust-native build pipeline for mesofact workloads (Rolldown + LightningCSS + deno_core SSG)"
+# R773-F7's differential conformance corpus is ~3 MB of recorded npm packuments
+# and lockfiles. It is a gate on THIS repo's resolver, not something a
+# downstream consumer of the crate should pay to depend on. `tests/conformance.rs`
+# skips when the directory is absent, and the QED step asserts it is present.
+exclude = ["tests/corpus/**"]
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -15,14 +20,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-mesofact-core = { path = "../mesofact-core", version = "0.8.30" }
-mesofact-ssr = { path = "../mesofact-ssr", version = "0.8.30" }
-mesofact-render = { path = "../mesofact-render", version = "0.8.30" }
+mesofact-core = { path = "../mesofact-core", version = "0.8.32" }
+mesofact-ssr = { path = "../mesofact-ssr", version = "0.8.32" }
+mesofact-render = { path = "../mesofact-render", version = "0.8.32" }
 
 # W272 bundle-manifest types (R599-F1), across the yah-base workspace boundary.
 # default-features = false keeps this to serde+blake3+toml types only — the
 # object-store `store` feature is for cloud/kamaji, not the build side.
-yah-mesofact-bundle = { path = "../../../yah-base/crates/mesofact-bundle", version = "0.8.30", default-features = false }
+yah-mesofact-bundle = { path = "../../../yah-base/crates/mesofact-bundle", version = "0.8.32", default-features = false }
 
 rolldown = "1.1"
 rolldown_common = "1.1"
@@ -35,6 +40,12 @@ flate2 = "1"
 # Apache-2.0, ~24 KB, no transitive deps outside the platform bindings.
 reflink-copy = "0.1.30"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "blocking"] }
+# The W318 stage-2 resolver, consumed by `lock_entries` to turn a resolved tree
+# into `lock::LockEntry` values (R773-T5). Direct rather than through `jsget`:
+# nothing here depends on `jsget` yet, and this edge is the sanctioned
+# direction — `rnpm` may not depend back on `mesofact-build` (that is the cycle
+# its own header forbids).
+rnpm = { path = "../rnpm", version = "0.8.32" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 # pnpm-lock.yaml v9 (R771-F4). 0.9 is what the rest of this camp reads YAML
@@ -43,9 +54,18 @@ serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = "0.9"
 sha2 = "0.10"
 tar = "0.4"
+# A regular dependency, not a dev-dependency: R773-F7's conformance RECORDER is
+# a `src/bin/` target (`mesofact-conformance record`), and a binary target sees
+# `[dependencies]` only. It runs `bun install` / `pnpm install` in a scratch
+# directory that must not survive a failed recording.
+tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 toml = "0.8"
 tracing = "0.1"
 
 [dev-dependencies]
+# The `testing` feature exposes `rnpm::testing::FakeTransport`, so
+# `lock_entries`' round-trip proof resolves a real tree against the same fake
+# registry `rnpm`'s own tests use rather than hand-building an arena.
+rnpm = { path = "../rnpm", version = "0.8.32", features = ["testing"] }
 tempfile = "3"

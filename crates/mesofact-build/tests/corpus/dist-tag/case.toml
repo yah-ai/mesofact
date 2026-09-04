@@ -1,0 +1,9 @@
+name = "dist-tag"
+description = "Both dependencies are specified as latest, which resolves through the packument's dist-tag table before any range is considered. Frozen at record time, which is exactly the behaviour wanted: the fixture records what latest meant then, and the replay must still agree with the lock minted at the same instant."
+recorded_at = "2026-09-03"
+known_divergence = []
+
+
+[compare]
+bun = true
+pnpm = true

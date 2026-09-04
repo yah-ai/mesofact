@@ -29,43 +29,29 @@ description = "Dev-tier affordances for mesofact workloads — a rebuild-on-chan
 path = "src/lib.rs"
 
 # DESCRIPTIVE NAME WHERE YOU READ IT, SHORT NAME WHERE YOU TYPE IT (operator
-# decision, 2026-09-01). Cargo decouples package name from bin name; this crate
-# uses that deliberately, and the two halves have different jobs:
+# decision, 2026-09-01; landed by MFT-R822). Cargo decouples package name from
+# bin name, and this workspace uses that ACROSS A PACKAGE BOUNDARY rather than
+# within one:
 #
 # - The PACKAGE stays `mesofact-dev`, permanently — not as a legacy spelling of
-#   `mes`, which is how this comment used to read. It is the meta crate: the
-#   entrypoint to the collection of dev-tier tools `mes` needs that are NOT
-#   mesofact — the rebuild-on-change watcher, the local S3 surface standing in
-#   for R2, and `serve_app`. It DEPENDS ON the `mesofact` facade rather than
-#   being it, and that direction is the whole prod/dev boundary (W225 §2). A
-#   dependency line reading `mes = "0.8"` would say none of that.
-# - The BINARY is `mes`, and only `mes`. Nobody wants to type `mesofact-dev`
-#   as a command.
+#   `mes`. It is the meta crate: the entrypoint to the collection of dev-tier
+#   tools `mes` needs that are NOT mesofact — the rebuild-on-change watcher,
+#   the local S3 surface standing in for R2, and `serve_app`. It DEPENDS ON the
+#   `mesofact` facade rather than being it, and that direction is the whole
+#   prod/dev boundary (W225 §2). A dependency line reading `mes = "0.8"` would
+#   say none of that.
+# - The COMMAND is `mes`, and it lives in its own package (`../mes`), three
+#   lines over `mesofact_dev::cli::run()`. `cargo install` takes a PACKAGE
+#   name, so a binary named `mes` shipping from a package named `mesofact-dev`
+#   makes `cargo install mes` fail outright — the command a user is told to run
+#   would not name anything installable.
 #
-# END STATE (MFT-R822): this package emits **no binaries at all** — it becomes
-# a pure library, and a separate thin `mes` package owns the command. That is
-# not tidiness; `cargo install` takes a PACKAGE name, so while the binary lives
-# here `cargo install mes` fails outright and users must somehow know to type
-# `cargo install mesofact-dev`. Splitting makes the guessable command work and
-# avoids two packages racing to write `~/.cargo/bin/mes`.
+# THIS PACKAGE THEREFORE EMITS NO BINARIES. There is no `[[bin]]` below and
+# there should not be one: adding one here re-creates the install-name problem,
+# and a second package emitting `mes` would race `../mes` for
+# `~/.cargo/bin/mes`. The CLI itself stays in `src/cli.rs` (a library module),
+# which is what lets `../mes/src/main.rs` be three lines.
 #
-# BOTH `[[bin]]` blocks below are therefore ON THE WAY OUT — see MFT-R822. Kept
-# for one deprecation cycle rather than deleted here because ~30 sites in the
-# parent camp resolve the string "mesofact-dev" as an executable name
-# (`crates/yah/plugin/src/source.rs` keys a builtin plugin manifest on it,
-# `crates/yah/bundled/src/lib.rs` registers it, `app/yah/desktop`'s version
-# store does `slot.bin("mesofact-dev")`), and — the sharp edge — ALREADY
-# INSTALLED store slots have a file of that name on disk, so removing it is a
-# migration and not a find-and-replace.
-[[bin]]
-name = "mes"
-path = "src/main.rs"
-
-# Transitional. Removal tracked by MFT-R822; do not add new callers.
-[[bin]]
-name = "mesofact-dev"
-path = "src/bin/mesofact-dev.rs"
-
 # NOTE: the prod `mesofact-serve` bin used to live here. It moved to the
 # `mesofact` facade — its presence in this crate is exactly what forced the prod
 # binary to link the watcher + dev S3 surface, breaking W225 §2's dev/prod
@@ -128,11 +114,11 @@ serde_json = "1"
 toml = "0.8"
 # The serving engine. This crate is now a thin dev-affordance layer ON TOP of
 # the facade rather than the crate that owned the engine (W225 §2a).
-mesofact = { path = "../mesofact", version = "0.8.30", default-features = false }
+mesofact = { path = "../mesofact", version = "0.8.32", default-features = false }
 # Direct publisher dep for the dev-S3 round-trip test (drives S3Store itself).
 # `version` is required now that this crate publishes: cargo rejects a path dep
 # without one, since a path means nothing to a downstream consumer.
-mesofact-publisher = { path = "../mesofact-publisher", version = "0.8.30", optional = true }
+mesofact-publisher = { path = "../mesofact-publisher", version = "0.8.32", optional = true }
 # HTTP client for the dev S3 round-trip. Loopback http://127.0.0.1 only — no TLS.
 reqwest = { version = "0.12", default-features = false }
 

@@ -83,18 +83,21 @@ places, both marked at their sites — direct http(s) tarball URLs are supported
 this crate. Upstream is **`node-maintainer` 0.3.34**, `src/resolver.rs:346-440`
 `place_child` (Apache-2.0, orogene), which W318 §5 names as the compact correct
 statement of the phase-1 hoisting walk. Taken from it: the loop that climbs the
-parent chain from the requester, both break conditions (an incompatible
-already-resolvable node whose requester lies inside the candidate level's
-subtree; a candidate level whose own manifest requirement the chosen version
-violates), the reflexive ancestry test that makes the first one land *below*
-the conflicting node rather than on top of it, and the initialisation of the
-target at the requester so that a first-iteration conflict nests by falling out
-of the loop rather than by a special case.
+parent chain from the requester, and both break conditions — now `conflicts_at`
+— (an incompatible already-resolvable node whose requester lies inside the
+candidate level's subtree; a candidate level whose own manifest requirement the
+chosen version violates), including the reflexive ancestry test that keeps the
+first condition from firing on behalf of a conflict in a sibling subtree.
 
-Changed: the data structure (a `Vec` arena here, `petgraph` there), and
-upstream's third break — a lockfile-supplied `target_path` placement hint — is
-dropped, because honouring a previous lock is R773-T5's concern rather than
-phase 1's. The call site carries the same attribution.
+Changed: the data structure (a `Vec` arena here, `petgraph` there); upstream's
+third break — a lockfile-supplied `target_path` placement hint — is dropped,
+because honouring a previous lock is R773-T5's concern rather than phase 1's;
+and **where a conflict lands** (MFT-R773-B1). Upstream places at the level
+below the objecting node, an intermediate position; this places under the
+requester, because that is what bun's `Tree.hoistDependency` does and bun is
+the oracle W318 §6 adopted. So there are two possible outcomes here rather than
+upstream's continuum: the root, or the requester. The call site carries the
+same attribution and the whole argument.
 
 `Graph::resolve_dep` and `Graph::is_ancestor` (`src/graph.rs:179-191`) are
 reimplemented rather than copied — they are three lines each over a different
