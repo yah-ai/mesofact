@@ -12,7 +12,7 @@ use mesofact_core::proxy::metrics::Metrics;
 use mesofact_core::proxy::router::{handle, metrics_handler, AppState, SharedState};
 use mesofact_core::proxy::session::{CookieSessionResolver, SessionResolver};
 use mesofact_core::proxy::source_gen::Generations;
-use mesofact_core::proxy::worker_pool::WorkerPool;
+use mesofact_core::proxy::worker_pool::{rolling_reload, WorkerPool};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{watch, RwLock};
@@ -89,7 +89,6 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         let state = state.clone();
         let worker_entry = cfg.worker_entry.clone();
         let n = cfg.worker_count();
-        let sources_config = cfg.sources_config.clone();
         let metrics = metrics.clone();
         let manifest_path = cfg.manifest.clone();
         let support = support.clone();
@@ -116,18 +115,15 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                         continue;
                     }
                 };
-                match WorkerPool::spawn_with_config(&json, worker_entry.clone(), n, sources_config.clone()).await {
+                let old_pool = state.read().await.pool.clone();
+                match rolling_reload(old_pool, &json, worker_entry.clone(), n).await {
                     Ok(new_pool) => {
                         new_pool.attach_metrics(metrics.clone());
                         let mut st = state.write().await;
-                        let old_pool = std::mem::replace(
-                            &mut st.pool,
-                            new_pool.clone(),
-                        );
+                        st.pool = new_pool;
                         st.manifest = new_manifest;
                         st.matcher = mesofact_core::proxy::router::build_matcher(&st.manifest);
                         drop(st);
-                        tokio::spawn(old_pool.drain_all());
                         info!("rolling reload complete");
                     }
                     Err(e) => {
