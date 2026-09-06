@@ -226,7 +226,28 @@ except Exception:
 BARREL_ON_NPM="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
   "https://registry.npmjs.org/@mesofact%2Fruntime/$BIN_VERSION" 2>/dev/null)"
 if [ "$BARREL_ON_NPM" = "404" ]; then
-  skip "@mesofact/runtime@$BIN_VERSION is not on npm yet (scaffold installed $BARREL_VERSION) — publish it and this asserts again"
+  # STRICT mode turns the skip into a failure. The skip above is right for the
+  # pre-publish leg (`yah-release-check` runs before `npm-publish`), and wrong
+  # for the post-publish one: `mesofact-new-smoke-armed` exists precisely to
+  # assert the pairing once both halves are on their registries, and a skip
+  # there is the gate declining to do its only job.
+  #
+  # It has done exactly that. On the 0.8.32 train (2026-09-04) this printed
+  #   SKIP — @mesofact/runtime@0.8.32 is not on npm yet (scaffold installed 0.8.31)
+  # and the run went green, shipping a binary whose scaffold hands out 0.8.31
+  # types. Two trains later curated.rs was still pinned to 0.8.31 and the alarm
+  # had never once fired.
+  #
+  # MESOFACT_NEW_STRICT is wired to the wizard's own `publish` param, not
+  # hardcoded on the armed step: under `--param publish=0` step 4b really does
+  # not publish, so a missing barrel is the truth and skipping is correct. The
+  # step stays correct under both settings, which is the property the wizard
+  # header (yah-release-wizard.toml:353-357) asks of it.
+  if [ "${MESOFACT_NEW_STRICT:-0}" = "1" ]; then
+    bad "@mesofact/runtime@$BIN_VERSION is not on npm (scaffold installed $BARREL_VERSION) — STRICT: the barrel publish for this version has not landed, so the release cannot claim the pairing is tested. Run \`yah qed run npm-publish --param dry_run=0\`, then re-run this step."
+  else
+    skip "@mesofact/runtime@$BIN_VERSION is not on npm yet (scaffold installed $BARREL_VERSION) — publish it and this asserts again"
+  fi
 else
   [ "$BARREL_VERSION" = "$BIN_VERSION" ]
   check $? "@mesofact/runtime on disk is $BARREL_VERSION — the scaffolding binary's version ($BIN_VERSION)"
