@@ -16,8 +16,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-mesofact-core = { path = "../mesofact-core", version = "0.8.33" }
-mesofact-ssr = { path = "../mesofact-ssr", version = "0.8.33" }
+mesofact-core = { path = "../mesofact-core", version = "0.8.34" }
+mesofact-ssr = { path = "../mesofact-ssr", version = "0.8.34" }
 
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
