@@ -118,10 +118,10 @@ pub const CURATED: &[Pinned] = &[
     // types-only directory could not provide).
     Pinned {
         name: RUNTIME_BARREL,
-        version: "0.8.33",
+        version: "0.8.36",
         role: Role::Runtime,
         meta: r#"{ "dependencies": { "aws4fetch": "^1.0.20", "smol-toml": "^1.6.1" } }"#,
-        integrity: "sha512-VFSactvhs/Zt3ZdGHbMFG4IidhW9stfholrMoQQJ8QwX/tkyjBSzyU5qw2b5GOYl4VzAL2K080/Z6jdKn3UVnw==",
+        integrity: "sha512-YzhKxBpx3zKF2MuBECPf9G9/AxGQ9fhrqrhStnD+gYApsHLHdYqjvtlQ5BryFfOwBa6hfv0X0WJYn1Obctkwkw==",
     },
     // The barrel's own two dependencies. Both declare none of their own, so
     // the closure ends here.

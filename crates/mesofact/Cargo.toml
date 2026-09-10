@@ -85,7 +85,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # default-features = false = types-only (serde + blake3 + toml), so the bundle
 # server never drags the object-store / reqwest `store` weight — and the whole
 # static bundle path builds V8-free (no `ssr` feature).
-yah-mesofact-bundle = { path = "../../../yah-base/crates/mesofact-bundle", version = "0.8.34", default-features = false }
+yah-mesofact-bundle = { path = "../../../yah-base/crates/mesofact-bundle", version = "0.8.36", default-features = false }
 
 # Re-exported subsystems. `mesofact-core` carries the manifest types + proxy
 # primitives (pulled only when a feature needs it — the bare harness above is
@@ -97,11 +97,11 @@ yah-mesofact-bundle = { path = "../../../yah-base/crates/mesofact-bundle", versi
 # Non-optional: the facade's manifest types, proxy primitives and validate all
 # come from here, and the `mesofact proxy` subcommand needs it unconditionally.
 # Cheap to carry — core is V8-free, so the lean default stays lean.
-mesofact-core = { path = "../mesofact-core", version = "0.8.34" }
-mesofact-ssr = { path = "../mesofact-ssr", version = "0.8.34", optional = true }
-mesofact-render = { path = "../mesofact-render", version = "0.8.34", optional = true }
-mesofact-build = { path = "../mesofact-build", version = "0.8.34", optional = true }
-mesofact-publisher = { path = "../mesofact-publisher", version = "0.8.34", optional = true }
+mesofact-core = { path = "../mesofact-core", version = "0.8.36" }
+mesofact-ssr = { path = "../mesofact-ssr", version = "0.8.36", optional = true }
+mesofact-render = { path = "../mesofact-render", version = "0.8.36", optional = true }
+mesofact-build = { path = "../mesofact-build", version = "0.8.36", optional = true }
+mesofact-publisher = { path = "../mesofact-publisher", version = "0.8.36", optional = true }
 
 [[bin]]
 # THE prod binary — Strategy A's artifact, subcommand-driven (W174 §Binary

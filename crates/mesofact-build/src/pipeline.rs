@@ -11,12 +11,14 @@
 //! 7. static-asset discovery (public/ → dist/html/ + manifest)
 //! 8. manifest assembly + validation
 //! 9. prerender (deno_core SSG) → dist/html/*.html
-//! 10. manifest + tag-index emission
+//! 10. build id derived from the staged tree, substituted into it (R870-B12)
+//! 11. manifest + tag-index emission
 
 use anyhow::{anyhow, bail, Context, Result};
 use mesofact_core::manifest::{Hydration, RouteMode};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use yah_mesofact_bundle::BundleHash;
 
 use crate::bundle::{
     assert_no_forbidden_modules, browser_forbidden, bundle_client_entrypoints, bundle_hooks,
@@ -56,36 +58,125 @@ pub struct BuildResult {
     pub sitemap_path: Option<PathBuf>,
 }
 
-pub fn default_build_id() -> String {
-    // ISO timestamp shaped like the TS pipeline's defaultBuildId():
-    // 2026-05-15T17:00:00.123Z → "2026-05-15T17-00-00Z"-ish 20-char prefix.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let days = now / 86_400;
-    let (y, m, d) = civil_from_days(days as i64);
-    let secs = now % 86_400;
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}-{:02}-{:02}Z",
-        secs / 3600,
-        (secs % 3600) / 60,
-        secs % 60
-    )
+/// What a build's id stands in for while the tree it names is still being
+/// written (R870-B12).
+///
+/// The default build id is a hash **of the built tree**, so it cannot be known
+/// until the tree exists — and the tree can't be finished without it, because
+/// the hydration weave bakes `/{build_id}/hydrate/<script>` into every
+/// prerendered shell. This placeholder breaks that cycle: prerender weaves it,
+/// the id is derived over the resulting bytes, and every staged file carrying
+/// it is rewritten in place.
+///
+/// It is deliberately shaped like nothing an author would type and nothing a
+/// bundler emits, because the substitution is a byte-level search over the
+/// staged tree.
+const BUILD_ID_PLACEHOLDER: &str = "__mesofact_build_id__";
+
+/// Hex digits of the tree hash kept as the build id.
+///
+/// 128 bits — collision-proof for the purpose (naming one immutable build of
+/// one site) while staying short enough to read in a URL path, which is where
+/// it is actually seen: `/{build_id}/hydrate/…` and `<build_id>/html/…`.
+const BUILD_ID_HEX_LEN: usize = 32;
+
+/// The staged output tree, as it stands the moment the build id is derived.
+struct StagedTree {
+    /// `out_dir`-relative, `/`-separated path → BLAKE3 of the staged bytes.
+    hashes: BTreeMap<String, String>,
+    /// Absolute paths of the staged files carrying [`BUILD_ID_PLACEHOLDER`],
+    /// i.e. exactly those the substitution pass has to rewrite.
+    placeholder_files: Vec<PathBuf>,
 }
 
-// Howard Hinnant's days→civil algorithm.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
+/// Files `build` writes *after* the id is derived. They are excluded from the
+/// scan because they do not exist yet — and, more importantly, because a stale
+/// copy left in `out_dir` by an earlier build must not feed into the id.
+const DERIVED_AFTER_ID: [&str; 3] = ["manifest.json", "tag-index.json", "sitemap.xml"];
+
+/// Walk the staged tree, hashing every file and noting which ones carry the
+/// placeholder.
+fn scan_staged_tree(out_dir: &Path) -> Result<StagedTree> {
+    let mut tree = StagedTree { hashes: BTreeMap::new(), placeholder_files: Vec::new() };
+    let needle = BUILD_ID_PLACEHOLDER.as_bytes();
+
+    fn walk(dir: &Path, prefix: &str, needle: &[u8], tree: &mut StagedTree) -> Result<()> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .with_context(|| format!("reading {}", dir.display()))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+            // The routes bundle lives here and is deleted before `build`
+            // returns, so it is not part of the tree the id names.
+            if rel == ".mesofact-build" {
+                continue;
+            }
+            if prefix.is_empty() && DERIVED_AFTER_ID.contains(&name.as_str()) {
+                continue;
+            }
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                walk(&path, &rel, needle, tree)?;
+            } else {
+                let bytes = std::fs::read(&path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                if bytes.windows(needle.len()).any(|w| w == needle) {
+                    tree.placeholder_files.push(path);
+                }
+                tree.hashes.insert(rel, BundleHash::of(&bytes).as_str().to_string());
+            }
+        }
+        Ok(())
+    }
+
+    if out_dir.is_dir() {
+        walk(out_dir, "", needle, &mut tree)?;
+    }
+    Ok(tree)
+}
+
+/// Derive the build id from what the build produced (R870-B12).
+///
+/// Content-addressed rather than clock-stamped, for the reason
+/// [`PublishBeacon::for_bundle`] is clock-free (R703-T7): this value ends up
+/// *inside* the unit being content-addressed. A wall clock made the built tree
+/// different bytes on every run from an unchanged source, which flipped the
+/// W272 bundle digest on every apply and cost the whole of §1 immutability —
+/// no blob dedupe, a re-materialize and a serve-process re-fork per apply, and
+/// a measured ~2s of 502 on a site nothing had changed.
+///
+/// The digest covers the staged tree in its *placeholder* form plus the
+/// manifest that describes it, so it is a total function of the build's own
+/// output: any byte that moves — a bundle, an asset, a rendered page, a route
+/// table entry — moves the id, and nothing else does. It cannot cover its own
+/// substituted form, for the same reason the bundle beacon excludes itself: a
+/// digest covering itself has no fixed point.
+fn derive_build_id(tree: &StagedTree, manifest_json: &str) -> String {
+    let mut canonical = String::new();
+    for (path, hash) in &tree.hashes {
+        canonical.push_str(path);
+        canonical.push('\0');
+        canonical.push_str(hash);
+        canonical.push('\n');
+    }
+    canonical.push_str("manifest\0");
+    canonical.push_str(manifest_json);
+    BundleHash::of(canonical.as_bytes()).as_str()[..BUILD_ID_HEX_LEN].to_string()
+}
+
+/// Rewrite the placeholder to the derived id in every staged file carrying it.
+fn substitute_build_id(files: &[PathBuf], build_id: &str) -> Result<()> {
+    for path in files {
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let text = String::from_utf8(bytes).with_context(|| {
+            format!("{} carries the build-id placeholder but is not UTF-8", path.display())
+        })?;
+        std::fs::write(path, text.replace(BUILD_ID_PLACEHOLDER, build_id))
+            .with_context(|| format!("rewriting {} with the derived build id", path.display()))?;
+    }
+    Ok(())
 }
 
 pub async fn build(opts: BuildOptions) -> Result<BuildResult> {
@@ -100,7 +191,13 @@ pub async fn build(opts: BuildOptions) -> Result<BuildResult> {
         }
         None => project_root.join("dist"),
     };
-    let build_id = opts.build_id.unwrap_or_else(default_build_id);
+    // An explicit id is taken as given (tests, and any caller that wants to
+    // name the build itself). Otherwise the id is derived from the built tree
+    // below, and the placeholder stands in until then — see
+    // [`BUILD_ID_PLACEHOLDER`].
+    let explicit_build_id = opts.build_id;
+    let staged_build_id =
+        explicit_build_id.clone().unwrap_or_else(|| BUILD_ID_PLACEHOLDER.to_string());
 
     // Phase 0 — install.
     let node_modules = project_root.join("node_modules");
@@ -270,9 +367,9 @@ pub async fn build(opts: BuildOptions) -> Result<BuildResult> {
         crate::assets::discover_static_assets(&project_root, &out_dir, &config.public_dir)?;
 
     // Phase 7 — manifest assembly + validation (before any HTML lands).
-    let manifest = crate::manifest_build::assemble_manifest(crate::manifest_build::AssembleInput {
+    let mut manifest = crate::manifest_build::assemble_manifest(crate::manifest_build::AssembleInput {
         routes: &routes_config,
-        build_id: &build_id,
+        build_id: &staged_build_id,
         server_paths: &server_paths,
         inferred_sources: &inferred_sources,
         hydration: &hydration,
@@ -309,7 +406,21 @@ pub async fn build(opts: BuildOptions) -> Result<BuildResult> {
             is_error_route: error_route_paths.contains(&r.route.as_str()),
         });
     }
-    let outcome = prerender(&ssg, &out_dir, &project_root, &build_id, &targets)?;
+    let outcome = prerender(&ssg, &out_dir, &project_root, &staged_build_id, &targets)?;
+
+    // Phase 8b — the build id, derived from what phases 2–8 just staged
+    // (R870-B12). Everything the id names now exists; nothing written after
+    // this point feeds into it.
+    let build_id = match explicit_build_id {
+        Some(id) => id,
+        None => {
+            let staged = scan_staged_tree(&out_dir)?;
+            let id = derive_build_id(&staged, &serde_json::to_string(&manifest)?);
+            substitute_build_id(&staged.placeholder_files, &id)?;
+            manifest.build_id = id.clone();
+            id
+        }
+    };
 
     // Phase 9 — manifest + tag-index emission.
     let manifest_path = out_dir.join("manifest.json");

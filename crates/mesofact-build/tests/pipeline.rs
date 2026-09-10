@@ -4,6 +4,7 @@
 //! and SSR probe behavior.
 
 use mesofact_build::pipeline::{build, BuildOptions, InstallMode};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 fn fixtures_root() -> PathBuf {
@@ -14,14 +15,53 @@ fn fixtures_root() -> PathBuf {
 }
 
 fn build_native(fixture: &str, out: &Path) -> mesofact_build::pipeline::BuildResult {
+    build_native_with_id(fixture, out, Some(format!("test-{fixture}")))
+}
+
+fn build_native_with_id(
+    fixture: &str,
+    out: &Path,
+    build_id: Option<String>,
+) -> mesofact_build::pipeline::BuildResult {
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
     rt.block_on(build(BuildOptions {
         project_root: fixtures_root().join(fixture),
         out_dir: Some(out.to_path_buf()),
-        build_id: Some(format!("test-{fixture}")),
+        build_id,
         install: InstallMode::Never,
     }))
     .unwrap_or_else(|e| panic!("native build of {fixture} failed: {e:?}"))
+}
+
+/// Every file under `dir`, as `relative path → bytes`.
+fn tree_files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    fn walk(dir: &Path, prefix: &str, out: &mut BTreeMap<String, Vec<u8>>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir").map(Result::unwrap) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+            if entry.file_type().unwrap().is_dir() {
+                walk(&entry.path(), &rel, out);
+            } else {
+                out.insert(rel, std::fs::read(entry.path()).expect("read"));
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(dir, "", &mut out);
+    out
+}
+
+/// Paths whose bytes differ between two built trees.
+fn drifting_files(a: &BTreeMap<String, Vec<u8>>, b: &BTreeMap<String, Vec<u8>>) -> Vec<String> {
+    let mut drifted: Vec<String> = a
+        .iter()
+        .filter(|(path, bytes)| b.get(*path).map(|o| o != *bytes).unwrap_or(true))
+        .map(|(path, _)| path.clone())
+        .collect();
+    drifted.extend(b.keys().filter(|p| !a.contains_key(*p)).cloned());
+    drifted.sort();
+    drifted.dedup();
+    drifted
 }
 
 #[test]
@@ -153,6 +193,71 @@ fn ssr_broken_default_export_fails_probe() {
     let Err(err) = result else { panic!("ssr-broken must fail") };
     let msg = format!("{err:#}");
     assert!(msg.contains("export default"), "unexpected error: {msg}");
+}
+
+// ── build-id determinism (R870-B12 / W272 §1) ────────────────────────────────
+
+/// Two builds of an unchanged tree must be byte-identical — including the
+/// build id, which is derived from the built tree rather than stamped from a
+/// clock.
+///
+/// This is not cosmetic and it is not a build-speed concern. A `mesofact-spa`
+/// component's `dist/` IS the W272 bundle's content, so a byte that moves
+/// between two builds of the same source moves the bundle digest, and a moving
+/// digest defeats every part of §1 immutability: blob dedupe stops matching,
+/// the node re-materializes, and the serve process re-forks — a measured ~2s of
+/// 502 on an apply that changed nothing (R876-T1, us-east-001 2026-09-09).
+///
+/// Before R870-B12 this failed on exactly three files — `manifest.json`,
+/// `tag-index.json` and every prerendered shell — because `default_build_id()`
+/// was a one-second-resolution UTC stamp woven into the hydrate URL.
+/// `spa` is the fixture that carries all three carriers at once.
+#[test]
+fn two_builds_of_an_unchanged_tree_are_byte_identical() {
+    let tmp = tempfile::tempdir().unwrap();
+    let first = tmp.path().join("first");
+    let second = tmp.path().join("second");
+
+    let a = build_native_with_id("spa", &first, None);
+    let b = build_native_with_id("spa", &second, None);
+
+    assert_eq!(a.build_id, b.build_id, "build id drifted across two identical builds");
+    let drifted = drifting_files(&tree_files(&first), &tree_files(&second));
+    assert!(drifted.is_empty(), "these files drifted between two identical builds: {drifted:?}");
+}
+
+/// The derived id is a hash *of the built tree*, so it has to move when the
+/// tree does — a stable-but-constant id would pass the test above while
+/// serving stale bytes from an immutable `<build_id>/` prefix forever.
+#[test]
+fn a_different_project_derives_a_different_build_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let spa = build_native_with_id("spa", &tmp.path().join("spa"), None);
+    let islands = build_native_with_id("static-islands", &tmp.path().join("islands"), None);
+
+    assert_ne!(spa.build_id, islands.build_id, "two different sites share a build id");
+    assert_eq!(spa.build_id.len(), 32, "build id is a 32-hex-digit tree hash");
+    assert!(spa.build_id.bytes().all(|b| b.is_ascii_hexdigit()));
+}
+
+/// The placeholder is an implementation detail of the derivation and must
+/// never survive into the published tree — a shell that shipped it would
+/// request `/__mesofact_build_id__/hydrate/…` and never hydrate.
+#[test]
+fn no_placeholder_survives_into_the_built_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("native");
+    let result = build_native_with_id("spa", &out, None);
+
+    for (path, bytes) in tree_files(&out) {
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("__mesofact_build_id__"), "placeholder survived in {path}");
+    }
+    let html = std::fs::read_to_string(out.join("html/app.html")).unwrap();
+    assert!(
+        html.contains(&format!("/{}/hydrate/", result.build_id)),
+        "shell weaves the derived id: {html}"
+    );
 }
 
 // ── Mode 2 hooks (R756-F6 / W311 §2) ─────────────────────────────────────────
