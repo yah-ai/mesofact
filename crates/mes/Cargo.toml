@@ -53,7 +53,7 @@ publish = ["mesofact-dev/publish"]
 build = ["mesofact-dev/build"]
 
 [dependencies]
-mesofact-dev = { path = "../mesofact-dev", version = "0.8.36", default-features = false }
+mesofact-dev = { path = "../mesofact-dev", version = "0.8.37", default-features = false }
 # The CLI is `async fn`; this is the runtime it is entered on. Same feature set
 # `mesofact-dev` asks for, because the whole toolchain runs on this one runtime.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "process", "time", "sync", "io-util", "net"] }
