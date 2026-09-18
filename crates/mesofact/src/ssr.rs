@@ -544,7 +544,7 @@ pub struct SpawnOptions {
     /// subprocess did. `Object.assign`-ed onto `globalThis.process.env` at
     /// boot, and also what `[sources.r2]` credentials in
     /// `mesofact.config.toml` resolve against. Dev callers (`mesofact-dev`)
-    /// pass `DevS3::env_vars()`; the prod receiver (`mesofact serve`) passes
+    /// pass `DevStore::env_vars()`; the prod receiver (`mesofact serve`) passes
     /// its own real `std::env::vars()`, since that process genuinely has
     /// yubaba-injected secrets in its env. Empty by default — a workload with
     /// no `[sources.r2]` and no env-reading route code needs nothing here.

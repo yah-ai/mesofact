@@ -67,7 +67,7 @@ pub struct DispatchRequest {
 /// Resolved R2 source coordinates handed to the isolate at boot (R444).
 /// `mesofact::ssr::spawn` resolves `[sources.<name>]` (`kind = "r2"`) entries
 /// from a workload's `mesofact.config.toml` against whatever env map the
-/// caller passed in (dev: `DevS3::env_vars()`; prod: the receiver's real
+/// caller passed in (dev: `DevStore::env_vars()`; prod: the receiver's real
 /// process env) *before* this crate ever sees them — the isolate itself never
 /// touches the config file or arbitrary env, only these already-resolved
 /// values. Mirrors `packages/mesofact-runtime/src/adapters/r2.ts`'s `R2Config`.

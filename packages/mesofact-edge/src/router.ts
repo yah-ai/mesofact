@@ -9,25 +9,37 @@
 // Config is injected via plain_text Worker bindings, plus the published
 // manifest (read lazily on a static miss):
 //   ASSET_ORIGIN             — base URL for static (build-output) assets (no
-//                              trailing slash); the catch-all for non-route URLs
+//                              trailing slash); the catch-all for a URL NO
+//                              table entry claims. May be empty when every
+//                              static entry reads a bucket (→ unclaimed 404)
+//   R2_<BUCKET>              — R2 bucket bindings, one per bucket a `static`
+//                              entry names by `binding` (R560-F13)
 //   POINTER_ORIGIN           — base URL the pointer store is read from
 //                              (`p/<key>` objects). Defaults to ASSET_ORIGIN
 //                              (pointers live under `p/` in the same bucket);
 //                              kept distinct so a future consumer can front the
 //                              (uncached) pointer reads separately.
-//   UPLOAD_ORIGIN            — base URL for dynamic /uploads/* content (R490-T8).
-//                              Reserved seam; absent → /uploads/* returns 404.
-//   WORKER_MODE              — "static" | "spa" | "ssr"
-//   SSR_ORIGIN               — SSR proxy origin URL (empty for non-SSR modes)
-//   SSR_PREFIXES             — JSON array of path prefixes to proxy to SSR_ORIGIN
-//                              (the escape hatch; normally manifest-derived)
+//   WORKER_MODE              — "static" | "spa" | "ssr". Selects what a static
+//                              MISS becomes — a branded 404, or the SPA/SSR
+//                              shell. It no longer selects a ROUTE.
 //   SSR_RESILIENCE           — JSON `{ [prefix]: ResiliencePolicy }` (W181 v1);
 //                              optional; absent/invalid → one attempt, no timeout
-//   MESOFACT_BACKEND_ORIGIN  — almanac surface; /api/releases* proxied here
-//   ISSUES_ORIGIN            — issue-tracker surface; /api/issues* proxied here
-//   ROUTE_HEADERS            — JSON `[{ path, headers }]`, the domain manifest's
-//                              per-route response headers in manifest order (see
-//                              `applyRouteHeaders`); optional, absent → no-op
+//   ROUTE_TABLE              — JSON `[{ path, mode, origin?, rewrite?, target?,
+//                              status?, headers?, auth? }]`, the domain's
+//                              compiled route table in manifest order. The
+//                              producer is `RouteTable::to_json` in
+//                              oss/yubaba/crates/cloud/src/route_table.rs.
+//                              Optional; absent → every path is a static one.
+//
+// ROUTING IS THE TABLE, AND ONLY THE TABLE (R898-F3 / W348 §2.2). This Worker
+// carried four hardcoded prefix seams until R898-F3 — `ISSUES_ORIGIN`
+// intercepting /api/issues*, `MESOFACT_BACKEND_ORIGIN` intercepting
+// /api/releases*, `SSR_PREFIXES` proxying page routes, and `UPLOAD_ORIGIN`
+// claiming /uploads/* — each one an `if` block plus a binding, so a fifth
+// prefix meant a fifth of both, in a file the domain manifest could not reach.
+// They are ordinary table entries now. DO NOT ADD A FIFTH: a prefix that needs
+// its own origin is an entry, and if the table cannot express what you need,
+// widen the table (`ResolvedRouteMode`) rather than reaching around it.
 //
 // Manifest-driven behavior:
 //   * PAGE requests resolve against the build tree the manifest's `build_id`
@@ -54,21 +66,47 @@ import { PointerMalformed, resolvePointer } from "./pointer.js";
 interface Env {
   ASSET_ORIGIN: string;
   POINTER_ORIGIN?: string;
-  UPLOAD_ORIGIN?: string;
   WORKER_MODE: string;
-  SSR_ORIGIN: string;
-  SSR_PREFIXES: string;
   SSR_RESILIENCE?: string;
-  MESOFACT_BACKEND_ORIGIN?: string;
-  ISSUES_ORIGIN?: string;
-  ROUTE_HEADERS?: string;
+  ROUTE_TABLE?: string;
+  /** The R2 bucket bindings `static` entries name by `binding` (R560-F13). */
+  [binding: string]: unknown;
 }
 
-/** One entry of the `ROUTE_HEADERS` table — mirrors `DomainRoute` in
- *  `oss/yubaba/crates/cloud/src/config.rs` (path + its `headers` map). */
-interface RouteHeaderRule {
+/** How a matched path is rewritten before it reaches its origin — mirrors
+ *  `RouteRewrite` in `oss/yubaba/crates/cloud/src/route_table.rs`.
+ *
+ *  Both halves travel on the wire so this door never re-derives a prefix from
+ *  a pattern: `/api/issues/42` under `{from: "/api/issues", to: "/issues"}`
+ *  reaches the origin as `/issues/42`. */
+interface RouteRewrite {
+  from: string;
+  to: string;
+}
+
+/** One entry of the `ROUTE_TABLE` — mirrors `RouteTableEntry` in
+ *  `oss/yubaba/crates/cloud/src/route_table.rs`, whose `mode` tag is flattened
+ *  into the object.
+ *
+ *  A `static` entry is served from ITS OWN source (R560-F13): the R2 bucket
+ *  bound as `binding` when it names one — the Rust side's
+ *  `ResolvedRouteMode::StaticBucket`, keyed by the request path minus its
+ *  leading slash, unchanged — otherwise its `origin`. `ASSET_ORIGIN` serves
+ *  only a path no entry claims. One Worker can therefore front several
+ *  buckets, and an alias-tier domain's second site no longer serves out of the
+ *  first one's origin. */
+interface RouteEntry {
   path: string;
-  headers: Record<string, string>;
+  mode: "static" | "backend" | "redirect";
+  component?: string;
+  origin?: string;
+  bucket?: string;
+  binding?: string;
+  rewrite?: RouteRewrite;
+  target?: string;
+  status?: number;
+  headers?: Record<string, string>;
+  auth?: string;
 }
 
 // W181 v1 schema mirror — see oss/mesofact/packages/mesofact-runtime/src/routes.ts.
@@ -102,83 +140,146 @@ const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
 // "nothing" cannot safely mean "hold it" at a mutable URL.
 const PAGE_CACHE_CONTROL = "no-cache";
 
+/** A read of one object by bucket key. A miss is a non-ok `Response`, never a
+ *  throw, so every caller keeps the `resp.ok` shape it had over `fetch`. */
+type AssetGet = (key: string) => Promise<Response>;
+
+/** Where a static request's bytes come from — and the manifest, pointer
+ *  records and error pages published beside them, which is why the whole
+ *  static pipeline below runs over one of these rather than over a URL. */
+interface AssetSource {
+  get: AssetGet;
+  /** `p/<key>` pointer records. The same source as `get` for an entry; the
+   *  catch-all keeps its distinct `POINTER_ORIGIN` binding. */
+  pointers: AssetGet;
+}
+
+function httpGet(origin: string): AssetGet {
+  return (key) => fetch(`${origin}/${key}`);
+}
+
+/** An R2 binding as an `AssetGet`. The object's own HTTP metadata
+ *  (content-type, cache-control, …) and its etag travel on the response, which
+ *  is what an R2 custom domain would have served for the same key. */
+function r2Get(bucket: R2Bucket): AssetGet {
+  return async (key) => {
+    const obj = await bucket.get(key);
+    if (!obj) return new Response(null, { status: 404 });
+    const headers = new Headers();
+    obj.writeHttpMetadata(headers);
+    headers.set("ETag", obj.httpEtag);
+    return new Response(obj.body, { headers });
+  };
+}
+
+/** The source the MATCHED entry serves from (R560-F13), or the `Response` that
+ *  ends the request when it cannot be served at all.
+ *
+ *  A bucket entry whose binding this Worker was not deployed with fails CLOSED
+ *  with a 502, like a backend entry with no origin: the producer derives the
+ *  binding list from the very table it ships, so this is a hand-edited or
+ *  half-deployed Worker, and falling through would serve the path out of the
+ *  catch-all with a 200. */
+function assetSource(
+  env: Env,
+  entry: RouteEntry | undefined,
+): AssetSource | Response {
+  if (entry?.mode === "static" && entry.binding !== undefined) {
+    const bucket = env[entry.binding] as R2Bucket | undefined;
+    if (!bucket || typeof bucket.get !== "function") {
+      console.error(
+        `mesofact: ROUTE_TABLE entry ${JSON.stringify(entry.path)} reads R2 binding ${JSON.stringify(entry.binding)}, which this Worker was not deployed with`,
+      );
+      return new Response("Bad Gateway", { status: 502 });
+    }
+    const get = r2Get(bucket);
+    return { get, pointers: get };
+  }
+  if (entry?.mode === "static" && entry.origin) {
+    const get = httpGet(entry.origin);
+    return { get, pointers: get };
+  }
+  if (!env.ASSET_ORIGIN) {
+    // Every static entry reads a bucket and none claimed this path.
+    return new Response("Not Found", { status: 404 });
+  }
+  return {
+    get: httpGet(env.ASSET_ORIGIN),
+    pointers: httpGet(env.POINTER_ORIGIN || env.ASSET_ORIGIN),
+  };
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    // Route first, then stamp the matching route's declared response headers
-    // onto whatever came back. Wrapping the whole router — rather than each
-    // `return` inside it — is what makes the guarantee total: a header a
-    // domain declares for a path applies to the asset hit, the clean-URL hit,
-    // the SPA shell, the branded 404 and the SSR proxy alike. A header set
-    // that only held on the happy path would be worse than none for the case
-    // that motivated this (COOP/COEP: a document served without them silently
-    // loses SharedArrayBuffer instead of failing loudly).
-    const resp = await route(request, env);
-    return applyRouteHeaders(resp, new URL(request.url).pathname, env.ROUTE_HEADERS);
+    // ONE walk of the table decides both halves of this request: which origin
+    // serves it, and which declared headers it carries. They were two
+    // independent decisions before R898-F3 — four `if` blocks for routing and
+    // a separate `ROUTE_HEADERS` match for headers — which is how a path could
+    // be routed by one rule and headered by another.
+    const path = new URL(request.url).pathname;
+    let entry: RouteEntry | undefined;
+    try {
+      entry = matchRoute(env.ROUTE_TABLE, path);
+    } catch (err) {
+      return routingUnavailable(path, err);
+    }
+
+    // Headers are stamped onto whatever came back, rather than at each
+    // `return` inside the router, and that is what makes the guarantee total:
+    // a header a domain declares for a path applies to the asset hit, the
+    // clean-URL hit, the SPA shell, the branded 404 and the proxied response
+    // alike. A header set that only held on the happy path would be worse
+    // than none for the case that motivated this (COOP/COEP: a document
+    // served without them silently loses SharedArrayBuffer instead of failing
+    // loudly).
+    const resp = await route(request, env, entry);
+    return applyRouteHeaders(resp, entry);
   },
 };
 
 /** The router proper. Every `return` here is post-processed by
- *  [`applyRouteHeaders`] in the exported `fetch` above. */
-async function route(request: Request, env: Env): Promise<Response> {
+ *  [`applyRouteHeaders`] in the exported `fetch` above.
+ *
+ *  `entry` is the ONE table entry that claimed this path, already matched.
+ *  A `static` entry is served from its own source (`assetSource`); only
+ *  `undefined` falls through to `ASSET_ORIGIN`, the catch-all. */
+async function route(
+  request: Request,
+  env: Env,
+  entry: RouteEntry | undefined,
+): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname;
   const resilience = parseResilience(env.SSR_RESILIENCE);
 
-  // Backend API routing (R455-T4): /api/issues* → ISSUES_ORIGIN,
-  // /api/releases* → MESOFACT_BACKEND_ORIGIN. Takes priority over SSR
-  // routing so pond/prod paths hit the backend container directly.
-  if (env.ISSUES_ORIGIN && path.startsWith("/api/issues")) {
-    const target =
-      env.ISSUES_ORIGIN +
-      "/issues" +
-      path.slice("/api/issues".length) +
-      url.search;
-    return proxyWithResilience(request, target, policyFor(resilience, path));
+  if (entry?.mode === "redirect") {
+    // `Response.redirect` demands an absolute URL; a manifest may declare a
+    // path, and a declared redirect that throws at the edge is worse than one
+    // the browser resolves relative to the request.
+    return new Response(null, {
+      status: entry.status ?? 308,
+      headers: { Location: entry.target ?? "/" },
+    });
   }
-  if (env.MESOFACT_BACKEND_ORIGIN && path.startsWith("/api/releases")) {
-    const target =
-      env.MESOFACT_BACKEND_ORIGIN +
-      "/releases" +
-      path.slice("/api/releases".length) +
-      url.search;
+
+  if (entry?.mode === "backend") {
+    if (!entry.origin) {
+      // The producer refuses to compile an entry with no resolved origin, so
+      // this is a hand-edited table. Failing the path is right: falling
+      // through would serve the backend's path out of the asset bucket with a
+      // 200, which is the silent failure the table exists to end.
+      console.error(
+        `mesofact: ROUTE_TABLE entry ${JSON.stringify(entry.path)} is mode=backend with no origin`,
+      );
+      return new Response("Bad Gateway", { status: 502 });
+    }
+    const target = entry.origin + rewritePath(entry, path) + url.search;
     return proxyWithResilience(request, target, policyFor(resilience, path));
   }
 
-  // SSR: proxy matching prefixes to origin
-  if (env.WORKER_MODE === "ssr" && env.SSR_ORIGIN) {
-    let prefixes: string[] = [];
-    try {
-      prefixes = JSON.parse(env.SSR_PREFIXES);
-    } catch {
-      // malformed JSON — fall through to asset serving
-    }
-    // Segment-aware match (W173): exact prefix OR descendant under prefix.
-    // Naive `path.startsWith(p)` would proxy /api/healthcheck to an
-    // /api/health origin — bytes match, segments don't.
-    const matched = prefixes.find(
-      (p) => path === p || path.startsWith(p.endsWith("/") ? p : p + "/"),
-    );
-    if (matched) {
-      const target = env.SSR_ORIGIN + path + url.search;
-      return proxyWithResilience(request, target, policyFor(resilience, path));
-    }
-  }
-
-  // Dynamic user content (R490-T8): /uploads/* routes to UPLOAD_ORIGIN,
-  // separate from the build-output static assets on ASSET_ORIGIN. No writer
-  // exists yet — the binding is a reserved seam; absent → clean 404, and a
-  // miss is a real 404 (never the SPA shell or 404.html, which belong to the
-  // static site). Segment-aware: the trailing slash keeps /uploadsfoo out.
-  if (path.startsWith("/uploads/")) {
-    if (!env.UPLOAD_ORIGIN) {
-      return new Response("Not Found", { status: 404 });
-    }
-    const uploadResp = await fetch(`${env.UPLOAD_ORIGIN}/${path.slice(1)}`);
-    if (uploadResp.ok) {
-      return uploadResp;
-    }
-    return new Response("Not Found", { status: 404 });
-  }
+  // Static: served from the MATCHED entry's own source, not a Worker-wide one.
+  const source = assetSource(env, entry);
+  if (source instanceof Response) return source;
 
   // Resolve asset key from URL path
   let key: string;
@@ -208,12 +309,12 @@ async function route(request: Request, env: Env): Promise<Response> {
   let manifest: EdgeManifest | null = null;
   let manifestLoaded = false;
   if (isPageKey(key)) {
-    manifest = await loadManifest(env.ASSET_ORIGIN);
+    manifest = await loadManifest(source.get);
     manifestLoaded = true;
     const pageRoot = buildPageRoot(manifest);
     if (pageRoot) {
       for (const candidate of assetCandidates(key)) {
-        const resp = await fetch(`${env.ASSET_ORIGIN}/${pageRoot}/${candidate}`);
+        const resp = await source.get(`${pageRoot}/${candidate}`);
         if (resp.ok) {
           return routePage(resp, manifest, path);
         }
@@ -222,7 +323,7 @@ async function route(request: Request, env: Env): Promise<Response> {
   }
 
   // Fetch from asset origin — the common (build-time HTML/asset) hit.
-  const assetResp = await fetch(`${env.ASSET_ORIGIN}/${key}`);
+  const assetResp = await source.get(key);
   if (assetResp.ok) {
     // A page here came from the flat layout (no build tree, or no copy of this
     // key in it); the manifest is already loaded for any page key, so the
@@ -237,12 +338,12 @@ async function route(request: Request, env: Env): Promise<Response> {
   // Asset requests still reach the manifest only here, so a site of hashed
   // bundles pays for it exactly once per miss rather than once per request.
   if (!manifestLoaded) {
-    manifest = await loadManifest(env.ASSET_ORIGIN);
+    manifest = await loadManifest(source.get);
   }
 
   // Instance-addressed (deferred) route → resolve through the pointer store.
   if (matchesDeferredRoute(manifest, path)) {
-    return serveInstance(env, path, manifest);
+    return serveInstance(source, path, manifest);
   }
 
   // Clean-URL resolution: an extensionless path (e.g. `/releases`) maps to
@@ -253,7 +354,7 @@ async function route(request: Request, env: Env): Promise<Response> {
   // so they keep priority; assets that already carry an extension (fetched
   // verbatim on the fast path) never reach here.
   for (const candidate of assetCandidates(key).slice(1)) {
-    const cleanResp = await fetch(`${env.ASSET_ORIGIN}/${candidate}`);
+    const cleanResp = await source.get(candidate);
     if (cleanResp.ok) {
       return withDeclaredCache(cleanResp, manifest, path);
     }
@@ -261,16 +362,16 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   // static → error page; spa/ssr → index.html shell (client-side routing).
   if (env.WORKER_MODE === "static") {
-    return errorResponse(404, env.ASSET_ORIGIN, manifest?.error_routes);
+    return errorResponse(404, source.get, manifest?.error_routes);
   }
-  const shellResp = await fetch(`${env.ASSET_ORIGIN}/index.html`);
+  const shellResp = await source.get("index.html");
   if (shellResp.ok) {
     return new Response(shellResp.body, {
       status: 200,
       headers: shellResp.headers,
     });
   }
-  return errorResponse(404, env.ASSET_ORIGIN, manifest?.error_routes);
+  return errorResponse(404, source.get, manifest?.error_routes);
 }
 
 /**
@@ -289,30 +390,27 @@ async function route(request: Request, env: Env): Promise<Response> {
  * this relay exists to remove.
  */
 async function serveInstance(
-  env: Env,
+  source: AssetSource,
   path: string,
   manifest: EdgeManifest | null,
 ): Promise<Response> {
-  const pointerOrigin = env.POINTER_ORIGIN || env.ASSET_ORIGIN;
   const key = path.slice(1);
 
   let state;
   try {
-    state = await resolvePointer(pointerOrigin, key);
+    state = await resolvePointer(source.pointers, key);
   } catch (err) {
     if (err instanceof PointerMalformed) {
-      return errorResponse(500, env.ASSET_ORIGIN, manifest?.error_routes);
+      return errorResponse(500, source.get, manifest?.error_routes);
     }
     throw err;
   }
 
   if (state.kind === "present") {
-    const contentResp = await fetch(
-      `${env.ASSET_ORIGIN}/${state.pointer.content_root}`,
-    );
+    const contentResp = await source.get(state.pointer.content_root);
     if (!contentResp.ok) {
       // Pointer names bytes that aren't there — treat as not found.
-      return errorResponse(404, env.ASSET_ORIGIN, manifest?.error_routes);
+      return errorResponse(404, source.get, manifest?.error_routes);
     }
     const headers = new Headers(contentResp.headers);
     stampPageCache(headers, manifest, path, IMMUTABLE_CACHE_CONTROL);
@@ -321,11 +419,11 @@ async function serveInstance(
 
   if (state.kind === "deleted") {
     // Published then unpublished — 410 Gone, distinct from a never-existed 404.
-    return errorResponse(410, env.ASSET_ORIGIN, manifest?.error_routes, "410 Gone");
+    return errorResponse(410, source.get, manifest?.error_routes, "410 Gone");
   }
 
   // absent
-  return errorResponse(404, env.ASSET_ORIGIN, manifest?.error_routes);
+  return errorResponse(404, source.get, manifest?.error_routes);
 }
 
 /**
@@ -340,7 +438,7 @@ async function serveInstance(
  */
 async function errorResponse(
   status: number,
-  assetOrigin: string,
+  get: AssetGet,
   errorRoutes: EdgeErrorRoutes | undefined,
   fallbackText?: string,
 ): Promise<Response> {
@@ -349,7 +447,7 @@ async function errorResponse(
   if (brandedRoute) keys.push(...routeToAssetKeys(brandedRoute));
   if (status < 500) keys.push("404.html"); // legacy default when no error_routes
   for (const k of keys) {
-    const resp = await fetch(`${assetOrigin}/${k}`);
+    const resp = await get(k);
     if (resp.ok) {
       return new Response(resp.body, { status, headers: resp.headers });
     }
@@ -484,37 +582,83 @@ function defaultStatusText(status: number): string {
   return "Not Found";
 }
 
-// ── per-route response headers ──────────────────────────────────────────────
+// ── the route table ─────────────────────────────────────────────────────────
 //
 // The domain manifest is the only place that knows about path routing, so it is
-// also where a path's *response headers* belong — not in a `_headers` file (a
-// Pages/Netlify convention no Worker reads) and not hardcoded here for one
-// site's needs. `ROUTE_HEADERS` carries that table verbatim, in manifest order;
-// the producer is `DomainConfig::route_headers_json` in
-// oss/yubaba/crates/cloud/src/config.rs.
+// also where a path's ORIGIN and its *response headers* belong — not in a
+// `_headers` file (a Pages/Netlify convention no Worker reads) and not
+// hardcoded here for one site's needs. `ROUTE_TABLE` carries the compiled table
+// verbatim, in manifest order; the producer is `RouteTable::to_json` in
+// oss/yubaba/crates/cloud/src/route_table.rs.
 //
-// FIRST MATCH WINS, with no merging across rules — the same rule the manifest
-// already states for routing ("vec order = match order, first match wins"). One
-// path therefore has one header set, decided where the route was decided.
+// FIRST MATCH WINS, with no merging across entries — the same rule the manifest
+// already states ("vec order = match order, first match wins"). One path
+// therefore has one origin and one header set, both decided where the route was
+// decided.
+//
+// TWO POSTURES ON A BAD TABLE, AND THE SPLIT IS THE POINT (R898-F3 decision 2):
+//
+//   * A table that cannot be PARSED or whose entries are not shaped like
+//     entries means this door does not know where anything goes. It fails the
+//     request CLOSED, loudly (`routingUnavailable`). Serving everything from
+//     the catch-all instead is the /api/releases silent-404 with extra steps —
+//     the incident W348 exists to prevent. The Rust origin refuses to start on
+//     the same input, so this is the Worker's analogue of that refusal.
+//   * A header that cannot be SET is cosmetic by comparison and keeps R749-T1's
+//     lenient posture: all headers are dropped (never a partial application,
+//     which makes a site look configured while one path is not), one log line
+//     is emitted, and ROUTING CONTINUES. A typo'd header name must not take a
+//     page down — that was the dead site R749-T5 fixed, and reaching it at all
+//     means a hand-edited binding, since `DomainConfig::validate_route_headers`
+//     fails `yah cloud apply` on anything `validateRouteTable` throws on.
 
 /** Statuses whose responses must carry a null body (constructing one with a
  *  body throws in workerd). */
 const NULL_BODY_STATUS = new Set([101, 103, 204, 205, 304]);
 
-/** Memoized parse of the `ROUTE_HEADERS` binding — the value is fixed for the
+/** Memoized parse of the `ROUTE_TABLE` binding — the value is fixed for the
  *  isolate's lifetime, so re-parsing it per request buys nothing. */
-let routeHeaderCache: { raw: string; rules: RouteHeaderRule[] } | undefined;
+let routeTableCache: { raw: string; entries: RouteEntry[] } | undefined;
+
+/** The entry that claims `path`, or `undefined` for a plain static request.
+ *  Throws when the table itself cannot be trusted — see the posture note
+ *  above; the caller turns that into a closed failure, never a fall-through. */
+function matchRoute(
+  raw: string | undefined,
+  path: string,
+): RouteEntry | undefined {
+  return parseRouteTable(raw).find((e) => matchesRoutePattern(e.path, path));
+}
+
+/** `to + <the rest of the path>`, or the path unchanged when the entry
+ *  declares no rewrite. `from` is the matched prefix, so slicing by its length
+ *  is exact — `/api/issues/42` under `{from:"/api/issues",to:"/issues"}` is
+ *  `/issues/42`, and the bare `/api/issues` is `/issues`. */
+function rewritePath(entry: RouteEntry, path: string): string {
+  const rw = entry.rewrite;
+  if (!rw) return path;
+  return rw.to + path.slice(rw.from.length);
+}
+
+/** A table this door cannot trust — 503, logged, and NOT served from the
+ *  catch-all. See the posture note above for why this one is closed. */
+function routingUnavailable(path: string, err: unknown): Response {
+  console.error(
+    `mesofact: ROUTE_TABLE binding is malformed — refusing to route ${path} rather than serving it from the catch-all — ${
+      err instanceof Error ? err.message : String(err)
+    }`,
+  );
+  return new Response("Service Unavailable: routing table is unreadable", {
+    status: 503,
+    headers: { "Content-Type": "text/plain" },
+  });
+}
 
 function applyRouteHeaders(
   resp: Response,
-  path: string,
-  raw: string | undefined,
+  entry: RouteEntry | undefined,
 ): Response {
-  const matched = parseRouteHeaders(raw).find((r) =>
-    matchesRoutePattern(r.path, path),
-  );
-  if (!matched) return resp;
-  const entries = Object.entries(matched.headers);
+  const entries = Object.entries(entry?.headers ?? {});
   if (entries.length === 0) return resp;
   const headers = new Headers(resp.headers);
   for (const [name, value] of entries) headers.set(name, value);
@@ -525,67 +669,53 @@ function applyRouteHeaders(
   });
 }
 
-function parseRouteHeaders(raw: string | undefined): RouteHeaderRule[] {
+function parseRouteTable(raw: string | undefined): RouteEntry[] {
   if (!raw) return [];
-  if (routeHeaderCache?.raw === raw) return routeHeaderCache.rules;
-  let rules: RouteHeaderRule[] = [];
+  if (routeTableCache?.raw === raw) return routeTableCache.entries;
+  // A structural failure propagates: the caller fails the request closed.
+  // Only the header half is caught, and only to drop headers.
+  let entries = validateRouteTable(raw);
   try {
-    rules = validateRouteHeaderTable(raw);
+    assertSettableHeaders(entries);
   } catch (err) {
-    // Malformed binding — serve without extra headers rather than 500 every
-    // request. The Rust side serializes this, so a malformed value is a bug
-    // there, and a dead site is a worse symptom than a missing header.
-    //
-    // R749-T1: this is the ONE place in the system where a declared policy is
-    // still allowed not to run, and it stays that way deliberately — the Rust
-    // origin refuses the start for the same input (`RouteHeaderTable::parse`),
-    // so the strictness belongs at the producer, not on the last hop before a
-    // user. What changed is that it is no longer silent, and no longer
-    // *partial*: a table with one bad rule used to apply the other rules, so a
-    // site looked configured while one path was not. All-or-nothing plus a log
-    // line is the honest version of "we could not enforce this".
-    //
-    // R749-T5: the producer-side check that makes this posture defensible now
-    // exists — `DomainConfig::validate_route_headers`
-    // (`oss/yubaba/crates/cloud/src/config.rs`) fails `yah cloud apply` at
-    // manifest load on anything `validateRouteHeaderTable` would throw on, so
-    // reaching this catch means a hand-edited binding, not a normal deploy.
     console.error(
-      `mesofact: ROUTE_HEADERS binding is malformed, serving with NO route headers — ${
+      `mesofact: ROUTE_TABLE carries a header that cannot be applied, serving with NO route headers — ${
         err instanceof Error ? err.message : String(err)
       }`,
     );
-    rules = [];
+    entries = entries.map(({ headers: _drop, ...rest }) => rest);
   }
-  routeHeaderCache = { raw, rules };
-  return rules;
+  routeTableCache = { raw, entries };
+  return entries;
 }
 
 /**
- * Parse and fully validate a `ROUTE_HEADERS` table, throwing on anything this
- * Worker would otherwise have dropped (R749-T1).
+ * Parse and structurally validate a `ROUTE_TABLE`, throwing on anything this
+ * Worker could not route from (R749-T1's all-or-nothing, widened past headers).
  *
  * Exported so the producing side can fail a deploy rather than ship a table
  * whose broken half disappears at the edge — the build-validation direction
  * R749-F3 named. The Rust half of the same check is
- * `mesofact::route_headers::RouteHeaderTable::parse`; keep the two agreeing.
+ * `mesofact::route_headers::RouteHeaderTable::parse` for the header column and
+ * `DomainConfig::route_table` for the whole thing; keep them agreeing.
  */
-export function validateRouteHeaderTable(raw: string): RouteHeaderRule[] {
+export function validateRouteTable(raw: string): RouteEntry[] {
   const v: unknown = JSON.parse(raw);
   if (!Array.isArray(v)) {
-    throw new Error("expected a JSON array of {path, headers} rules");
+    throw new Error("expected a JSON array of route entries");
   }
-  return v.map((rule, i) => {
-    if (!isRouteHeaderRule(rule)) {
-      throw new Error(`rule ${i} is not a {path: string, headers: object}`);
-    }
-    if (rule.path === "") {
+  return v.map((entry, i) => {
+    if (!isRouteEntry(entry)) {
       throw new Error(
-        `rule ${i} has an empty path — a rule that matches nothing (or everything, depending on who reads it) is not a policy`,
+        `entry ${i} is not a {path: string, mode: "static"|"backend"|"redirect", headers?: object}`,
       );
     }
-    assertSettableHeaders(rule, i);
-    return rule;
+    if (entry.path === "") {
+      throw new Error(
+        `entry ${i} has an empty path — an entry that matches nothing (or everything, depending on who reads it) is not a route`,
+      );
+    }
+    return entry;
   });
 }
 
@@ -605,46 +735,60 @@ export function validateRouteHeaderTable(raw: string): RouteHeaderRule[] {
  * door applying a header the other rejects is the failure this fixture set was
  * built to catch, so reject it here too.
  */
-function assertSettableHeaders(rule: RouteHeaderRule, i: number): void {
+function assertSettableHeaders(entries: RouteEntry[]): void {
   const probe = new Headers();
-  for (const [name, value] of Object.entries(rule.headers)) {
-    if (typeof value !== "string") {
-      throw new Error(
-        `rule ${i} declares ${JSON.stringify(name)} = ${JSON.stringify(value)}, which is not a string`,
-      );
+  entries.forEach((entry, i) => {
+    for (const [name, value] of Object.entries(entry.headers ?? {})) {
+      if (typeof value !== "string") {
+        throw new Error(
+          `entry ${i} declares ${JSON.stringify(name)} = ${JSON.stringify(value)}, which is not a string`,
+        );
+      }
+      try {
+        probe.set(name, value);
+      } catch (err) {
+        throw new Error(
+          `entry ${i} declares ${JSON.stringify(name)} = ${JSON.stringify(value)}, which cannot be set as a response header — ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
     }
-    try {
-      probe.set(name, value);
-    } catch (err) {
-      throw new Error(
-        `rule ${i} declares ${JSON.stringify(name)} = ${JSON.stringify(value)}, which cannot be set as a response header — ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-    }
-  }
+  });
 }
 
-function isRouteHeaderRule(v: unknown): v is RouteHeaderRule {
+function isRouteEntry(v: unknown): v is RouteEntry {
   if (!v || typeof v !== "object") return false;
-  const r = v as RouteHeaderRule;
-  return (
-    typeof r.path === "string" &&
-    !!r.headers &&
-    typeof r.headers === "object" &&
-    // An array passes `typeof === "object"` and would then be walked by its
-    // indices, so `[["a","b"]]` becomes the settable header `0` at the edge
-    // while the Rust side rejects the table outright.
-    !Array.isArray(r.headers)
-  );
+  const e = v as RouteEntry;
+  if (typeof e.path !== "string") return false;
+  if (e.mode !== "static" && e.mode !== "backend" && e.mode !== "redirect") {
+    return false;
+  }
+  // A static entry's source fields are optional, but a present one that is
+  // not a string would read `env[<object>]` or fetch `[object Object]/key`.
+  if (e.origin !== undefined && typeof e.origin !== "string") return false;
+  if (e.binding !== undefined && typeof e.binding !== "string") return false;
+  // `headers` is optional (the producer omits it when empty) but must be a
+  // plain object when present. An array passes `typeof === "object"` and would
+  // then be walked by its indices, so `[["a","b"]]` becomes the settable
+  // header `0` at the edge while the Rust side rejects the table outright.
+  if (e.headers !== undefined) {
+    if (!e.headers || typeof e.headers !== "object" || Array.isArray(e.headers)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
  * Match a domain-manifest route pattern against a request path.
  *
  * `"/*"` matches everything. `"/app/*"` matches `/app`, `/app/` and everything
- * below — segment-aware (so `/apple` stays out), the same rule SSR_PREFIXES
- * uses above, and deliberately including the BARE prefix: `/app` is the URL a
+ * below — segment-aware (so `/apple` stays out), the same rule the SSR prefix
+ * matcher used before it became table entries (W173: a naive
+ * `path.startsWith(p)` proxies `/api/healthcheck` to an `/api/health` origin —
+ * bytes match, segments don't), and deliberately including the BARE prefix:
+ * `/app` is the URL a
  * link points at, it resolves to `app/index.html` through the clean-URL rule,
  * and a header set that skipped it would miss the very document it exists for.
  * Any pattern without a trailing `*` is an exact path match.

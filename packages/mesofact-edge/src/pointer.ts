@@ -86,19 +86,20 @@ export function validateKey(key: string): string | null {
  * (→ 404) without a fetch.
  */
 export async function resolvePointer(
-  pointerOrigin: string,
+  read: (key: string) => Promise<Response>,
   key: string,
 ): Promise<PointerState> {
   if (validateKey(key) !== null) {
     return { kind: "absent" };
   }
-  const url = `${pointerOrigin}/${POINTER_PREFIX}${key}`;
-  const resp = await fetch(url);
+  // `read` is the pointer store — an HTTP origin or an R2 binding (R560-F13).
+  const pointerKey = `${POINTER_PREFIX}${key}`;
+  const resp = await read(pointerKey);
   if (resp.status === 404) {
     return { kind: "absent" };
   }
   if (!resp.ok) {
-    throw new PointerMalformed(`pointer read ${url} -> ${resp.status}`);
+    throw new PointerMalformed(`pointer read ${pointerKey} -> ${resp.status}`);
   }
   let record: PointerRecord;
   try {

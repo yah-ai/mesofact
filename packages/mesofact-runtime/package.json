@@ -1,6 +1,6 @@
 {
   "name": "@mesofact/runtime",
-  "version": "0.8.37",
+  "version": "0.8.40",
   "description": "Render contract types and adapter API for mesofact (RenderRequest, RenderResult, Source, error taxonomy)",
   "license": "MIT OR Apache-2.0",
   "publishConfig": {

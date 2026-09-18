@@ -103,6 +103,14 @@ pub struct ServeArgs {
     #[arg(long, env = "MESOFACT_MIRROR_KEY")]
     mirror_key: Option<String>,
 
+    /// Receiver mode only: path to a file holding the bearer secret, read and
+    /// trimmed when `--mirror-key` / `MESOFACT_MIRROR_KEY` is unset (R876-B16
+    /// — the file-backed delivery form for a `SecretMount` + `SecretTarget::
+    /// File` materialized at this path by yubaba's native path, so the
+    /// bearer's plaintext never has to be a literal in the WorkloadSpec).
+    #[arg(long, env = "MESOFACT_MIRROR_KEY_FILE")]
+    mirror_key_file: Option<PathBuf>,
+
     /// Receiver mode only: route allowlist — repeat the flag per route
     /// (`--allow-route /releases --allow-route /issues`). Unset = every
     /// render-eligible route in the manifest.
@@ -558,6 +566,26 @@ fn socket_activation_listener() -> anyhow::Result<Option<tokio::net::TcpListener
     Ok(None)
 }
 
+/// Value-first, file-fallback bearer resolution (R876-B16): a direct
+/// `--mirror-key` / `MESOFACT_MIRROR_KEY` wins; otherwise read+trim the file
+/// named by `--mirror-key-file` / `MESOFACT_MIRROR_KEY_FILE`. `None` on both =
+/// open receiver, same as before this file-backed form existed — this is the
+/// receiving half of the `SecretMount` + `SecretTarget::File` path yubaba's
+/// native materialization writes to.
+fn resolve_mirror_key(direct: Option<String>, file: Option<PathBuf>) -> anyhow::Result<Option<String>> {
+    match direct {
+        Some(key) => Ok(Some(key)),
+        None => match file {
+            Some(path) => {
+                let contents = std::fs::read_to_string(&path)
+                    .map_err(|e| anyhow::anyhow!("reading --mirror-key-file {}: {e}", path.display()))?;
+                Ok(Some(contents.trim().to_string()))
+            }
+            None => Ok(None),
+        },
+    }
+}
+
 /// The V8-backed modes (SSR host + revalidate/tenants receivers). Compiled only
 /// with the `ssr` feature; without it, any of these invocations is a clear
 /// error instead of a silent static fallthrough.
@@ -616,11 +644,12 @@ async fn run_workload_modes(args: ServeArgs) -> anyhow::Result<()> {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("--revalidate needs a <workload> dir (or use --tenants)"))?;
         let workload_abs = workload.canonicalize().unwrap_or(workload);
+        let mirror_key = resolve_mirror_key(args.mirror_key, args.mirror_key_file)?;
         return revalidate::serve(
             revalidate::RevalidateConfig {
                 workload: workload_abs,
                 publish_config: args.publish_config,
-                mirror_key: args.mirror_key,
+                mirror_key,
                 routes: args.allow_route,
             },
             addr.ip(),
@@ -734,6 +763,49 @@ mod tests {
         let mut argv = vec!["mesofact-serve"];
         argv.extend_from_slice(extra);
         Harness::parse_from(argv).args
+    }
+
+    #[test]
+    fn resolve_mirror_key_prefers_the_direct_value_over_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bearer");
+        std::fs::write(&path, "from-file\n").unwrap();
+        let resolved =
+            resolve_mirror_key(Some("from-flag".to_string()), Some(path)).unwrap();
+        assert_eq!(resolved.as_deref(), Some("from-flag"));
+    }
+
+    #[test]
+    fn resolve_mirror_key_falls_back_to_the_file_and_trims_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bearer");
+        std::fs::write(&path, "sentinel-bearer\n").unwrap();
+        let resolved = resolve_mirror_key(None, Some(path)).unwrap();
+        assert_eq!(resolved.as_deref(), Some("sentinel-bearer"));
+    }
+
+    #[test]
+    fn resolve_mirror_key_is_none_when_both_are_unset() {
+        assert!(resolve_mirror_key(None, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_mirror_key_names_the_path_when_the_file_is_missing() {
+        let err = resolve_mirror_key(None, Some(PathBuf::from("/nonexistent/mirror-key")))
+            .unwrap_err();
+        assert!(err.to_string().contains("/nonexistent/mirror-key"));
+    }
+
+    #[test]
+    fn mirror_key_file_flag_reaches_serve_args() {
+        let args = args_from(&["--mirror-key-file", "/run/yah/secrets/mesofact/x/mirror-key"]);
+        assert_eq!(
+            args.mirror_key_file.as_deref(),
+            Some(std::path::Path::new(
+                "/run/yah/secrets/mesofact/x/mirror-key"
+            ))
+        );
+        assert!(args.mirror_key.is_none());
     }
 
     fn support(extra: &[&str]) -> mesofact_core::PolicySupport {

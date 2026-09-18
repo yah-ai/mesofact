@@ -5,8 +5,7 @@
 //!
 //! - **No-watch (T1)** — [`Server::from_workload`] points at
 //!   `<workload>/dist/html/`. Whatever's on disk is served; no rebuild
-//!   orchestration. Useful for the local-static reconciler (R255-T3) when it
-//!   owns the build pipeline itself.
+//!   orchestration. Useful to any caller that owns the build pipeline itself.
 //! - **Watch (`mesofact_dev::Watcher`)** — `mesofact_dev::Watcher::start` watches `<workload>/src/`,
 //!   debounces edits, runs `bun run build`, snapshots `dist/` into
 //!   `<workload>/.mesofact-dev/gen-<N>/`, and flips the shared [`DistPointer`]
@@ -22,7 +21,11 @@
 //!
 //! Sibling tickets under R255:
 //! - R255-T1 — scaffolded the static handler + CLI (review).
-//! - R255-T3 — local-static reconciler that spawns this binary.
+//! - R255-T3 — the dev-tier reconciler that used to spawn this binary. Retired
+//!   by R584-F4: the dev tier now publishes into the camp's S3 driver and
+//!   serves through the same Worker every other tier runs, so nothing in
+//!   `yah cloud mirror up` spawns `mesofact-dev`. Running it by hand for a
+//!   watch loop is unaffected.
 //! - R255-T4 — Run-tab iframe consumes the served `dev_url`.
 //!
 //! @yah:relay(R434, "Mesofact SSR support — yah-side rollout (cube + placement)")
@@ -147,7 +150,8 @@ use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 use yah_mesofact_bundle::BundleManifest;
 
-/// Default port for the local-static provider slot.
+/// Default port. Historically the `local-static` provider slot's; kept as the
+/// bare-`mesofact-dev` default so an existing terminal habit still works.
 pub const DEFAULT_PORT: u16 = 4321;
 
 /// Cache-Control for content-addressed instance bytes (W270 §9), byte-parallel
@@ -416,7 +420,7 @@ impl Server {
 
     /// Attach the object store that backs instance-addressed (deferred) route
     /// resolution (W270 §9). In dev this is an [`S3Store`](mesofact_publisher::S3Store)
-    /// pointed at the local dev-S3 surface (`mesofact_dev::DevS3`) — the same store the
+    /// pointed at the local dev-S3 surface (`mesofact_dev::DevStore`) — the same store the
     /// publisher flips pointers and writes render-root bytes into, so the local
     /// `publish → view` loop resolves a `/<slug>` the way the edge worker does
     /// against R2. Absent → deferred routes fall through to the 404 page.

@@ -31,12 +31,14 @@
 //!
 //! **The dev object store does carry over, and is the whole of the
 //! difference.** A handler that reads or writes R2 builds its store from
-//! environment coordinates. In prod those point at Cloudflare R2; in dev
-//! nothing points anywhere, so without this the consumer either stubs the store
-//! or runs a MinIO container — precisely the "local pond emulation" W225 §2
-//! puts in this crate to avoid. [`DevServer::start`] brings up the FS-backed
-//! [`DevS3`] surface, [`DevServer::export_env`] publishes its coordinates into
-//! this process's environment, and `.mesofact-dev/s3.json` carries them for
+//! environment coordinates. In prod those point at Cloudflare R2; in dev a
+//! running `yah camp` supplies a local dev-tier S3 driver and injects its
+//! coordinates (R584-T1, W265) — precisely the "local pond emulation" W225 §2
+//! puts in this crate to avoid re-deriving per consumer. [`DevServer::start`]
+//! resolves the store ([`DevStore::resolve`] — the camp's when a camp
+//! injected one, an embedded surface otherwise),
+//! [`DevServer::export_env`] republishes them under the `R2_*` names this
+//! process's own handlers expect, and `.mesofact-dev/s3.json` carries them for
 //! out-of-process tooling (`aws s3 --endpoint-url …`, a test harness).
 //!
 //! So `mesofact_dev::serve_app` is `mesofact::serve_app` plus a local R2 and a
@@ -62,7 +64,7 @@ use anyhow::{Context, Result};
 use axum::Router;
 use tracing::{info, warn};
 
-use crate::{DevS3, DEV_S3_BUCKET};
+use crate::DevStore;
 
 /// Directory, relative to a project root, that holds dev-only scratch state —
 /// the S3 surface's backing store and its discovery file. The standalone tier's
@@ -76,17 +78,19 @@ pub const DEV_STATE_DIR: &str = ".mesofact-dev";
 /// Prefer the one-call [`serve_app`] unless your `router()` reads the store
 /// coordinates *at construction time* — see [`serve_app`]'s ordering note.
 pub struct DevServer {
-    s3: DevS3,
+    s3: DevStore,
     state_dir: PathBuf,
 }
 
 impl DevServer {
     /// Bring up the dev-tier services for a project rooted at `root`.
     ///
-    /// Starts the local object store under `<root>/.mesofact-dev/s3` and writes
-    /// its coordinates to `<root>/.mesofact-dev/s3.json`. Does **not** touch
-    /// the process environment — call [`export_env`](Self::export_env) for
-    /// that, before building any router that reads it.
+    /// Resolves the dev S3 store ([`DevStore::resolve`]) and writes its
+    /// coordinates to `<root>/.mesofact-dev/s3.json`. Does **not** touch the
+    /// process environment — call [`export_env`](Self::export_env) for that,
+    /// before building any router that reads it. Errors only on a *half-set*
+    /// camp injection; with nothing injected it starts an embedded store under
+    /// the state dir, so a standalone `mes` works with no camp.
     pub async fn start(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         // Canonicalize so the state dir does not move under a handler that
@@ -99,11 +103,12 @@ impl DevServer {
             .await
             .with_context(|| format!("creating dev state dir {}", state_dir.display()))?;
 
-        let s3 = DevS3::start(state_dir.join("s3"), DEV_S3_BUCKET).await?;
+        let s3 = DevStore::resolve(&state_dir).await?;
         info!(
             endpoint = %s3.endpoint,
             bucket = %s3.bucket,
-            "mesofact-dev: local object store ready (stands in for R2)",
+            provenance = ?s3.provenance,
+            "mesofact-dev: dev object store resolved (stands in for R2)",
         );
 
         // Discovery file for out-of-process tooling. Best-effort on purpose:
@@ -120,7 +125,7 @@ impl DevServer {
     }
 
     /// Coordinates of the running local object store.
-    pub fn s3(&self) -> &DevS3 {
+    pub fn s3(&self) -> &DevStore {
         &self.s3
     }
 
@@ -131,7 +136,7 @@ impl DevServer {
 
     /// Publish the store coordinates into this process's environment
     /// (`R2_ENDPOINT`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`
-    /// — see [`DevS3::env_vars`]), so a handler that builds its store from env
+    /// — see [`DevStore::env_vars`]), so a handler that builds its store from env
     /// resolves against the local bucket with no dev-specific code.
     ///
     /// Existing values are **overwritten**: a dev binary that left a real
@@ -191,94 +196,123 @@ pub async fn serve_app(app: Router, addr: SocketAddr) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::{Request, StatusCode};
+    use crate::test_support::ENV_LOCK;
     use tempfile::tempdir;
 
+    const REQUIRED_ENV: [&str; 4] = [
+        "S3_ENDPOINT",
+        "S3_BUCKET",
+        "S3_ACCESS_KEY_ID",
+        "S3_SECRET_ACCESS_KEY",
+    ];
+
+    fn set_camp_env() {
+        std::env::set_var("S3_ENDPOINT", "http://127.0.0.1:54321");
+        std::env::set_var("S3_BUCKET", "dev");
+        std::env::set_var("S3_ACCESS_KEY_ID", "ak");
+        std::env::set_var("S3_SECRET_ACCESS_KEY", "sk");
+    }
+
+    fn clear_camp_env() {
+        for var in REQUIRED_ENV {
+            std::env::remove_var(var);
+        }
+        for var in ["R2_ENDPOINT", "R2_BUCKET", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"] {
+            std::env::remove_var(var);
+        }
+    }
+
     #[tokio::test]
-    async fn start_creates_state_dir_and_discovery_file() {
+    async fn start_reads_camp_coordinates_and_writes_discovery_file() {
+        let _guard = ENV_LOCK.lock().await;
+        clear_camp_env();
+        set_camp_env();
+
         let root = tempdir().unwrap();
         let dev = DevServer::start(root.path()).await.unwrap();
 
         assert_eq!(dev.state_dir(), dev.state_dir().canonicalize().unwrap());
         assert!(dev.state_dir().ends_with(DEV_STATE_DIR));
-        assert!(dev.state_dir().join("s3").join(DEV_S3_BUCKET).is_dir());
+        assert_eq!(dev.s3().endpoint, "http://127.0.0.1:54321");
+        assert_eq!(dev.s3().bucket, "dev");
 
         let discovery: serde_json::Value = serde_json::from_slice(
             &std::fs::read(dev.state_dir().join("s3.json")).expect("discovery file written"),
         )
         .unwrap();
         assert_eq!(discovery["endpoint"], dev.s3().endpoint);
-        assert_eq!(discovery["bucket"], DEV_S3_BUCKET);
+        assert_eq!(discovery["bucket"], dev.s3().bucket);
+
+        clear_camp_env();
     }
 
-    /// The point of the entry point: a plain Rust handler that builds its
-    /// object store the way a prod handler does — from `R2_*` env — resolves
-    /// against the local surface, with nothing dev-specific in the handler.
-    ///
-    /// Drives the router through the same [`mesofact::wrap`] stack
-    /// [`DevServer::serve`] serves it under, so the probe routes and the
-    /// caller's routes are proven to coexist rather than assumed to.
-    #[cfg(feature = "ssr")]
+    /// The restored embedded arm at the `DevServer` level: with no camp injecting anything,
+    /// `start` must still come up — on an embedded store — and must still
+    /// publish a discovery file, because the standalone tier of
+    /// `check-mesofact-new.sh` reads `.mesofact-dev/s3.json` and dials what it
+    /// finds there. R584-T1 made this case an error; that is what broke the
+    /// release gate.
     #[tokio::test]
-    async fn handler_reads_r2_from_env_against_the_dev_surface() {
-        use axum::body::Body;
-        use axum::routing::get;
-        use mesofact_publisher::{ObjectStore, S3Store};
-        use tower::ServiceExt;
+    async fn start_comes_up_on_an_embedded_store_when_nothing_is_injected() {
+        let _guard = ENV_LOCK.lock().await;
+        clear_camp_env();
+
+        let root = tempdir().unwrap();
+        let dev = DevServer::start(root.path()).await.expect("no camp is fine");
+
+        assert_eq!(dev.s3().provenance, crate::StoreProvenance::Embedded);
+        assert_eq!(dev.s3().bucket, crate::EMBEDDED_BUCKET);
+        assert!(dev.state_dir().join("s3").join(crate::EMBEDDED_BUCKET).is_dir());
+
+        let discovery: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dev.state_dir().join("s3.json")).expect("discovery file written"),
+        )
+        .unwrap();
+        assert_eq!(discovery["endpoint"], dev.s3().endpoint);
+        // The advertised endpoint answers — the same assertion the smoke's
+        // library tier makes against this file.
+        let addr = dev.s3().endpoint.trim_start_matches("http://");
+        tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("the advertised endpoint accepts");
+
+        clear_camp_env();
+    }
+
+    /// A half-set injection stays a hard error: the embedded arm is for "no
+    /// camp", not for "camp wired up wrong".
+    #[tokio::test]
+    async fn start_errors_on_a_half_set_injection() {
+        let _guard = ENV_LOCK.lock().await;
+        clear_camp_env();
+        std::env::set_var("S3_ENDPOINT", "http://127.0.0.1:54321");
+
+        let root = tempdir().unwrap();
+        let err = match DevServer::start(root.path()).await {
+            Ok(_) => panic!("expected an error on a half-set injection"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("S3_BUCKET"), "{err}");
+        assert!(err.contains("half-set"), "{err}");
+
+        clear_camp_env();
+    }
+
+    #[tokio::test]
+    async fn export_env_publishes_r2_coordinates_from_camp_env() {
+        let _guard = ENV_LOCK.lock().await;
+        clear_camp_env();
+        set_camp_env();
 
         let root = tempdir().unwrap();
         let dev = DevServer::start(root.path()).await.unwrap();
         dev.export_env();
 
-        // Seed the bucket over plain HTTP, as any out-of-process tool would.
-        let put = reqwest::Client::new()
-            .put(format!("{}/{}/greeting.txt", dev.s3().endpoint, dev.s3().bucket))
-            .body("hello from the dev store")
-            .send()
-            .await
-            .unwrap();
-        assert!(put.status().is_success(), "seed PUT status: {}", put.status());
+        assert_eq!(std::env::var("R2_ENDPOINT").unwrap(), "http://127.0.0.1:54321");
+        assert_eq!(std::env::var("R2_BUCKET").unwrap(), "dev");
+        assert_eq!(std::env::var("R2_ACCESS_KEY_ID").unwrap(), "ak");
+        assert_eq!(std::env::var("R2_SECRET_ACCESS_KEY").unwrap(), "sk");
 
-        // A handler with no knowledge of dev: env in, bytes out.
-        async fn greeting() -> String {
-            let store = S3Store::new(
-                std::env::var("R2_ENDPOINT").unwrap(),
-                std::env::var("R2_BUCKET").unwrap(),
-                "auto",
-                std::env::var("R2_ACCESS_KEY_ID").unwrap(),
-                std::env::var("R2_SECRET_ACCESS_KEY").unwrap(),
-            )
-            .unwrap();
-            let bytes = store.get("greeting.txt").await.unwrap().unwrap();
-            String::from_utf8(bytes.to_vec()).unwrap()
-        }
-
-        let app = mesofact::wrap(Router::new().route("/greeting", get(greeting)));
-
-        let response = app
-            .clone()
-            .oneshot(Request::builder().uri("/greeting").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(
-            String::from_utf8(body.to_vec()).unwrap(),
-            "hello from the dev store"
-        );
-
-        // …and the standard stack is still there around it.
-        let probe = app
-            .oneshot(
-                Request::builder()
-                    .uri(mesofact::LIVE_PATH)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(probe.status(), StatusCode::OK);
+        clear_camp_env();
     }
 }

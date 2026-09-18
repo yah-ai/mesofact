@@ -19,7 +19,7 @@ pub enum ConfigError {
     Parse(String),
     #[error("missing [publish] section in {0} — declare it to enable real-network publish, or pass --in-memory")]
     MissingPublish(String),
-    #[error("missing env var {var} referenced by mesofact.config.toml {field}")]
+    #[error("missing env var {var} (or {var}_FILE) referenced by mesofact.config.toml {field}")]
     MissingEnv { var: String, field: String },
 }
 
@@ -93,9 +93,46 @@ impl PublishConfig {
         let body = fs::read_to_string(path).await?;
         let parsed: ConfigFile = toml::from_str(&body)
             .map_err(|e| ConfigError::Parse(format!("{}: {e}", path.display())))?;
-        parsed
+        let publish = parsed
             .publish
-            .ok_or_else(|| ConfigError::MissingPublish(path.display().to_string()))
+            .ok_or_else(|| ConfigError::MissingPublish(path.display().to_string()))?;
+        publish.reject_placeholders(path)?;
+        Ok(publish)
+    }
+
+    /// Refuse a config still carrying the template's literal placeholders.
+    ///
+    /// This has now been a live landmine three times — `app/yah/web/marketing`
+    /// (R330-T35), `app/yah/web/analytics` (R556-F6) and `app/yah/web/dashboard`
+    /// (R891-B6) — and each one survived for months because the failure is
+    /// *deferred*: `publish` only purges when the cache-tag diff is non-empty,
+    /// so every content-identical publish skips the purge and reports success.
+    /// The first publish that actually changes a file POSTs to
+    /// `zones/ZONE_ID/purge_cache`, takes a 400, and fails the run — after the
+    /// objects have already been uploaded, which is the worst moment to learn.
+    ///
+    /// Failing at load turns a deferred, half-applied publish into an immediate
+    /// refusal that names the field. Placeholders stay correct in a *template*;
+    /// they are only wrong in a config something tries to publish with, and
+    /// this is the exact seam between the two.
+    fn reject_placeholders(&self, path: &Path) -> Result<(), ConfigError> {
+        const PLACEHOLDERS: &[&str] = &["ACCOUNT_ID", "ZONE_ID", "BUCKET_NAME"];
+        for (field, value) in [
+            ("endpoint", &self.endpoint),
+            ("zone_id", &self.zone_id),
+            ("bucket", &self.bucket),
+        ] {
+            if let Some(found) = PLACEHOLDERS.iter().find(|p| value.contains(**p)) {
+                return Err(ConfigError::Parse(format!(
+                    "{}: [publish].{field} still holds the template placeholder \
+                     `{found}` — substitute the real value before publishing. \
+                     Neither the Cloudflare account id nor the zone id is a \
+                     secret; both are readable from the Cloudflare dashboard.",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Apply CLI flag overrides — non-`None` values win over the file.
@@ -127,8 +164,24 @@ impl PublishConfig {
     }
 }
 
+/// Resolves a credential by NAME, value-first. If `<name>` is unset but
+/// `<name>_FILE` is, reads and trims the file it points to — the mount-path
+/// delivery form used by the SecretMount + SecretTarget::File path (R876-B16),
+/// so a receiver that can read either form is safe regardless of which one
+/// the sender emits.
 fn env_required(name: &str, field: &str) -> Result<String, ConfigError> {
-    std::env::var(name).map_err(|_| ConfigError::MissingEnv {
+    if let Ok(v) = std::env::var(name) {
+        return Ok(v);
+    }
+    let file_var = format!("{name}_FILE");
+    if let Ok(path) = std::env::var(&file_var) {
+        let contents = std::fs::read_to_string(&path).map_err(|_| ConfigError::MissingEnv {
+            var: name.to_string(),
+            field: field.to_string(),
+        })?;
+        return Ok(contents.trim().to_string());
+    }
+    Err(ConfigError::MissingEnv {
         var: name.to_string(),
         field: field.to_string(),
     })
@@ -155,6 +208,32 @@ zone_id = "deadbeef"
         assert_eq!(cfg.region, "auto");
         assert_eq!(cfg.access_key_id_env, "MESOFACT_S3_ACCESS_KEY_ID");
         assert_eq!(cfg.api_token_env, "CLOUDFLARE_API_TOKEN");
+    }
+
+    /// R891-B6: the template placeholders must fail at load, not at the first
+    /// content-changing publish. Three separate configs shipped with these
+    /// literals and each was found by hand months later.
+    #[tokio::test]
+    async fn load_rejects_unsubstituted_placeholders() {
+        for (field, toml) in [
+            (
+                "endpoint",
+                "[publish]\nbucket=\"b\"\nendpoint=\"https://ACCOUNT_ID.r2.cloudflarestorage.com\"\nzone_id=\"deadbeef\"\n",
+            ),
+            (
+                "zone_id",
+                "[publish]\nbucket=\"b\"\nendpoint=\"https://acct.r2.cloudflarestorage.com\"\nzone_id=\"ZONE_ID\"\n",
+            ),
+        ] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("mesofact.config.toml");
+            tokio::fs::write(&path, toml).await.unwrap();
+            let err = PublishConfig::load(&path)
+                .await
+                .expect_err("placeholder must be refused");
+            let msg = err.to_string();
+            assert!(msg.contains(field), "error should name the field: {msg}");
+        }
     }
 
     #[tokio::test]
@@ -188,6 +267,42 @@ zone_id = "deadbeef"
             .unwrap();
         let err = PublishConfig::load(&path).await.unwrap_err();
         assert!(matches!(err, ConfigError::MissingPublish(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn env_required_falls_back_to_file_when_value_var_unset() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("secret.txt");
+        std::fs::write(&path, "sentinel-value\n").unwrap();
+        let name = "MESOFACT_TEST_CRED_ENV_REQUIRED_FALLBACK";
+        let file_var = format!("{name}_FILE");
+        // SAFETY: test-local env vars, no other test reads this name.
+        unsafe {
+            std::env::remove_var(name);
+            std::env::set_var(&file_var, &path);
+        }
+        let result = env_required(name, "test_field");
+        unsafe {
+            std::env::remove_var(&file_var);
+        }
+        assert_eq!(result.unwrap(), "sentinel-value");
+    }
+
+    #[test]
+    fn env_required_prefers_value_var_over_file() {
+        let name = "MESOFACT_TEST_CRED_ENV_REQUIRED_PREFERENCE";
+        let file_var = format!("{name}_FILE");
+        // SAFETY: test-local env vars, no other test reads this name.
+        unsafe {
+            std::env::set_var(name, "direct-value");
+            std::env::set_var(&file_var, "/nonexistent/path/should/not/be/read");
+        }
+        let result = env_required(name, "test_field");
+        unsafe {
+            std::env::remove_var(name);
+            std::env::remove_var(&file_var);
+        }
+        assert_eq!(result.unwrap(), "direct-value");
     }
 
     #[tokio::test]

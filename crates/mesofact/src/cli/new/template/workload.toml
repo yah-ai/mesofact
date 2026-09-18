@@ -10,7 +10,6 @@
 # Node. Setting it opts back out to a shell command, which is what a project
 # with its own bundler step wants.
 
-schema_version = 1
 kind = "mesofact-static"
 
 # `routes` is a TOP-LEVEL field. It must stay above [build] — TOML would scope

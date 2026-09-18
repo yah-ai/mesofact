@@ -77,10 +77,12 @@ export function buildPageRoot(manifest: EdgeManifest | null): string | null {
  * pointer, and a cached pointer is a stale site.
  */
 export async function loadManifest(
-  assetOrigin: string,
+  get: (key: string) => Promise<Response>,
 ): Promise<EdgeManifest | null> {
   try {
-    const resp = await fetch(`${assetOrigin}/manifest.json`);
+    // `get` reads one key from wherever the matched route's bytes live — an
+    // HTTP origin or an R2 binding (R560-F13).
+    const resp = await get("manifest.json");
     if (!resp.ok) {
       return null;
     }

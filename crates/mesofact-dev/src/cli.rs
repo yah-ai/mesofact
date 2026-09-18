@@ -400,14 +400,20 @@ async fn dev(args: DevArgs) -> anyhow::Result<()> {
     #[cfg(feature = "ssr")]
     let ssr_slot = server.ssr_slot();
 
-    // Dev-tier S3 surface (R490-F7): host a local s3s-fs bucket so a workload's
-    // @mesofact/runtime R2Adapter can resolve against it during dev instead of
-    // real Cloudflare R2. Coords go to .mesofact-dev/s3.json for discovery,
-    // into the build child's env below, AND (R444) into the in-process SSR
-    // isolate's env — started before the SSR spawn below so the first boot
-    // already has coordinates, not just post-build respawns.
-    let dev_s3 = crate::DevS3::start(state_dir.join("s3"), crate::DEV_S3_BUCKET).await?;
-    info!(endpoint = %dev_s3.endpoint, bucket = %dev_s3.bucket, "dev S3 surface ready");
+    // Dev-tier S3 coordinates (R584-T1, partly reversed 2026-09-17): prefer the store a running
+    // `yah camp` injected, and start an embedded one when there is no camp, so
+    // a workload's @mesofact/runtime R2Adapter can resolve against it during
+    // dev instead of real Cloudflare R2. Coords go to .mesofact-dev/s3.json for
+    // discovery, into the build child's env below, AND (R444) into the
+    // in-process SSR isolate's env — resolved before the SSR spawn below so the
+    // first boot already has coordinates, not just post-build respawns.
+    let dev_s3 = crate::DevStore::resolve(&state_dir).await?;
+    info!(
+        endpoint = %dev_s3.endpoint,
+        bucket = %dev_s3.bucket,
+        provenance = ?dev_s3.provenance,
+        "dev S3 coordinates resolved",
+    );
 
     // Attach an SSR child if the workload's manifest declares any mode:"ssr"
     // routes. ssr::spawn returns Ok(None) for static/SPA-only workloads (or
@@ -437,12 +443,18 @@ async fn dev(args: DevArgs) -> anyhow::Result<()> {
     // S3Store at the dev-S3 surface so a static miss on a `prerender:
     // { deferred: true }` route resolves through the pointer store against the
     // same local bucket the publisher flips into — the local mirror of the edge
-    // worker's R2 resolution. Region "auto" + dummy creds match R2 / the
-    // anonymous dev surface (s3s skips signature verification).
+    // worker's R2 resolution. Region "auto" + the camp-injected creds match
+    // what the dev-tier S3 driver actually enforces.
     #[cfg(feature = "ssr")]
     {
         use mesofact_publisher::{ObjectStore, S3Store};
-        match S3Store::new(dev_s3.endpoint.clone(), dev_s3.bucket.clone(), "auto", "dev", "dev") {
+        match S3Store::new(
+            dev_s3.endpoint.clone(),
+            dev_s3.bucket.clone(),
+            "auto",
+            dev_s3.access_key_id.clone(),
+            dev_s3.secret_access_key.clone(),
+        ) {
             Ok(store) => {
                 server = server.with_instance_store(Arc::new(store) as Arc<dyn ObjectStore>);
                 info!("mesofact-dev: instance-addressed route resolution wired to dev S3 (W270 §9)");

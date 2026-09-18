@@ -41,33 +41,82 @@ async function makeMf(cfg: {
   issuesOrigin?: string;
   uploadOrigin?: string;
   routeHeaders?: { path: string; headers: Record<string, string> }[];
-  /** Escape hatch for the malformed-binding case, which the typed
-   *  `routeHeaders` field cannot express. */
-  rawRouteHeaders?: string;
+  /** Escape hatch for the malformed-binding cases, which the typed fields
+   *  cannot express. */
+  rawRouteTable?: string;
 }): Promise<MfSetup> {
   const { port, stop } = startAssetServer(cfg.assets);
+  const assetOrigin = `http://localhost:${port}`;
   const bindings: Record<string, string> = {
-    ASSET_ORIGIN: `http://localhost:${port}`,
+    ASSET_ORIGIN: assetOrigin,
     WORKER_MODE: cfg.mode,
-    SSR_ORIGIN: cfg.ssrOrigin ?? "",
-    SSR_PREFIXES: JSON.stringify(cfg.ssrPrefixes ?? []),
+    ROUTE_TABLE: cfg.rawRouteTable ?? JSON.stringify(routeTable(cfg, assetOrigin)),
   };
-  if (cfg.uploadOrigin !== undefined) {
-    bindings.UPLOAD_ORIGIN = cfg.uploadOrigin;
-  }
-  if (cfg.mesofactBackendOrigin) {
-    bindings.MESOFACT_BACKEND_ORIGIN = cfg.mesofactBackendOrigin;
-  }
-  if (cfg.issuesOrigin) {
-    bindings.ISSUES_ORIGIN = cfg.issuesOrigin;
-  }
-  if (cfg.rawRouteHeaders !== undefined) {
-    bindings.ROUTE_HEADERS = cfg.rawRouteHeaders;
-  } else if (cfg.routeHeaders) {
-    bindings.ROUTE_HEADERS = JSON.stringify(cfg.routeHeaders);
-  }
   const mf = new Miniflare({ modules: true, scriptPath: BUNDLE, bindings });
   return { mf, port, stop };
+}
+
+/**
+ * The fixture's stand-in for the producer — it composes the same table
+ * `worker_route_table_json` (oss/yubaba/crates/cloud/src/reconciler/mesofact_static.rs)
+ * emits from a mirror's slot fields plus the domain manifest, IN THE SAME
+ * ORDER, because order is the contract: the interception entries precede the
+ * declared ones, which is the precedence the four deleted `if` blocks had
+ * (backends over SSR, SSR over uploads, everything over the static catch-all).
+ *
+ * Keeping the per-seam `cfg` fields is deliberate: the behaviour tests below
+ * were written against those seams and must go on asserting exactly what they
+ * asserted before R898-F3 — only the way the config reaches the Worker moved.
+ */
+function routeTable(
+  cfg: {
+    ssrOrigin?: string;
+    ssrPrefixes?: string[];
+    mesofactBackendOrigin?: string;
+    issuesOrigin?: string;
+    uploadOrigin?: string;
+    routeHeaders?: { path: string; headers: Record<string, string> }[];
+  },
+  assetOrigin: string,
+): unknown[] {
+  const entries: unknown[] = [];
+  if (cfg.issuesOrigin) {
+    entries.push({
+      path: "/api/issues*",
+      mode: "backend",
+      origin: cfg.issuesOrigin,
+      rewrite: { from: "/api/issues", to: "/issues" },
+    });
+  }
+  if (cfg.mesofactBackendOrigin) {
+    entries.push({
+      path: "/api/releases*",
+      mode: "backend",
+      origin: cfg.mesofactBackendOrigin,
+      rewrite: { from: "/api/releases", to: "/releases" },
+    });
+  }
+  if (cfg.ssrOrigin) {
+    for (const prefix of cfg.ssrPrefixes ?? []) {
+      entries.push({ path: `${prefix}*`, mode: "backend", origin: cfg.ssrOrigin });
+    }
+  }
+  if (cfg.uploadOrigin) {
+    entries.push({
+      path: "/uploads/*",
+      mode: "backend",
+      origin: cfg.uploadOrigin,
+    });
+  }
+  for (const rule of cfg.routeHeaders ?? []) {
+    entries.push({
+      path: rule.path,
+      mode: "static",
+      origin: assetOrigin,
+      headers: rule.headers,
+    });
+  }
+  return entries;
 }
 
 // ── static mode ──────────────────────────────────────────────────────────────
@@ -136,7 +185,13 @@ describe("static mode", () => {
 // ── /uploads/ prefix routing (R490-T8) ──────────────────────────────────────
 
 describe("uploads prefix", () => {
-  test("/uploads/* returns 404 when UPLOAD_ORIGIN is unset", async () => {
+  // R898-F3: the reserved upload seam (R490-T8) is a TABLE ENTRY now, not a
+  // binding plus an `if`. "Unset" therefore means "no /uploads/* entry", and
+  // the path falls to the static tier — which 404s it, since no upload key is
+  // a published asset. The old seam short-circuited to a hand-built 404 to
+  // keep the SPA shell out of an upload miss; a matched backend entry never
+  // falls back to static serving either, so that invariant is unchanged.
+  test("/uploads/* 404s when no upload entry is declared", async () => {
     const setup = await makeMf({
       mode: "static",
       assets: { "index.html": { body: "<h1>hi</h1>", type: "text/html" } },
@@ -148,7 +203,7 @@ describe("uploads prefix", () => {
     setup.stop();
   });
 
-  test("/uploads/* routes to UPLOAD_ORIGIN when set", async () => {
+  test("/uploads/* routes to the upload origin when declared", async () => {
     const uploads = Bun.serve({
       port: 0,
       fetch(req) {
@@ -167,9 +222,13 @@ describe("uploads prefix", () => {
     const hit = await setup.mf.dispatchFetch("http://w.test/uploads/pic.png");
     expect(hit.status).toBe(200);
     expect(await hit.text()).toBe("UPLOADBYTES");
+    // The upstream's own 404 now reaches the client verbatim, where the old
+    // seam replaced any non-ok response with a hand-built "Not Found". The
+    // property that matters is unchanged and asserted: a miss is a REAL 404
+    // and never the static site's shell or 404.html.
     const miss = await setup.mf.dispatchFetch("http://w.test/uploads/absent.png");
     expect(miss.status).toBe(404);
-    expect(await miss.text()).toBe("Not Found");
+    expect(await miss.text()).not.toContain("<h1>hi</h1>");
     await setup.mf.dispose();
     setup.stop();
     uploads.stop(true);
@@ -801,8 +860,9 @@ describe("parametric prerender instances (non-deferred)", () => {
 
 // ── R746: per-route response headers ─────────────────────────────────────────
 //
-// The domain manifest's `[[routes]].headers` reach the Worker as ROUTE_HEADERS
-// and are stamped onto the response. The motivating case is COOP/COEP on a wasm
+// The domain manifest's `[[routes]].headers` reach the Worker as the `headers`
+// column of ROUTE_TABLE (R898-F3 folded the separate ROUTE_HEADERS binding into
+// it) and are stamped onto the response. The motivating case is COOP/COEP on a wasm
 // sub-app: without both headers the document loses `SharedArrayBuffer` silently,
 // so "the header made it onto the bytes the browser actually got" is the only
 // assertion that means anything — hence these go through miniflare rather than
@@ -956,7 +1016,7 @@ describe("route-header front-door parity fixture", () => {
   }
 });
 
-describe("no ROUTE_HEADERS binding", () => {
+describe("no ROUTE_TABLE binding", () => {
   let setup: MfSetup;
 
   beforeAll(async () => {
@@ -979,14 +1039,14 @@ describe("no ROUTE_HEADERS binding", () => {
   });
 });
 
-describe("malformed ROUTE_HEADERS binding", () => {
+describe("malformed ROUTE_TABLE binding", () => {
   let setup: MfSetup;
 
   beforeAll(async () => {
     setup = await makeMf({
       mode: "static",
       assets: { "index.html": { body: "<h1>hello</h1>", type: "text/html" } },
-      rawRouteHeaders: "{not json",
+      rawRouteTable: "{not json",
     });
   });
 
@@ -995,30 +1055,34 @@ describe("malformed ROUTE_HEADERS binding", () => {
     setup.stop();
   });
 
-  // The producer is Rust, so a malformed value is a bug there — but the site
-  // staying up beats every request 500ing on a config typo.
-  test("serves without extra headers rather than failing the request", async () => {
+  // R898-F3 decision 2, and a DELIBERATE change of posture from R749-T1's
+  // header-only leniency. A table that will not parse is not a missing
+  // header — this door does not know where anything goes, and the catch-all
+  // it would otherwise fall through to is exactly how /api/releases 404'd
+  // silently while the site looked healthy. The Rust origin refuses to start
+  // on the same input; failing the request closed is the Worker's analogue.
+  test("fails the request closed instead of falling through to the catch-all", async () => {
     const resp = await setup.mf.dispatchFetch("http://w.test/");
-    expect(resp.status).toBe(200);
-    expect(await resp.text()).toContain("hello");
+    expect(resp.status).toBe(503);
+    expect(await resp.text()).not.toContain("hello");
   });
 });
 
 // R749-T1. A table with one bad rule used to have its OTHER rules applied, so
-// the site looked configured while one path silently was not — the exact shape
-// of "declared and not enforced" this ticket forbids, one rule deep instead of
-// one field deep. All-or-nothing: if the table cannot be trusted, none of it is
-// applied, and the log line says so.
-describe("partially malformed ROUTE_HEADERS binding", () => {
+// the site looked configured while one path silently was not. All-or-nothing
+// still holds, and R898-F3 hardens it: an entry that is not shaped like an
+// entry means the ROUTING is untrustworthy, not just the headers, so the
+// request fails closed rather than serving with the half that parsed.
+describe("partially malformed ROUTE_TABLE binding", () => {
   let setup: MfSetup;
 
   beforeAll(async () => {
     setup = await makeMf({
       mode: "static",
       assets: { "index.html": { body: "<h1>hello</h1>", type: "text/html" } },
-      rawRouteHeaders: JSON.stringify([
-        { path: "/*", headers: { "X-Good": "1" } },
-        { path: 42, headers: {} },
+      rawRouteTable: JSON.stringify([
+        { path: "/*", mode: "static", headers: { "X-Good": "1" } },
+        { path: 42, mode: "static", headers: {} },
       ]),
     });
   });
@@ -1028,9 +1092,9 @@ describe("partially malformed ROUTE_HEADERS binding", () => {
     setup.stop();
   });
 
-  test("applies none of the table rather than the half that parsed", async () => {
+  test("applies none of the table and serves none of it", async () => {
     const resp = await setup.mf.dispatchFetch("http://w.test/");
-    expect(resp.status).toBe(200);
+    expect(resp.status).toBe(503);
     expect(resp.headers.get("X-Good")).toBeNull();
   });
 });
@@ -1041,15 +1105,19 @@ describe("partially malformed ROUTE_HEADERS binding", () => {
 // likely typo in the hand-written manifest that produces this table. The
 // producer now refuses it at `yah cloud apply`
 // (`DomainConfig::validate_route_headers`); the edge degrades if one gets past.
-describe("ROUTE_HEADERS binding whose header cannot be set", () => {
+describe("ROUTE_TABLE entry whose header cannot be set", () => {
   let setup: MfSetup;
 
   beforeAll(async () => {
     setup = await makeMf({
       mode: "static",
       assets: { "index.html": { body: "<h1>hello</h1>", type: "text/html" } },
-      rawRouteHeaders: JSON.stringify([
-        { path: "/*", headers: { "Cross Origin Opener Policy": "same-origin" } },
+      rawRouteTable: JSON.stringify([
+        {
+          path: "/*",
+          mode: "static",
+          headers: { "Cross Origin Opener Policy": "same-origin" },
+        },
       ]),
     });
   });
@@ -1072,14 +1140,16 @@ describe("ROUTE_HEADERS binding whose header cannot be set", () => {
 // direction: `Headers.set` coerces it and serves the header, while
 // `RouteHeaderTable::parse` refuses the table, so the same manifest is enforced
 // at one front door and refused at the other.
-describe("ROUTE_HEADERS binding with a non-string header value", () => {
+describe("ROUTE_TABLE entry with a non-string header value", () => {
   let setup: MfSetup;
 
   beforeAll(async () => {
     setup = await makeMf({
       mode: "static",
       assets: { "index.html": { body: "<h1>hello</h1>", type: "text/html" } },
-      rawRouteHeaders: JSON.stringify([{ path: "/*", headers: { "X-Count": 1 } }]),
+      rawRouteTable: JSON.stringify([
+        { path: "/*", mode: "static", headers: { "X-Count": 1 } },
+      ]),
     });
   });
 
@@ -1092,5 +1162,271 @@ describe("ROUTE_HEADERS binding with a non-string header value", () => {
     const resp = await setup.mf.dispatchFetch("http://w.test/");
     expect(resp.status).toBe(200);
     expect(resp.headers.get("X-Count")).toBeNull();
+  });
+});
+
+// ── R898-F3: the table's own vocabulary ──────────────────────────────────────
+//
+// The two `/api/*` describes above prove the rewrite on the two seams that
+// happen to exist today. These prove the MECHANISM — that a prefix swap is
+// route data any entry can carry, which is what makes the next backend prefix
+// a manifest edit instead of a fifth `if` block in this file.
+
+describe("backend entry with a declared rewrite", () => {
+  let setup: MfSetup;
+  let stopOrigin: () => void;
+
+  beforeAll(async () => {
+    const origin = Bun.serve({
+      port: 0,
+      fetch(req) {
+        const url = new URL(req.url);
+        return new Response(`origin:${url.pathname}${url.search}`, { status: 200 });
+      },
+    });
+    stopOrigin = () => origin.stop(true);
+    setup = await makeMf({
+      mode: "static",
+      assets: { "index.html": { body: "<h1>home</h1>", type: "text/html" } },
+      rawRouteTable: JSON.stringify([
+        {
+          path: "/docs/*",
+          mode: "backend",
+          origin: `http://localhost:${origin.port}`,
+          rewrite: { from: "/docs", to: "/v2/documentation" },
+        },
+        {
+          path: "/raw/*",
+          mode: "backend",
+          origin: `http://localhost:${origin.port}`,
+        },
+      ]),
+    });
+  });
+
+  afterAll(async () => {
+    await setup.mf.dispose();
+    setup.stop();
+    stopOrigin();
+  });
+
+  test("the sub-path survives the prefix swap", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/docs/guide/intro");
+    expect(await resp.text()).toBe("origin:/v2/documentation/guide/intro");
+  });
+
+  test("the bare prefix rewrites too — it is the URL a link points at", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/docs");
+    expect(await resp.text()).toBe("origin:/v2/documentation");
+  });
+
+  test("the query string is preserved across the rewrite", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/docs/x?q=1&r=2");
+    expect(await resp.text()).toBe("origin:/v2/documentation/x?q=1&r=2");
+  });
+
+  test("an entry with no rewrite is an identity proxy", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/raw/thing");
+    expect(await resp.text()).toBe("origin:/raw/thing");
+  });
+
+  test("a path no entry claims is still served from ASSET_ORIGIN", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/");
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toContain("home");
+  });
+});
+
+describe("redirect entry", () => {
+  let setup: MfSetup;
+
+  beforeAll(async () => {
+    setup = await makeMf({
+      mode: "static",
+      assets: { "index.html": { body: "<h1>home</h1>", type: "text/html" } },
+      rawRouteTable: JSON.stringify([
+        { path: "/old", mode: "redirect", target: "/new", status: 301 },
+        { path: "/moved", mode: "redirect", target: "https://elsewhere.test/" },
+      ]),
+    });
+  });
+
+  afterAll(async () => {
+    await setup.mf.dispose();
+    setup.stop();
+  });
+
+  test("emits the declared status and Location", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/old", {
+      redirect: "manual",
+    });
+    expect(resp.status).toBe(301);
+    expect(resp.headers.get("Location")).toBe("/new");
+  });
+
+  // 308 keeps the method, so a deprecated POST endpoint does not silently
+  // become a GET at its new home — the reason the Rust default is 308.
+  test("defaults to 308 when the entry declares no status", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/moved", {
+      redirect: "manual",
+    });
+    expect(resp.status).toBe(308);
+    expect(resp.headers.get("Location")).toBe("https://elsewhere.test/");
+  });
+});
+
+// A backend entry the producer could never emit (it refuses an unresolved
+// origin), reachable only by hand-editing the binding. It must not fall
+// through to the asset bucket: a 200 of the wrong bytes is the failure mode
+// this whole relay exists to remove.
+// ── R560-F13: a static entry serves from ITS OWN source ─────────────────────
+//
+// One Worker fronting several R2 buckets (cdn.noisetable.com) plus a component
+// entry with its own origin. Every bucket that could answer for a key is seeded
+// with a decoy under that key, so a hit proves WHICH source answered.
+
+describe("static entries serve from the matched entry's source", () => {
+  let mf: Miniflare;
+  let fallback: { port: number; stop: () => void };
+  let docs: { port: number; stop: () => void };
+
+  beforeAll(async () => {
+    fallback = startAssetServer({
+      "other.txt": { body: "from ASSET_ORIGIN", type: "text/plain" },
+      "docs/guide.html": { body: "WRONG: the catch-all", type: "text/html" },
+      "engine/dev/latest.txt": { body: "WRONG: the catch-all", type: "text/plain" },
+    });
+    docs = startAssetServer({
+      "docs/guide.html": { body: "from the docs entry's origin", type: "text/html" },
+    });
+    const table = [
+      {
+        path: "/engine/*",
+        mode: "static",
+        bucket: "noisetable-releases",
+        binding: "R2_NOISETABLE_RELEASES",
+        auth: "anonymous",
+      },
+      {
+        path: "/nt-cas/*",
+        mode: "static",
+        bucket: "noisetable-assets",
+        binding: "R2_NOISETABLE_ASSETS",
+        auth: "anonymous",
+      },
+      {
+        path: "/docs/*",
+        mode: "static",
+        component: "handbook/site",
+        origin: `http://localhost:${docs.port}`,
+        auth: "anonymous",
+      },
+      {
+        path: "/unbound/*",
+        mode: "static",
+        bucket: "nowhere",
+        binding: "R2_NOWHERE",
+        auth: "anonymous",
+      },
+    ];
+    mf = new Miniflare({
+      modules: true,
+      scriptPath: BUNDLE,
+      bindings: {
+        ASSET_ORIGIN: `http://localhost:${fallback.port}`,
+        WORKER_MODE: "static",
+        ROUTE_TABLE: JSON.stringify(table),
+      },
+      r2Buckets: ["R2_NOISETABLE_RELEASES", "R2_NOISETABLE_ASSETS"],
+    });
+    const releases = await mf.getR2Bucket("R2_NOISETABLE_RELEASES");
+    await releases.put("engine/dev/latest.txt", "0.9.1", {
+      httpMetadata: { contentType: "text/plain" },
+    });
+    await releases.put("engine/index.html", "<h1>engine</h1>", {
+      httpMetadata: { contentType: "text/html" },
+    });
+    await releases.put("nt-cas/ab/cd", "WRONG: the releases bucket");
+    const assets = await mf.getR2Bucket("R2_NOISETABLE_ASSETS");
+    await assets.put("nt-cas/ab/cd", "cas blob", {
+      httpMetadata: {
+        contentType: "application/octet-stream",
+        cacheControl: "public, max-age=31536000, immutable",
+      },
+    });
+  });
+
+  afterAll(async () => {
+    await mf.dispose();
+    fallback.stop();
+    docs.stop();
+  });
+
+  test("a bucket entry reads its binding, keyed by the request path unchanged", async () => {
+    const resp = await mf.dispatchFetch("http://w.test/engine/dev/latest.txt");
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toBe("0.9.1");
+    expect(resp.headers.get("content-type")).toBe("text/plain");
+    expect(resp.headers.get("etag")).toBeTruthy();
+  });
+
+  test("each bucket entry reads its OWN bucket, with the object's metadata", async () => {
+    const resp = await mf.dispatchFetch("http://w.test/nt-cas/ab/cd");
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toBe("cas blob");
+    expect(resp.headers.get("cache-control")).toBe(
+      "public, max-age=31536000, immutable",
+    );
+  });
+
+  test("a directory path under a bucket entry resolves index.html in that bucket", async () => {
+    const resp = await mf.dispatchFetch("http://w.test/engine/");
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toContain("engine");
+  });
+
+  test("a key the bucket lacks is a 404, never a fall-through to ASSET_ORIGIN", async () => {
+    const resp = await mf.dispatchFetch("http://w.test/engine/nope.bin");
+    expect(resp.status).toBe(404);
+  });
+
+  test("a component entry serves from its own origin, not ASSET_ORIGIN", async () => {
+    const resp = await mf.dispatchFetch("http://w.test/docs/guide.html");
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toBe("from the docs entry's origin");
+  });
+
+  test("a path no entry claims still falls back to ASSET_ORIGIN", async () => {
+    const resp = await mf.dispatchFetch("http://w.test/other.txt");
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toBe("from ASSET_ORIGIN");
+  });
+
+  test("an entry naming a binding the Worker lacks fails closed with 502", async () => {
+    const resp = await mf.dispatchFetch("http://w.test/unbound/x.txt");
+    expect(resp.status).toBe(502);
+  });
+});
+
+describe("backend entry with no origin", () => {
+  let setup: MfSetup;
+
+  beforeAll(async () => {
+    setup = await makeMf({
+      mode: "static",
+      assets: { "index.html": { body: "<h1>home</h1>", type: "text/html" } },
+      rawRouteTable: JSON.stringify([{ path: "/api/*", mode: "backend" }]),
+    });
+  });
+
+  afterAll(async () => {
+    await setup.mf.dispose();
+    setup.stop();
+  });
+
+  test("fails the path rather than serving it from the catch-all", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/api/thing");
+    expect(resp.status).toBe(502);
+    expect(await resp.text()).not.toContain("home");
   });
 });

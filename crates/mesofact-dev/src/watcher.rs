@@ -156,10 +156,10 @@ pub struct WatchOptions {
     pub debounce: Duration,
     /// Run an initial build at startup even if `dist/html/` already exists.
     pub initial_build: bool,
-    /// Extra env vars injected into the build subprocess (R490-F7). Carries
-    /// the dev S3 coords (`R2_ENDPOINT`, `R2_BUCKET`, dummy creds) so a
-    /// workload's build-time `r2` reads resolve against mesofact-dev's local
-    /// s3s-fs surface instead of real R2.
+    /// Extra env vars injected into the build subprocess (R490-F7, R584-T1).
+    /// Carries the dev S3 coords (`R2_ENDPOINT`, `R2_BUCKET`, camp-injected
+    /// creds) so a workload's build-time `r2` reads resolve against the
+    /// camp's dev-tier S3 driver instead of real R2.
     pub build_env: Vec<(String, String)>,
 }
 

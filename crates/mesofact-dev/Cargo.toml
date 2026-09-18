@@ -93,15 +93,6 @@ build = ["mesofact/build"]
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "process", "time", "sync", "io-util", "net"] }
-# Dev-tier S3 surface (R490-F7): FS-backed s3s-fs so a workload's
-# @mesofact/runtime R2Adapter resolves against a local bucket in `bun run dev`.
-# Apache-2.0; resolves cleanly here (the R274-F5 sha1/iroh-relay conflict is
-# camp-only — absent from mesofact-dev's tree).
-s3s = "0.13"
-s3s-fs = "0.13"
-# Impl of s3s::access::S3Access for the dev-S3 surface (async-trait method).
-async-trait = "0.1"
-hyper-util = { version = "0.1", features = ["server", "tokio", "http1"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
@@ -114,13 +105,23 @@ serde_json = "1"
 toml = "0.8"
 # The serving engine. This crate is now a thin dev-affordance layer ON TOP of
 # the facade rather than the crate that owned the engine (W225 §2a).
-mesofact = { path = "../mesofact", version = "0.8.37", default-features = false }
-# Direct publisher dep for the dev-S3 round-trip test (drives S3Store itself).
+mesofact = { path = "../mesofact", version = "0.8.40", default-features = false }
+# Direct publisher dep for the instance-store wiring in cli.rs (drives
+# S3Store itself against the camp-injected dev S3 coordinates).
 # `version` is required now that this crate publishes: cargo rejects a path dep
 # without one, since a path means nothing to a downstream consumer.
-mesofact-publisher = { path = "../mesofact-publisher", version = "0.8.37", optional = true }
-# HTTP client for the dev S3 round-trip. Loopback http://127.0.0.1 only — no TLS.
-reqwest = { version = "0.12", default-features = false }
+mesofact-publisher = { path = "../mesofact-publisher", version = "0.8.40", optional = true }
+# Embedded dev-tier S3 surface, restored 2026-09-17 after R584-T1 deleted it.
+# R584-T1's premise was that a `yah camp` always injects S3_* coordinates; that
+# is true inside a camp and false for every other way `mes` is run — a bare
+# `mes .` on a scaffolded project, which is the invocation the scaffold's own
+# README gives. `DevStore::resolve` prefers the camp's store and falls back to
+# this one, so the standalone tier has a store again without a camp.
+s3s = "0.13"
+s3s-fs = "0.13"
+# Impl of s3s::access::S3Access for the embedded surface (async-trait method).
+async-trait = "0.1"
+hyper-util = { version = "0.1", features = ["server", "tokio", "http1"] }
 
 [dev-dependencies]
 tempfile = "3"
