@@ -666,7 +666,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "cheers-core"
-version = "0.8.40"
+version = "0.8.41"
 dependencies = [
  "async-trait",
  "base64",
@@ -677,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "cheers-server"
-version = "0.8.40"
+version = "0.8.41"
 dependencies = [
  "async-trait",
  "base64",
@@ -696,7 +696,7 @@ dependencies = [
 
 [[package]]
 name = "cheers-verify"
-version = "0.8.40"
+version = "0.8.41"
 dependencies = [
  "async-trait",
  "cheers-core",
@@ -1913,7 +1913,7 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "fob"
-version = "0.8.40"
+version = "0.8.41"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2782,7 +2782,7 @@ dependencies = [
 
 [[package]]
 name = "jsget"
-version = "0.8.40"
+version = "0.8.41"
 dependencies = [
  "anyhow",
  "rnpm",
@@ -3014,7 +3014,7 @@ dependencies = [
 
 [[package]]
 name = "mes"
-version = "0.8.40"
+version = "0.8.41"
 dependencies = [
  "mesofact-dev",
  "tokio",
@@ -3023,7 +3023,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact"
-version = "0.8.40"
+version = "0.8.41"
 dependencies = [
  "anyhow",
  "axum",
@@ -3050,7 +3050,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact-build"
-version = "0.8.40"
+version = "0.8.41"
 dependencies = [
  "anyhow",
  "clap",
@@ -3078,7 +3078,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact-core"
-version = "0.8.40"
+version = "0.8.41"
 dependencies = [
  "anyhow",
  "axum",
@@ -3105,7 +3105,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact-dev"
-version = "0.8.40"
+version = "0.8.41"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3130,7 +3130,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact-publisher"
-version = "0.8.40"
+version = "0.8.41"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3152,7 +3152,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact-render"
-version = "0.8.40"
+version = "0.8.41"
 dependencies = [
  "anyhow",
  "mesofact-core",
@@ -3163,7 +3163,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact-ssr"
-version = "0.8.40"
+version = "0.8.41"
 dependencies = [
  "anyhow",
  "deno_core",
@@ -4770,7 +4770,7 @@ dependencies = [
 
 [[package]]
 name = "rnpm"
-version = "0.8.40"
+version = "0.8.41"
 dependencies = [
  "anyhow",
  "node-semver",
@@ -7362,7 +7362,7 @@ checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"
 
 [[package]]
 name = "yah-almanac"
-version = "0.8.40"
+version = "0.8.41"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7384,7 +7384,7 @@ dependencies = [
 
 [[package]]
 name = "yah-local-driver"
-version = "0.8.40"
+version = "0.8.41"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7402,7 +7402,7 @@ dependencies = [
 
 [[package]]
 name = "yah-mesofact-bundle"
-version = "0.8.40"
+version = "0.8.41"
 dependencies = [
  "blake3",
  "serde",
@@ -7413,7 +7413,7 @@ dependencies = [
 
 [[package]]
 name = "yah-object-store"
-version = "0.8.40"
+version = "0.8.41"
 dependencies = [
  "fob",
  "hex",
@@ -7426,7 +7426,7 @@ dependencies = [
 
 [[package]]
 name = "yah-workload-spec"
-version = "0.8.40"
+version = "0.8.41"
 dependencies = [
  "anyhow",
  "async-trait",

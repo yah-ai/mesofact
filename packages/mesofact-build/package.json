@@ -1,6 +1,6 @@
 {
   "name": "@mesofact/build",
-  "version": "0.8.40",
+  "version": "0.8.41",
   "description": "Build pipeline — TS bundle → route discovery → source inference → validate → Mode 1 prerender → manifest + tag-index.",
   "license": "MIT OR Apache-2.0",
   "private": true,

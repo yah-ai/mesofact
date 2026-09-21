@@ -15,7 +15,6 @@ use tracing::{info, warn};
 
 const HEARTBEAT: Duration = Duration::from_secs(30);
 
-/// Load the manifest from a local file path.
 pub async fn load_from_file(path: &Path) -> std::io::Result<Manifest> {
     let bytes = tokio::fs::read(path).await?;
     serde_json::from_slice(&bytes).map_err(|e| std::io::Error::other(e.to_string()))
@@ -57,7 +56,7 @@ pub async fn reload_once(path: &Path, tx: &watch::Sender<Arc<Manifest>>) {
             let new_version = m.build_id.clone();
             let old_version = tx.borrow().build_id.clone();
             if new_version == old_version {
-                return; // no change
+                return;
             }
             info!("manifest updated: {old_version} → {new_version}");
             tx.send_replace(Arc::new(m));
