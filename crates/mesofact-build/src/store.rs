@@ -40,7 +40,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// volume that outlives the job, and for tests.
 pub const STORE_DIR_ENV: &str = "MESOFACT_STORE_DIR";
 
-/// A content-addressed store rooted at a directory.
 #[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,

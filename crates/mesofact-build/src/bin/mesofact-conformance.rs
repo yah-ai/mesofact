@@ -106,8 +106,6 @@ fn corpus_root(explicit: Option<PathBuf>) -> PathBuf {
     })
 }
 
-// ── Tier A ──────────────────────────────────────────────────────────────────
-
 fn check(corpus: Option<PathBuf>, case: Option<String>) -> Result<()> {
     let root = corpus_root(corpus);
     let report = match case {
@@ -131,8 +129,6 @@ fn check(corpus: Option<PathBuf>, case: Option<String>) -> Result<()> {
         std::process::exit(1);
     }
 }
-
-// ── Tier B ──────────────────────────────────────────────────────────────────
 
 struct RecordArgs {
     name: String,
@@ -237,7 +233,6 @@ fn record(args: RecordArgs) -> Result<()> {
     merge_lock_versions(&mut keep, &case_dir.join("bun.lock"))?;
     merge_lock_versions(&mut keep, &case_dir.join("pnpm-lock.yaml"))?;
 
-    // ── prune and check in ──────────────────────────────────────────────────
     let case_cache = case_dir.join(PACKUMENT_DIR);
     if case_cache.exists() {
         std::fs::remove_dir_all(&case_cache).with_context(|| {
@@ -275,7 +270,6 @@ fn record(args: RecordArgs) -> Result<()> {
         recorded += 1;
     }
 
-    // ── the case file ───────────────────────────────────────────────────────
     let spec = CaseSpec {
         name: args.name.clone(),
         description: args.description,
@@ -290,7 +284,6 @@ fn record(args: RecordArgs) -> Result<()> {
         name = args.name
     );
 
-    // ── replay it through the gate, immediately ─────────────────────────────
     let report = conformance::check_case(&case_dir)?;
     for warning in &report.resolve_warnings {
         println!("  note — {warning}");

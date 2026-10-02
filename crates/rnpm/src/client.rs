@@ -63,7 +63,6 @@ impl RegistryEndpoint {
     }
 }
 
-/// When a cached packument may be served without a network round trip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CachePolicy {
     /// Serve an entry younger than this without any request.

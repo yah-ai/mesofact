@@ -10,10 +10,6 @@ use tracing::{error, info};
 
 use crate::issues_source::IssuesSource;
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
 /// One filed issue, as stored and as rendered.
 ///
 /// This struct is the *whole* wire contract between the `/issues` form, the
@@ -65,10 +61,6 @@ pub struct IssuesFeed {
 #[derive(Debug, Clone)]
 pub struct RevalidateRequest;
 
-// ---------------------------------------------------------------------------
-// ArtifactSink
-// ---------------------------------------------------------------------------
-
 /// Write destination for the materialized `IssuesFeed` JSON.
 pub struct ArtifactSink {
     path: PathBuf,
@@ -92,10 +84,6 @@ impl ArtifactSink {
         Ok(())
     }
 }
-
-// ---------------------------------------------------------------------------
-// OnChange
-// ---------------------------------------------------------------------------
 
 type OnChangeFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
@@ -156,10 +144,6 @@ impl OnChange {
     }
 }
 
-// ---------------------------------------------------------------------------
-// IssuesFeed::run
-// ---------------------------------------------------------------------------
-
 impl IssuesFeed {
     /// Long-running task: await trigger ticks, re-materialize the feed, fire
     /// on_change. Runs until the trigger sender is dropped.
@@ -198,10 +182,6 @@ impl IssuesFeed {
         // trigger channel closed — loop ends cleanly
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

@@ -139,7 +139,6 @@ fn strip_trailing_commas(src: &str) -> String {
                     j += 1;
                 }
                 if j < bytes.len() && (bytes[j] == b'}' || bytes[j] == b']') {
-                    // skip the comma
                 } else {
                     out.push(c);
                 }

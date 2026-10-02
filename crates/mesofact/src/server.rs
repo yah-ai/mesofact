@@ -1000,10 +1000,7 @@ async fn dispatch_to_ssr(
         }
     };
 
-    // dispatch_url mirrors the absolute URL the bun wrapper used to construct
-    // from the request line — keeps `req.url` parsing identical for routes
-    // that read pathname/search.
-    let dispatch_url = format!("http://dev{path_and_query}");
+    let dispatch_url = format!("{}{path_and_query}", public_origin(&parts.headers));
 
     let retry = policy.as_ref().and_then(|p| p.retry.as_ref());
     let attempts = retry.map(|r| r.attempts.max(1)).unwrap_or(1);
@@ -1070,6 +1067,41 @@ async fn dispatch_to_ssr(
         .map(|e| format!("ssr dispatch failed: {e}"))
         .unwrap_or_else(|| "ssr dispatch failed".to_string());
     (StatusCode::BAD_GATEWAY, msg).into_response()
+}
+
+/// The origin an SSR handler sees as `new URL(request.url).origin`: the
+/// public one the client asked for, so a handler that builds a self-fetch URL
+/// from it reaches its own site. `Host` is stripped from the forwarded
+/// headers above, so this URL is the handler's ONLY way to learn it.
+///
+/// R931-B8: this was the constant `http://dev`, and noisetable's `/issues`
+/// page 500'd in prod fetching `http://dev/api/issues`. Precedence is
+/// `X-Forwarded-Host`, then `Host`; scheme is `X-Forwarded-Proto` when it
+/// names http/https, else `http` (what this listener actually speaks). Only a
+/// request with no host at all — HTTP/1.0, in-process tests — gets
+/// `http://localhost`.
+#[cfg(feature = "ssr")]
+fn public_origin(headers: &axum::http::HeaderMap) -> String {
+    // Proxies append to these lists; the first entry is the client-facing hop.
+    let first = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let scheme = match first("x-forwarded-proto").map(str::to_ascii_lowercase) {
+        Some(p) if p == "https" => "https",
+        _ => "http",
+    };
+    // Refuse anything that could splice path/userinfo into the URL: a host
+    // header is authority-shaped or it is ignored.
+    let host = first("x-forwarded-host")
+        .or_else(|| first("host"))
+        .filter(|h| h.parse::<axum::http::uri::Authority>().is_ok() && !h.contains('@'))
+        .unwrap_or("localhost");
+    format!("{scheme}://{host}")
 }
 
 #[cfg(feature = "ssr")]
@@ -3200,6 +3232,51 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_string(response).await, "user 42");
+    }
+
+    /// R931-B8: an SSR handler's `request.url` carries the public origin, so
+    /// `new URL("/api/x", new URL(request.url).origin)` reaches its own site.
+    #[cfg(feature = "ssr")]
+    #[tokio::test]
+    async fn ssr_request_url_carries_public_origin() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let s = seen.clone();
+        let ssr = ssr::detached_for_test_with_policies(
+            vec!["/issues".to_string()],
+            vec![],
+            move |req: DispatchRequest| {
+                s.lock().unwrap().push(req.url);
+                Ok(DispatchResponse { status: 200, headers: vec![], body: vec![] })
+            },
+        );
+        let workload = workload_with(&[]);
+        let router = Server::from_workload(workload.path()).unwrap().with_ssr(ssr).router();
+        for headers in [
+            vec![("host", "noisetable.com")],
+            vec![
+                ("host", "10.0.0.7:8080"),
+                ("x-forwarded-host", "noisetable.com, edge.internal"),
+                ("x-forwarded-proto", "https"),
+            ],
+            vec![("host", "evil.com/@x")],
+            vec![],
+        ] {
+            let mut b = Request::builder().uri("/issues?page=2");
+            for (k, v) in headers {
+                b = b.header(k, v);
+            }
+            let resp = router.clone().oneshot(b.body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                "http://noisetable.com/issues?page=2",
+                "https://noisetable.com/issues?page=2",
+                "http://localhost/issues?page=2",
+                "http://localhost/issues?page=2",
+            ]
+        );
     }
 
     // ── W181 resilience tests ────────────────────────────────────────────

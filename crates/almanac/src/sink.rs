@@ -236,6 +236,5 @@ mod tests {
                 key: "data/x.json".into()
             }
         );
-        // Nothing was written.
     }
 }

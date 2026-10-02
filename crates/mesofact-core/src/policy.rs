@@ -65,9 +65,9 @@ pub enum RoutePolicy {
 }
 
 impl RoutePolicy {
-    /// Every policy, in declaration order. Adding a variant without adding it
-    /// here fails to compile (the exhaustive matches on `RoutePolicy` below
-    /// won't cover it).
+    /// Every policy, in declaration order. Nothing at compile time checks this
+    /// list is complete — `parse()` searches it at runtime — so a variant left
+    /// out here is caught only by `every_route_field_is_classified` below.
     pub const ALL: [RoutePolicy; 4] = [
         RoutePolicy::Requires,
         RoutePolicy::CachePolicy,
@@ -339,7 +339,6 @@ pub fn check_manifest(raw: &[u8], support: &PolicySupport) -> Result<(), PolicyC
         serde_json::from_slice(raw).map_err(|e| PolicyCheckError::Unreadable(e.to_string()))?;
     let routes = match doc.get("routes") {
         Some(serde_json::Value::Array(routes)) => routes.as_slice(),
-        // `routes` present but not an array is a manifest shape we do not recognize.
         Some(_) => return Err(PolicyCheckError::Unreadable("`routes` is not an array".into())),
         None => &[],
     };

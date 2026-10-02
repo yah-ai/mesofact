@@ -276,8 +276,8 @@ fn render_instance(
 /// `render_entrypoint` is emitted as `dist/server/<key>.js` — relative to
 /// the *project root* with the conventional `dist/` first segment. Resolve
 /// it against the actual out dir by stripping that first segment (the same
-/// convention mesofact-dev's SSR loader uses; see its lib.rs cleanup note
-/// about non-`dist` out_dir overrides).
+/// convention `mesofact-dev`'s watcher uses; see `WatchOptions::defaults_for_workload`
+/// in `crates/mesofact-dev/src/watcher.rs` for the `build.out_dir` override).
 fn resolve_bundle(out_dir: &Path, route: &Route) -> Result<PathBuf> {
     let rel = route
         .render_entrypoint

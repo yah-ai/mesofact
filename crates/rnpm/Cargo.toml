@@ -43,7 +43,7 @@ anyhow = "1"
 node-semver = "=2.2.0"
 # Blocking, deliberately: the R773-F3 tree walk is a sequential BFS, so an async
 # client buys nothing and would infect every caller up to `mesofact-build`,
-# which is itself blocking (`install.rs:490`).
+# which is itself blocking (`install.rs`'s `install()`).
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls-native-roots",
     "blocking",

@@ -146,7 +146,6 @@ async fn freshen_handler(
     State(state): State<ReceiverState>,
     Json(body): Json<FreshenBody>,
 ) -> StatusCode {
-    // Mirror-key auth: reject cross-mirror freshens.
     if let Some(ref expected) = state.mirror_key {
         match &body.mirror_key {
             Some(provided) if provided == expected => {}
@@ -160,7 +159,6 @@ async fn freshen_handler(
         }
     }
 
-    // Feed-level binding check: reject feeds not bound to this mirror's service.
     if let Some(ref bind) = state.bind {
         let loader = FeedLoader::new(&bind.almanac_dir);
         match loader.load(&body.feed) {
@@ -416,7 +414,6 @@ mod tests {
 
     #[tokio::test]
     async fn no_bind_skips_feed_check() {
-        // Without a bind, any feed name is forwarded regardless of almanac state.
         let (tx, mut rx) = mpsc::channel(4);
         let app = router(tx, None, None);
         let resp = post_json(app,r#"{"feed":"unknown-feed"}"#).await;

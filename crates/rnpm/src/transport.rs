@@ -8,7 +8,7 @@
 //! surface this crate needs is four fields and three response shapes, and the
 //! hermetic tests substitute a counting fake for [`HttpTransport`].
 //!
-//! Blocking, matching `mesofact-build`'s `install.rs:490` client — see the
+//! Blocking, matching `mesofact-build`'s `install.rs`'s `install()` client — see the
 //! crate manifest for why async is not wanted here.
 
 use anyhow::{bail, Context, Result};

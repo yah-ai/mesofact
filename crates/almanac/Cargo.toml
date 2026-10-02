@@ -60,8 +60,8 @@ anyhow = "1.0"
 # has no such block and states its yah-base path deps inline (see
 # `crates/mesofact/Cargo.toml`'s `yah-mesofact-bundle`). House style follows the
 # workspace, so these changed shape when the crate moved.
-workload-spec = { package = "yah-workload-spec", path = "../../../yah-base/crates/workload-spec", version = "0.8.41" }
-yah-object-store = { path = "../../../yah-base/crates/object-store", version = "0.8.41" }
+workload-spec = { package = "yah-workload-spec", path = "../../../yah-base/crates/workload-spec", version = "0.8.42" }
+yah-object-store = { path = "../../../yah-base/crates/object-store", version = "0.8.42" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

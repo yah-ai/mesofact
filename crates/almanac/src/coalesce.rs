@@ -156,12 +156,10 @@ mod tests {
         let c = Coalescer::new();
         assert_eq!(c.admit("releases"), Admission::Run);
 
-        // Ten triggers land while the first run is in flight.
         for _ in 0..10 {
             assert_eq!(c.admit("releases"), Admission::Coalesced);
         }
 
-        // They collapse to ONE re-run, not ten.
         assert!(c.finish("releases"), "queued re-run expected");
         assert!(!c.finish("releases"), "only one re-run should be queued");
         assert_eq!(c.in_flight(), 0);
@@ -173,7 +171,6 @@ mod tests {
         assert_eq!(c.admit("releases"), Admission::Run);
         assert!(!c.finish("releases"));
         assert_eq!(c.in_flight(), 0);
-        // And the feed is immediately runnable again.
         assert_eq!(c.admit("releases"), Admission::Run);
     }
 
@@ -181,7 +178,6 @@ mod tests {
     fn feeds_do_not_block_each_other() {
         let c = Coalescer::new();
         assert_eq!(c.admit("releases"), Admission::Run);
-        // A different feed is unaffected by the first being busy.
         assert_eq!(c.admit("issues"), Admission::Run);
         assert_eq!(c.in_flight(), 2);
     }

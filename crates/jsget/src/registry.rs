@@ -44,7 +44,6 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// The public npm registry.
     pub fn npm() -> Self {
         Self {
             ecosystem: Ecosystem::Npm,

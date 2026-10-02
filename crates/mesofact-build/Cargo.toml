@@ -20,14 +20,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-mesofact-core = { path = "../mesofact-core", version = "0.8.41" }
-mesofact-ssr = { path = "../mesofact-ssr", version = "0.8.41" }
-mesofact-render = { path = "../mesofact-render", version = "0.8.41" }
+mesofact-core = { path = "../mesofact-core", version = "0.8.42" }
+mesofact-ssr = { path = "../mesofact-ssr", version = "0.8.42" }
+mesofact-render = { path = "../mesofact-render", version = "0.8.42" }
 
 # W272 bundle-manifest types (R599-F1), across the yah-base workspace boundary.
 # default-features = false keeps this to serde+blake3+toml types only — the
 # object-store `store` feature is for cloud/kamaji, not the build side.
-yah-mesofact-bundle = { path = "../../../yah-base/crates/mesofact-bundle", version = "0.8.41", default-features = false }
+yah-mesofact-bundle = { path = "../../../yah-base/crates/mesofact-bundle", version = "0.8.42", default-features = false }
 
 rolldown = "1.1"
 rolldown_common = "1.1"
@@ -45,7 +45,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 # nothing here depends on `jsget` yet, and this edge is the sanctioned
 # direction — `rnpm` may not depend back on `mesofact-build` (that is the cycle
 # its own header forbids).
-rnpm = { path = "../rnpm", version = "0.8.41" }
+rnpm = { path = "../rnpm", version = "0.8.42" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 # pnpm-lock.yaml v9 (R771-F4). 0.9 is what the rest of this camp reads YAML
@@ -67,5 +67,5 @@ tracing = "0.1"
 # The `testing` feature exposes `rnpm::testing::FakeTransport`, so
 # `lock_entries`' round-trip proof resolves a real tree against the same fake
 # registry `rnpm`'s own tests use rather than hand-building an arena.
-rnpm = { path = "../rnpm", version = "0.8.41", features = ["testing"] }
+rnpm = { path = "../rnpm", version = "0.8.42", features = ["testing"] }
 tempfile = "3"

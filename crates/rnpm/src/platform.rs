@@ -32,7 +32,6 @@ pub struct Host {
 }
 
 impl Host {
-    /// The host this binary is running on.
     pub fn current() -> Self {
         let (os, cpu) = match host_platform_arch() {
             Some((os, cpu)) => (Some(os), Some(cpu)),
