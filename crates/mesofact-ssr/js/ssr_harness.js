@@ -61,18 +61,22 @@ const HOOK_ADAPTERS = {
 
 /** `readyz`: the module is a Fetch handler, and the verdict is its status.
  *  Builds a minimal `Request` from `{method, url}` — no headers, no body,
- *  because `/readyz` never carried either — and cancels rather than buffers
- *  the response body nobody reads. */
+ *  because `/readyz` never carried either. The body is ignored: shim bodies
+ *  are already-buffered Uint8Arrays (R750-F1), so there is nothing to cancel. */
 async function fetchHandlerHook(fn, input) {
   const req = new Request(input.url, { method: input.method ?? "GET" });
   const resp = await fn(req);
-  if (resp.body) {
-    await resp.body.cancel();
-  }
   return { status: resp.status };
 }
 
 globalThis.__mesofact_ssr = {
+  /** R750-F2: the user the Rust side resolved for the CURRENT dispatch
+   *  (`{id, attrs}`, mesofact-runtime's `User`), or null. Only meaningful
+   *  inside a request handler. Typed as `SsrContext` in mesofact-runtime. */
+  currentUser() {
+    return Deno.core.ops.op_mesofact_session() ?? null;
+  },
+
   async registerR2Sources(sources) {
     mesofactRuntime.registerR2Sources(sources);
   },

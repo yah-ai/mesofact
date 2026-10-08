@@ -1,6 +1,5 @@
 //! @yah:relay(R016, "Cell 2 (Islands) build support — static + client_entrypoint")
 //! @yah:at(2026-06-05T00:52:24Z)
-//! @yah:status(open)
 //! @yah:next("W173 Cell 2 = mode:'static' + client_entrypoint. Current build rejects this combination; this relay lifts the limit. R015-F3 shipped the analogous wiring for Cell 4 (ssr+client_entrypoint); Cell 2 is the same machinery on the static prerender path.")
 //! @yah:next("Single feature unit — see child F-ticket for the concrete edits. No ordering with other relays.")
 //! @yah:next("Real consumer: yah-camp R443-F2 is blocked on this (issues tracker on yah.dev marketing site).")
@@ -10,7 +9,6 @@
 //!
 //! @yah:relay(R017, "Parametric prerender enumeration from local data_inputs")
 //! @yah:at(2026-06-05T00:52:31Z)
-//! @yah:status(open)
 //! @yah:next("Parametric routes today enumerate IDs either via literal `prerender:{params:[...]}` or via a registered R2-shaped source adapter (BlobSource). There's no path to enumerate from a local-JSON data_inputs file at build time. This relay adds a third shape.")
 //! @yah:next("Single feature unit — see child F-ticket. Independent from the Cell 2 relay; either can ship first.")
 //! @yah:next("Real consumer: yah-camp R443-F2's /issues/:id wants one static HTML per issue, enumerated from src/data/issues.json (the same file feeding data_inputs).")

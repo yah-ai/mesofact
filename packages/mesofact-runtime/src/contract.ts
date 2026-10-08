@@ -11,6 +11,14 @@ export type User = {
   attrs: Record<string, unknown>;
 };
 
+/** The SSR isolate's bridge object, `globalThis.__mesofact_ssr` (mesofact-ssr
+ *  js/ssr_harness.js). Only the route-facing member is typed here.
+ *  `currentUser()` returns the user Rust resolved for the current dispatch,
+ *  or null (R750-F2). */
+export type SsrContext = {
+  currentUser(): User | null;
+};
+
 export type Project = {
   id: string;
   home_region: Region;

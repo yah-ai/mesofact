@@ -4,6 +4,7 @@
 export type {
   Region,
   User,
+  SsrContext,
   Project,
   RenderRequest,
   CachePolicy,

@@ -1,6 +1,5 @@
 //! @yah:relay(R820, "SigV4-sign SSR-isolate r2() requests (needs deno_core 0.404→0.410 bump across mesofact-ssr's whole extension set)")
 //! @yah:at(2026-08-13T19:12:16Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-miravel)
 //! @yah:next("Spike the deno_core 0.404->0.410 bump in isolation (a throwaway branch/crate) to find the compatible version set for deno_webidl/deno_web/deno_fetch/deno_net/deno_fs/deno_permissions before touching mesofact-ssr for real.")
 //! @yah:next("Once the extension set builds on deno_core 0.410, add deno_crypto + bind ext:deno_crypto's bootstrap JS to globalThis.crypto in ssr_bootstrap.js.")
@@ -101,115 +100,90 @@ class BaseSource {
   }
 }
 
-const DEFAULT_TIMEOUT_MS = 2000;
+// Default per-call timeouts, matching packages/mesofact-runtime's adapters.
+const R2_TIMEOUT_MS = 2000;
+const SQLITE_TIMEOUT_MS = 100;
 
-// Read-only R2 (S3-compatible) adapter. Ported from
-// packages/mesofact-runtime/src/adapters/r2.ts, minus SigV4 request signing —
-// unsigned requests are enough for mesofact-dev's anonymous s3s-fs surface
-// (s3s.rs AllowAllAccess) but not real Cloudflare R2 in production. See the
-// R820 annotation at the top of this file for the deno_core version blocker.
+const ops = globalThis.Deno.core.ops;
+
+// R750-F3: every read goes through a Rust op against the SourceBackend the
+// caller attached to this dispatch (signed S3 for r2, turso for sqlite —
+// mesofact's `ssr` feature). Ops resolve to `{ok}` / `{err: {kind, message}}`;
+// this maps the error kinds back onto the runtime's error classes.
+async function callSource(op, kind, name, args) {
+  const reply = await op({ source: name, ...args });
+  if ("ok" in reply) return reply.ok;
+  const { kind: errKind, message } = reply.err;
+  if (errKind === "not_registered") throw new SourceNotRegisteredError(name, kind);
+  if (errKind === "unavailable") {
+    const e = new SourceUnavailableError(name);
+    if (message) e.message += ` (${message})`;
+    throw e;
+  }
+  throw new SourceQueryError(name, message);
+}
+
 class R2Adapter extends BaseSource {
-  constructor({ name, bucket, endpoint, accessKeyId, secretAccessKey }) {
+  constructor({ name, bucket }) {
     super(name);
     this.bucket = bucket;
-    this.endpoint = endpoint.replace(/\/$/, "");
-    // Not yet used for signing (see file-top R820 annotation) — kept on the
-    // instance so wiring SigV4 later is a local change to `send()`, not
-    // another pass threading credentials through Rust.
-    this.accessKeyId = accessKeyId;
-    this.secretAccessKey = secretAccessKey;
   }
-
   async fetch(key) {
-    const { track, timeout_ms } = this.consumeOverrides(DEFAULT_TIMEOUT_MS);
+    const { track, timeout_ms } = this.consumeOverrides(R2_TIMEOUT_MS);
     this.emitTag(`r2:${this.bucket}:${key}`, track);
-    const url = `${this.endpoint}/${this.bucket}/${encodeKey(key)}`;
-    const res = await this.send(url, { method: "GET" }, timeout_ms);
-    if (res.status === 404) return null;
-    if (!res.ok) {
-      throw new SourceQueryError(this.name, `r2 GET ${key} → HTTP ${res.status}`);
-    }
-    return new Uint8Array(await res.arrayBuffer());
+    const bytes = await callSource(ops.op_mesofact_source_fetch, "r2", this.name, { key, timeout_ms });
+    return bytes ?? null;
   }
-
   async list(prefix, opts = {}) {
-    const { track, timeout_ms } = this.consumeOverrides(DEFAULT_TIMEOUT_MS);
+    const { track, timeout_ms } = this.consumeOverrides(R2_TIMEOUT_MS);
     this.emitTag(`r2:${this.bucket}:${prefix}*`, track);
-    const params = new URLSearchParams({ "list-type": "2", prefix });
-    if (opts.limit !== undefined) params.set("max-keys", String(opts.limit));
-    if (opts.cursor) params.set("continuation-token", opts.cursor);
-    if (opts.delimiter) params.set("delimiter", opts.delimiter);
-    const url = `${this.endpoint}/${this.bucket}?${params.toString()}`;
-    const res = await this.send(url, { method: "GET" }, timeout_ms);
-    if (!res.ok) {
-      throw new SourceQueryError(this.name, `r2 LIST ${prefix} → HTTP ${res.status}`);
-    }
-    return parseListV2(await res.text());
+    return callSource(ops.op_mesofact_source_list, "r2", this.name, { prefix, opts, timeout_ms });
   }
-
-  async send(url, init, timeout_ms) {
-    let timer;
-    try {
-      return await Promise.race([
-        fetch(url, init).catch((err) => {
-          throw new SourceUnavailableError(this.name, { cause: err });
-        }),
-        new Promise((_, reject) => {
-          timer = setTimeout(() => reject(new SourceUnavailableError(this.name)), timeout_ms);
-        }),
-      ]);
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-  }
-
   get(_table, _id) {
     return Promise.reject(new SourceQueryError(this.name, "r2 sources do not support get()"));
   }
-
   query(_sql, _params) {
     return Promise.reject(new SourceQueryError(this.name, "r2 sources do not support query()"));
   }
-
   head() {
     return Promise.reject(new SourceQueryError(this.name, "r2 sources do not support head()"));
   }
 }
 
-// `encodeURIComponent` re-encodes `/`, which we want to preserve so S3 sees
-// path-style keys correctly.
-function encodeKey(key) {
-  return key
-    .split("/")
-    .map((segment) => encodeURIComponent(segment))
-    .join("/");
-}
-
-// Minimal ListBucketResult v2 parser — same regex approach as r2.ts (S3's XML
-// is a fixed shape; no XML parser dependency needed for the fields the
-// R2Object contract exposes).
-function parseListV2(xml) {
-  const out = [];
-  for (const match of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)) {
-    const inner = match[1];
-    const key = pick(inner, "Key");
-    const sizeStr = pick(inner, "Size");
-    const last_modified = pick(inner, "LastModified");
-    const etagRaw = pick(inner, "ETag");
-    if (key === undefined || sizeStr === undefined || last_modified === undefined) continue;
-    out.push({
-      key,
-      size: Number.parseInt(sizeStr, 10),
-      last_modified,
-      ...(etagRaw ? { etag: etagRaw.replace(/^"|"$/g, "") } : {}),
-    });
+// Port of packages/mesofact-runtime/src/adapters/sqlite.ts's read surface and
+// tag scheme; the SQL runs Rust-side.
+class SqliteAdapter extends BaseSource {
+  async get(table, id) {
+    const { track, timeout_ms } = this.consumeOverrides(SQLITE_TIMEOUT_MS);
+    this.emitTag(`sqlite:${this.name}:${table}:${id}`, track);
+    return (
+      (await callSource(ops.op_mesofact_source_get, "sqlite", this.name, {
+        table: String(table),
+        id: String(id),
+        timeout_ms,
+      })) ?? null
+    );
   }
-  return out;
+  async query(sql, params = []) {
+    const { track, timeout_ms } = this.consumeOverrides(SQLITE_TIMEOUT_MS);
+    const tables = extractTables(sql);
+    if (tables.length === 0) this.emitTag(`sqlite:${this.name}`, track);
+    else for (const t of tables) this.emitTag(`sqlite:${this.name}:${t}`, track);
+    return callSource(ops.op_mesofact_source_query, "sqlite", this.name, { sql, params, timeout_ms });
+  }
+  fetch(_key) {
+    return Promise.reject(new SourceQueryError(this.name, "sqlite sources do not support fetch()"));
+  }
+  list(_prefix) {
+    return Promise.reject(new SourceQueryError(this.name, "sqlite sources do not support list()"));
+  }
 }
 
-function pick(haystack, tag) {
-  const m = haystack.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`));
-  return m?.[1];
+// Same FROM/JOIN table scrape as adapters/sqlite.ts, for read-set tags.
+function extractTables(sql) {
+  const out = new Set();
+  for (const m of sql.matchAll(/\b(?:from|join)\s+["'`]?([A-Za-z_][\w$]*)/gi)) out.add(m[1]);
+  return [...out];
 }
 
 // Per-isolate registry, mirroring packages/mesofact-runtime/src/adapters/r2.ts.
@@ -230,22 +204,9 @@ export function r2(name) {
   return adapter;
 }
 
+// sqlite names have no isolate-side registry: the backend holds them, so an
+// unknown name rejects with SourceNotRegisteredError on first read rather than
+// throwing here.
 export function sqlite(name) {
-  // sqlite reads a local file — out of R444's scope (env/R2 plumbing only).
-  // Keeping the throwing stub means a route declaring [sources.<x>] kind =
-  // "sqlite" still fails loudly and specifically rather than silently.
-  return {
-    name,
-    get: () => Promise.reject(new SourceUnavailableError(name)),
-    query: () => Promise.reject(new SourceUnavailableError(name)),
-    fetch: () => Promise.reject(new SourceUnavailableError(name)),
-    list: () => Promise.reject(new SourceUnavailableError(name)),
-    head: () => Promise.reject(new SourceUnavailableError(name)),
-    noTrack() {
-      return this;
-    },
-    timeout() {
-      return this;
-    },
-  };
+  return new SqliteAdapter(name);
 }

@@ -24,24 +24,68 @@
 //! internally, round-robined across so N requests get real parallelism.
 //! An interleaving rewrite of the single job loop was considered and
 //! deferred (W311 §1, move C) as the riskier restructure for a smaller win.
+//!
+//! @yah:ticket(R750-F1, "Lean fetch shim (Headers/Request/Response/fetch/URL in pure JS) + op_mesofact_fetch over reqwest; drop deno_web/fetch/net/fs/permissions/webidl from mesofact-ssr")
+//! @yah:status(review)
+//! @yah:at(2026-10-07T21:49:02Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R750)
+//! @yah:next("Tier: Cleric. Spec is W225 §2b Finding 1 table (.yah/docs/working/W225-mesofact-consumer-deployment-model.md:1109-1125) plus the R750 relay body; do NOT re-measure.")
+//! @yah:next("New file oss/mesofact/crates/mesofact-ssr/js/ssr_fetch_shim.js (pure JS, no deno_web): Headers (get/set/has/delete/append/entries/keys/values/forEach/Symbol.iterator, case-insensitive, ctor from object|array|Headers), Request (url/method/headers/body + json()/text()/arrayBuffer() over a Uint8Array body), Response (ctor(body, {status, statusText, headers}) accepting string|Uint8Array|null, status/ok/statusText/headers/body/bodyUsed + json()/text()/arrayBuffer(), static Response.json), and global fetch(url, init) that calls Deno.core.ops.op_mesofact_fetch({url, method, headers, body}) and wraps the {status, status_text, headers, body} reply in a Response. Reuse the TextEncoder/TextDecoder polyfills from js/bootstrap.js:47-108 verbatim (include or share the file; do not rewrite them).")
+//! @yah:next("DECISION (made by leader, R750): URL + URLSearchParams are a ~150-line pure-JS polyfill in the same shim — absolute http(s) URLs plus relative-against-base resolution, href/origin/protocol/host/hostname/port/pathname/search/hash/searchParams; URLSearchParams get/getAll/set/append/delete/has/entries/toString/iterator with proper percent-encoding. No deno_url dep. Record unsupported bits (IDN, blob:/data: schemes) in a comment at the top.")
+//! @yah:next("Rust: add #[op2] op_mesofact_fetch in a new src/ops_fetch.rs (or inside ssr.rs if the crate is small) over reqwest, registered in extensions() (ssr.rs:479-491). Match the reqwest feature set mesofact-core already uses so no net-new TLS stack enters the closure (the verify line below says rustls/aws-lc-sys/quinn/hickory-resolver must LEAVE the lean closure — pick reqwest features accordingly, e.g. default-features=false + the same TLS backend mesofact-core uses). Apply the W181 ResiliencePolicy {retry, timeout_ms} (oss/mesofact/crates/mesofact-core/src/manifest.rs:54) if the dispatch context carries one; otherwise a sane default timeout (30s) and no retry.")
+//! @yah:next("Remove deno_web, deno_fetch, deno_net, deno_fs, deno_permissions, deno_webidl (and rustls, sys_traits if only they needed them) from oss/mesofact/crates/mesofact-ssr/Cargo.toml; rewrite js/ssr_bootstrap.js so it installs the shim globals instead of loading deno_web/deno_fetch; update ext_sources.rs's embedded-source table and both tests there (every_extension_source_is_runtime_loadable, embedded_table_matches_declared_sources) to the new extension set.")
+//! @yah:next("Keep the SSG build path (bootstrap.js/harness.js/runtime_shim.js) working — it is the same crate; run its tests too.")
+//! @yah:next("Return: single JSON object {ticket_id, status, commit_sha?, notes<=3 sentences with pass/fail counts vs baseline}. Full account goes in @yah:handoff on this ticket. Git policy is defer: do not commit; print the commit command you would have run.")
+//! @yah:verify("cargo test -p mesofact-ssr: all pass (baseline: 2 tests in ext_sources.rs plus whatever else exists — record the count).")
+//! @yah:verify("cargo run -p mesofact-ssr --example fetch_surface_probe -- <abs path>/app/yah/web/marketing/dist/server/api_issues.js <abs path>/app/yah/web/analytics/dist/server/index.js reproduces 405/201/415/400/422/405 and 200 x6 respectively (build the bundles first if dist/server is absent — find the bun/mesofact build command in those app dirs).")
+//! @yah:verify("cargo tree -p mesofact-ssr -e normal | grep -cE 'deno_web|deno_fetch|deno_net|deno_fs|deno_permissions|deno_webidl|rustls|aws-lc-sys|quinn|hickory-resolver|web-transport-proto' == 0")
+//! @yah:verify("grep -n 'deno_web\\|deno_fetch' oss/mesofact/crates/mesofact-ssr/js/*.js oss/mesofact/crates/mesofact-ssr/src/*.rs returns nothing")
+//! @yah:gotcha("Shared tree, git policy defer: never run git checkout/restore/reset; never commit. R820 owns the header annotation of js/ssr_runtime_shim.js — do not edit that file in this ticket (T3 fills the sources seam). ssr.rs lines 67/164/233/518/688 reference R444; leave those comments intact.")
+//! @yah:gotcha("Serializing on the cargo build lock behind a peer's build is foreground work, not a reason to end your turn.")
+//! @arch:see(.yah/docs/working/W225-mesofact-consumer-deployment-model.md)
+//! @yah:files(oss/mesofact/crates/mesofact-ssr/Cargo.toml)
+//! @yah:files(oss/mesofact/crates/mesofact-ssr/src/ssr.rs)
+//! @yah:files(oss/mesofact/crates/mesofact-ssr/src/ext_sources.rs)
+//! @yah:files(oss/mesofact/crates/mesofact-ssr/js/ssr_bootstrap.js)
+//! @yah:files(oss/mesofact/crates/mesofact-ssr/js/ssr_fetch_shim.js)
+//! @yah:handoff("LANDED: new js/ssr_fetch_shim.js (pure JS: URL + URLSearchParams polyfill with the unsupported bits listed in its header, Headers, Request, Response incl. static json/redirect, fetch over Deno.core.ops.op_mesofact_fetch). Bodies are buffered Uint8Arrays, not ReadableStreams. new src/ops_fetch.rs: async #[op2] op_mesofact_fetch over reqwest 0.12 (default-features=false, no TLS backend), thread-local Client per isolate thread, 30s timeout, no retry (the dispatch context has no W181 ResiliencePolicy to apply), registered as extension mesofact_fetch.")
+//! @yah:handoff("js/ssr_bootstrap.js rewritten: setTimeout/clearTimeout over deno_core's core.createTimer/cancelTimer, JS atob/btoa, process.env. ssr::SSR_PRELUDE runs ssr_bootstrap.js, then js/bootstrap.js (the SSG polyfills shared verbatim: console, TextEncoder/TextDecoder, self), then ssr_fetch_shim.js. The order matters because bootstrap.js installs a throwing setTimeout when none is present. SSR_PRELUDE and extensions() are pub #[doc(hidden)] so the probe example uses the same wiring.")
+//! @yah:handoff("Removed deno_webidl/web/fetch/net/fs/permissions, rustls, sys_traits, build.rs and its serde_json build-dep. Also removed ensure_crypto_provider and build_permissions. ext_sources.rs is now a test-only R823 gate: every_extension_source_is_runtime_loadable is kept, and embedded_table_matches_declared_sources is replaced by extensions_declare_no_fs_backed_sources, since there is no embed table anymore.")
+//! @yah:handoff("OUTSIDE files list, needed for green: (1) js/ssr_harness.js readyz hook dropped resp.body.cancel(), because shim bodies are buffered. (2) examples/fetch_surface_probe.rs now uses the lean wiring, and its 3 JSON POSTs carry x-issues-key. Without the key the marketing bundle's R752-F9 gate returns 403 on all three, so the baseline 201/400/422 cannot be reached.")
+//! @yah:verify("cargo test -p mesofact-ssr: 10 passed, 0 failed (baseline 10). The 2 ext_sources tests were replaced 1:1.")
+//! @yah:verify("fetch_surface_probe on marketing api_issues.js + analytics index.js: 405/201/415/400/422/405 and 200x6. The 201 is a real outbound op_mesofact_fetch to the stub upstream.")
+//! @yah:verify("cargo tree -p mesofact-ssr -e normal | grep -cE '<forbidden set>' = 0. Unique crate lines: 203.")
+//! @yah:verify("grep deno_web|deno_fetch in js/*.js src/*.rs: only prose comments explaining what was replaced, no code references.")
+//! @yah:verify("cargo check -p mesofact --features ssr -p mesofact-render -p mesofact-build: EXIT 0, no warnings. cargo tree -p mesofact --features ssr -i reqwest shows rustls-tls unified in via mesofact-core, so https fetch works in the shipped binary.")
+//! @yah:handoff("TLS made explicit (leader decision): mesofact-ssr feature `tls` = reqwest/rustls-tls, off by default (standalone http-only, lean closure grep still 0); mesofact's `ssr` feature enables mesofact-ssr/tls. cargo check -p mesofact --features ssr EXIT 0.")
 
-use crate::ext_sources::embed_sources;
 use anyhow::{anyhow, Context, Result};
 use deno_core::error::ModuleLoaderError;
 use deno_core::{
     resolve_import, JsRuntime, ModuleLoadResponse, ModuleLoader, ModuleSource, ModuleSourceCode,
     ModuleSpecifier, ModuleType, PollEventLoopOptions, RuntimeOptions,
 };
-use deno_permissions::PermissionsContainer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use crate::ops_session::DispatchSession;
+use crate::ops_sources::{DispatchSources, SourceBackend};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Once};
+use std::sync::mpsc;
 use std::thread::JoinHandle;
 
-const SSR_BOOTSTRAP: &str = include_str!("../js/ssr_bootstrap.js");
+/// Scripts run, in order, before any route module loads (R750-F1): the SSR
+/// bootstrap (timers, base64, process.env), the SSG polyfills shared verbatim
+/// (console, TextEncoder/TextDecoder), then the lean Fetch shim. See the header
+/// of `js/ssr_bootstrap.js` for why the order is load-bearing.
+#[doc(hidden)]
+pub const SSR_PRELUDE: &[(&str, &str)] = &[
+    ("mesofact-ssr:bootstrap", include_str!("../js/ssr_bootstrap.js")),
+    ("mesofact:bootstrap", include_str!("../js/bootstrap.js")),
+    ("mesofact-ssr:fetch-shim", include_str!("../js/ssr_fetch_shim.js")),
+];
 const SSR_HARNESS: &str = include_str!("../js/ssr_harness.js");
 /// Pure helpers shared with the SSG tier; re-exported by the SSR shim below.
 const RUNTIME_PURE: &str = include_str!("../js/runtime_shim.js");
@@ -51,7 +95,7 @@ const RUNTIME_SPECIFIER: &str = "mesofact-ssr:runtime";
 const RUNTIME_PURE_SPECIFIER: &str = "mesofact:runtime-pure";
 
 /// Plain request shape handed in by the dev server.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct DispatchRequest {
     pub method: String,
     pub url: String,
@@ -62,6 +106,29 @@ pub struct DispatchRequest {
     /// harness drops it before constructing the Request to match Fetch
     /// semantics.
     pub body: Option<Vec<u8>>,
+    /// Pre-resolved identity for this request (R750-F2): mesofact-core's
+    /// `User` serialized as `{id, attrs}`, or `None` when unauthenticated.
+    /// Never sent to the harness as request data — route code reads it via
+    /// `__mesofact_ssr.currentUser()` (op_mesofact_session).
+    #[serde(skip)]
+    pub user: Option<Value>,
+    /// The source backend `r2()` / `sqlite()` read through for this request
+    /// (R750-F3). `None` → every source name reads as unregistered.
+    #[serde(skip)]
+    pub sources: Option<std::sync::Arc<dyn SourceBackend>>,
+}
+
+impl std::fmt::Debug for DispatchRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DispatchRequest")
+            .field("method", &self.method)
+            .field("url", &self.url)
+            .field("headers", &self.headers)
+            .field("body_len", &self.body.as_ref().map(Vec::len))
+            .field("user", &self.user)
+            .field("sources", &self.sources.is_some())
+            .finish()
+    }
 }
 
 /// Resolved R2 source coordinates handed to the isolate at boot (R444).
@@ -76,9 +143,6 @@ pub struct DispatchRequest {
 pub struct R2SourceCoords {
     pub name: String,
     pub bucket: String,
-    pub endpoint: String,
-    pub access_key_id: String,
-    pub secret_access_key: String,
 }
 
 /// Plain response shape returned by the harness; mirrors what the bun
@@ -166,7 +230,6 @@ impl SsrRuntime {
     /// the caller (`mesofact::ssr::spawn`) hands in whatever env map route
     /// code and `[sources.r2]` resolution should see.
     pub fn start(env: Vec<(String, String)>) -> Result<Self> {
-        ensure_crypto_provider();
         let (tx, rx) = mpsc::channel::<Job>();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
         let thread = std::thread::Builder::new()
@@ -349,22 +412,6 @@ impl SsrPool {
     }
 }
 
-static CRYPTO_PROVIDER_INIT: Once = Once::new();
-
-/// Install the process-wide rustls `CryptoProvider` exactly once. deno_fetch's
-/// HTTP client always builds a TLS-capable connector — even for a plain
-/// `http://` request — and both `aws-lc-rs` and `ring` end up in this crate's
-/// dependency graph (different `deno_*` crates pick different rustls
-/// features), so rustls can't auto-select a default: the first real
-/// `fetch()` call panics without this. Idempotent — `install_default`'s
-/// "already installed" error (e.g. a peer crate installed one first) is
-/// expected and ignored, not a startup failure.
-fn ensure_crypto_provider() {
-    CRYPTO_PROVIDER_INIT.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    });
-}
-
 /// Module loader: file-system ESM plus the embedded harness module.
 struct SsrModuleLoader;
 
@@ -429,13 +476,6 @@ impl ModuleLoader for SsrModuleLoader {
     }
 }
 
-fn build_permissions() -> PermissionsContainer {
-    let parser = deno_permissions::RuntimePermissionDescriptorParser::new(
-        sys_traits::impls::RealSys,
-    );
-    PermissionsContainer::allow_all(Arc::new(parser))
-}
-
 /// @yah:relay(R823, "Self-contained SSR runtime: embed a deno_core startup snapshot so a shipped binary boots V8 off its build machine")
 /// @yah:status(review)
 /// @yah:at(2026-09-03T07:12:12Z)
@@ -462,31 +502,47 @@ fn build_permissions() -> PermissionsContainer {
 fn build_runtime() -> JsRuntime {
     JsRuntime::new(RuntimeOptions {
         module_loader: Some(Rc::new(SsrModuleLoader)),
-        // R823: every one of these declares its whole JS surface as
-        // `lazy_loaded_*`, which `extension!` lowers to an absolute path into
-        // the COMPILING machine's cargo registry. `embed_sources` swaps those
-        // paths for the copies build.rs baked into the binary — without it,
-        // `JsRuntime::new` below panics with ENOENT on any machine that did not
-        // compile the binary. `build.rs` must register the same set; the
-        // `ext_sources` tests fail if the two drift.
-        extensions: extensions().into_iter().map(embed_sources).collect(),
+        extensions: extensions(),
         ..Default::default()
     })
 }
 
-/// The extension set the SSR isolate registers. Mirrored by `build.rs`, which
-/// walks the same list to find the JS it has to embed — keep them in step.
-pub(crate) fn extensions() -> Vec<deno_core::Extension> {
+/// The extension set the SSR isolate registers: ops only, no extension JS
+/// (R750-F1). The JS surface is [`SSR_PRELUDE`], `include_str!`ed into the
+/// binary, so nothing is read off the build machine at `JsRuntime::new` (R823).
+///
+/// @yah:ticket(R750-F3, "op_mesofact_source_fetch/list/get/query: fill the throwing r2()/sqlite() seam in ssr_runtime_shim.js over a Rust SourceBackend")
+/// @yah:status(review)
+/// @yah:at(2026-10-07T22:08:28Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R750)
+/// @yah:next("Tier: Cleric. TS contract is oss/mesofact/packages/mesofact-runtime/src/source.ts:1-92 (BlobSource.fetch(key)->Uint8Array|null, list(prefix, opts)->R2Object[]; KeyValueSource.get(table,id), query(sql, params); plus noTrack()/timeout(ms) builders). The seam to fill is oss/mesofact/crates/mesofact-ssr/js/ssr_runtime_shim.js:220-250 (registerR2Sources, r2() throws SourceNotRegisteredError, sqlite() returns a Promise.reject stub).")
+/// @yah:next("Rust: define a `SourceBackend` trait in mesofact-ssr (async fn fetch(source, key) -> Option<Vec<u8>>; list(source, prefix, opts) -> Vec<R2Object>; get(source, table, id) -> Option<Value>; query(source, sql, params) -> Vec<Value>), stored as Arc<dyn SourceBackend> in OpState at dispatch time. Four #[op2(async)] ops op_mesofact_source_fetch/list/get/query call it. mesofact-ssr itself gains NO r2/sqlite deps.")
+/// @yah:next("Implement SourceBackend in mesofact-core over the R2 client and sqlite handle it already owns for mode:ssr sources (search mesofact-core for the R2 client / sqlite/turso pool used by SSG source fetching, and for how ssr.rs references R444 at lines 67/164/233/518/688 — R444 threaded R2 source coordinates into the isolate; build on that, do not re-thread). If no sqlite handle exists yet Rust-side, implement sqlite via the same crate mesofact-core already depends on; do not add a second sqlite crate.")
+/// @yah:next("JS: rewrite r2(name)/sqlite(name) in ssr_runtime_shim.js to return objects satisfying BlobSource/KeyValueSource that call the ops; keep registerR2Sources as the name registry and keep SourceNotRegisteredError for unknown names; honour timeout(ms) by passing it to the op; keep the R820 header annotation untouched.")
+/// @yah:next("Tests: a mesofact-ssr unit test with an in-memory SourceBackend asserting all four ops round-trip through a tiny route; an unknown-name case still throws SourceNotRegisteredError.")
+/// @yah:next("Return: single JSON object {ticket_id, status, commit_sha?, notes<=3 sentences with pass/fail counts vs baseline}. Full account in @yah:handoff. Git policy defer: no commits.")
+/// @yah:verify("cargo test -p mesofact-ssr and cargo test -p mesofact-core pass (counts vs baseline).")
+/// @yah:verify("grep -n 'Promise.reject\\|throw new SourceNotRegisteredError' oss/mesofact/crates/mesofact-ssr/js/ssr_runtime_shim.js shows only the unknown-name path.")
+/// @yah:gotcha("Subcamp relay R444 (status review) already threaded R2 source coordinates into the isolate — read its annotations in ssr.rs before designing the backend. Shared tree, git policy defer.")
+/// @yah:depends_on(MFT-R750-F2)
+/// @yah:files(oss/mesofact/crates/mesofact-ssr/src/ssr.rs)
+/// @yah:files(oss/mesofact/crates/mesofact-ssr/js/ssr_runtime_shim.js)
+/// @yah:files(oss/mesofact/crates/mesofact-core/src/proxy)
+/// @yah:handoff("mesofact-ssr: new src/ops_sources.rs adds the SourceBackend trait (fetch/list/get/query, returning boxed futures) and the ListOpts/R2Object/SourceError types, all re-exported from lib.rs. It also adds four async #[op2] ops: op_mesofact_source_fetch/list/get/query. Each takes {source, ..., timeout_ms}, enforces timeout(ms) with tokio::time::timeout, and resolves to {ok} or {err:{kind,message}}. DispatchRequest gains `#[serde(skip)] sources: Option<Arc<dyn SourceBackend>>` (Debug is now hand-written). The dispatch loop puts DispatchSources into OpState and clears it after each request, exactly like DispatchSession. No r2/sqlite deps in mesofact-ssr; tokio gains the `time` feature.")
+/// @yah:handoff("js/ssr_runtime_shim.js (body only; the R820 header is untouched): the unsigned-fetch R2Adapter, encodeKey, parseListV2 and the throwing sqlite stub are replaced by an op-backed R2Adapter and a SqliteAdapter. Error kinds map to SourceNotRegisteredError, SourceUnavailableError and SourceQueryError. Tags and default timeouts match packages/mesofact-runtime (r2 2000ms, sqlite 100ms; the FROM/JOIN table regex is copied from adapters/sqlite.ts). registerR2Sources stays the r2 name registry, so r2(unknown) still throws synchronously. sqlite has no isolate-side registry: an unknown name rejects with SourceNotRegisteredError on its first read.")
+/// @yah:handoff("PRODUCTION WIRING in crates/mesofact (ssr feature): new src/sources.rs `Sources` backend. r2 uses mesofact-publisher's SigV4 S3Store (region auto) plus a new S3Store::list_page that returns object metadata (key/size/last_modified/etag) for a single page honouring limit/cursor/delimiter. sqlite uses turso 0.7.2 (operator decision via ask_user F4315; default-features off, matching yah's pin): one lazily opened Database per source, rows returned as {column: value} JSON, the get SQL copied from the TS adapter. All backend I/O is spawned on the server runtime captured at construction, because an isolate's current-thread runtime only runs while that isolate is dispatching. ssr.rs: resolve_sources() reads mesofact.config.toml once, keeps the r2 entries, and adds `kind = \"sqlite\"` entries with `path` (relative paths resolve against the workload). spawn() builds Sources when any source is declared; DispatchTarget::Runtime holds it and sets req.sources on every dispatch. That covers serve, bundle and dev with one hook.")
+/// @yah:handoff("Finding for R820's owner: the isolate no longer sends any R2 request itself, so the unsigned-request/SigV4 blocker that R820's header describes no longer applies to the r2() path. The header annotation was left as-is per the brief. Also: R2SourceCoords still carries credentials into the isolate registry, where they are now unused; trimming them is cleanup.")
+/// @yah:verify("cargo test -p mesofact-ssr: 12 passed (baseline 11). The new source_ops_round_trip_through_an_in_memory_backend test covers fetch hit and miss (null), list with opts, sqlite get, query with params, a backend Query error mapped to SourceQueryError, r2(unknown) throwing SourceNotRegisteredError synchronously, and sqlite(unknown) rejecting with SourceNotRegisteredError.")
+/// @yah:verify("cargo test -p mesofact --features ssr --no-fail-fast: lib 203 passed, 2 failed (baseline 202 passed, 2 failed). The new sources::tests::sqlite_get_and_query_through_turso runs against a real turso file DB. The 2 failures are the same pre-existing cli::new version-pin tests. Integration tests: 5 + 2 passed.")
+/// @yah:verify("cargo test -p mesofact-core: 77 passed (baseline 77). cargo test -p mesofact-publisher: 28 + 14 passed, including the new parse_list_objects_reads_metadata. cargo check -p mesofact --tests (default features): EXIT 0, with only the pre-existing resolve_mirror_key warning. cargo check -p mesofact-dev --tests: EXIT 0.")
+/// @yah:cleanup("No test drives Sources' R2 path against a live S3 surface. A candidate is mesofact-dev's embedded s3s-fs DevStore, which accepts dev/dev SigV4: put an object, then read it through r2().fetch/list from a spawned SSR route.")
+#[doc(hidden)]
+pub fn extensions() -> Vec<deno_core::Extension> {
     vec![
-        deno_webidl::deno_webidl::init(),
-        deno_web::deno_web::init(
-            Arc::new(deno_web::BlobStore::default()),
-            None,
-            false,
-            deno_web::InMemoryBroadcastChannel::default(),
-        ),
-        deno_net::deno_net::init(None, None),
-        deno_fetch::deno_fetch::init(deno_fetch::Options::default()),
+        crate::ops_fetch::mesofact_fetch::init(),
+        crate::ops_session::mesofact_session::init(),
+        crate::ops_sources::mesofact_sources::init(),
     ]
 }
 
@@ -504,17 +560,12 @@ fn run_isolate(rx: mpsc::Receiver<Job>, ready: mpsc::Sender<Result<()>>, env: Ve
     tokio_rt.block_on(async move {
         let mut runtime = build_runtime();
 
-        // Make the permissions container available to deno_fetch/deno_web ops
-        // (they read it out of the op state).
-        runtime
-            .op_state()
-            .borrow_mut()
-            .put(build_permissions());
-
         let init = async {
-            runtime
-                .execute_script("mesofact-ssr:bootstrap", SSR_BOOTSTRAP)
-                .map_err(|e| anyhow!("SSR bootstrap failed: {e}"))?;
+            for (name, src) in SSR_PRELUDE {
+                runtime
+                    .execute_script(*name, *src)
+                    .map_err(|e| anyhow!("SSR bootstrap ({name}) failed: {e}"))?;
+            }
             // R444: fold the caller's env onto the empty `process.env` the
             // bootstrap just installed, before the harness (or any route
             // module) loads — so a top-level read at module-eval time still
@@ -558,7 +609,7 @@ fn run_isolate(rx: mpsc::Receiver<Job>, ready: mpsc::Sender<Result<()>>, env: Ve
                     let r = call_harness(&mut runtime, "register", &bundle, None).await.map(|_| ());
                     let _ = reply.send(r);
                 }
-                Job::Dispatch { bundle, req, reply } => {
+                Job::Dispatch { bundle, mut req, reply } => {
                     let input = match serde_json::to_value(&req) {
                         Ok(v) => v,
                         Err(e) => {
@@ -566,7 +617,20 @@ fn run_isolate(rx: mpsc::Receiver<Job>, ready: mpsc::Sender<Result<()>>, env: Ve
                             continue;
                         }
                     };
+                    // R750-F2: scope the user to exactly this dispatch.
+                    {
+                        let state = runtime.op_state();
+                        let mut state = state.borrow_mut();
+                        state.put(DispatchSession(req.user.take()));
+                        state.put(DispatchSources(req.sources.take()));
+                    }
                     let r = dispatch_harness(&mut runtime, &bundle, input).await;
+                    {
+                        let state = runtime.op_state();
+                        let mut state = state.borrow_mut();
+                        state.put(DispatchSession(None));
+                        state.put(DispatchSources(None));
+                    }
                     let _ = reply.send(r);
                 }
                 Job::Invoke { bundle, hook, input, reply } => {
@@ -711,6 +775,7 @@ async fn call_bridge(runtime: &mut JsRuntime, method: &str, input: Value) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     /// End-to-end smoke: register a fixture route that returns a static
     /// Response, dispatch a GET to it, expect status + body to round-trip.
@@ -740,6 +805,8 @@ mod tests {
                     url: "http://dev/api/ping".into(),
                     headers: vec![],
                     body: None,
+                    user: None,
+                    sources: None,
                 },
             )
             .expect("dispatch");
@@ -752,6 +819,154 @@ mod tests {
             .map(|(_, v)| v.as_str())
             .unwrap_or("");
         assert!(ct.starts_with("text/plain"), "got content-type {ct}");
+    }
+
+    /// R750-F2: the pre-resolved user reaches route code via
+    /// `__mesofact_ssr.currentUser()`, is null when absent, and does not leak
+    /// from one dispatch into the next.
+    #[test]
+    fn dispatch_hands_the_resolved_user_to_route_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("whoami.js");
+        std::fs::write(
+            &bundle,
+            "export default async function (req) {\n\
+               return Response.json({ user: globalThis.__mesofact_ssr.currentUser() });\n\
+             }\n",
+        )
+        .unwrap();
+        let rt = SsrRuntime::start(Vec::new()).expect("ssr runtime starts");
+        rt.register(&bundle).expect("register");
+        let call = |user: Option<Value>| {
+            let resp = rt
+                .dispatch(
+                    &bundle,
+                    DispatchRequest {
+                        method: "GET".into(),
+                        url: "http://dev/whoami".into(),
+                        headers: vec![],
+                        body: None,
+                        user,
+                        sources: None,
+                    },
+                )
+                .expect("dispatch");
+            serde_json::from_slice::<Value>(&resp.body).unwrap()["user"].clone()
+        };
+        let user = serde_json::json!({ "id": "u_1", "attrs": { "device": "d_9" } });
+        assert_eq!(call(Some(user.clone())), user);
+        assert_eq!(call(None), Value::Null);
+    }
+
+    /// R750-F3: all four source ops round-trip through a route against an
+    /// in-memory backend; an unknown r2 name throws SourceNotRegisteredError
+    /// synchronously, an unknown sqlite name rejects with it, and a dispatch
+    /// with no backend attached reads every name as unregistered.
+    #[test]
+    fn source_ops_round_trip_through_an_in_memory_backend() {
+        use crate::ops_sources::{ListOpts, R2Object, SourceError, SourceFuture};
+        struct Mem;
+        impl SourceBackend for Mem {
+            fn fetch<'a>(&'a self, s: &'a str, key: &'a str) -> SourceFuture<'a, Option<Vec<u8>>> {
+                Box::pin(async move {
+                    match (s, key) {
+                        ("assets", "hello.txt") => Ok(Some(b"hi".to_vec())),
+                        ("assets", _) => Ok(None),
+                        _ => Err(SourceError::NotRegistered),
+                    }
+                })
+            }
+            fn list<'a>(&'a self, s: &'a str, prefix: &'a str, opts: ListOpts) -> SourceFuture<'a, Vec<R2Object>> {
+                Box::pin(async move {
+                    if s != "assets" {
+                        return Err(SourceError::NotRegistered);
+                    }
+                    Ok(vec![R2Object {
+                        key: format!("{prefix}a.txt"),
+                        size: opts.limit.unwrap_or(0) as u64,
+                        last_modified: "2026-10-07T00:00:00Z".into(),
+                        etag: None,
+                    }])
+                })
+            }
+            fn get<'a>(&'a self, s: &'a str, table: &'a str, id: &'a str) -> SourceFuture<'a, Option<Value>> {
+                Box::pin(async move {
+                    if s != "db" {
+                        return Err(SourceError::NotRegistered);
+                    }
+                    Ok(Some(serde_json::json!({ "table": table, "id": id })))
+                })
+            }
+            fn query<'a>(&'a self, s: &'a str, sql: &'a str, params: Vec<Value>) -> SourceFuture<'a, Vec<Value>> {
+                Box::pin(async move {
+                    if s != "db" {
+                        return Err(SourceError::NotRegistered);
+                    }
+                    if sql == "boom" {
+                        return Err(SourceError::Query("no such table".into()));
+                    }
+                    Ok(vec![serde_json::json!({ "sql": sql, "params": params })])
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("sources.js");
+        std::fs::write(
+            &bundle,
+            r#"import { r2, sqlite } from "@mesofact/runtime";
+const caught = async (f) => { try { await f(); return "no error"; } catch (e) { return e.name; } };
+export default async function () {
+  const bytes = await r2("assets").fetch("hello.txt");
+  return Response.json({
+    fetch: new TextDecoder().decode(bytes),
+    missing: await r2("assets").fetch("nope"),
+    list: await r2("assets").list("p/", { limit: 7 }),
+    get: await sqlite("db").get("issues", "42"),
+    query: await sqlite("db").query("SELECT 1", [1, "x"]),
+    queryErr: await caught(() => sqlite("db").query("boom")),
+    unknownR2: await caught(() => r2("nope")),
+    unknownSqlite: await caught(() => sqlite("nope").get("t", "1")),
+  });
+}
+"#,
+        )
+        .unwrap();
+        let rt = SsrRuntime::start(Vec::new()).expect("ssr runtime starts");
+        rt.register_r2_sources(&[R2SourceCoords {
+            name: "assets".into(),
+            bucket: "b".into(),
+        }])
+        .expect("register r2");
+        rt.register(&bundle).expect("register");
+        let call = |sources: Option<Arc<dyn SourceBackend>>| {
+            let resp = rt
+                .dispatch(
+                    &bundle,
+                    DispatchRequest {
+                        method: "GET".into(),
+                        url: "http://dev/sources".into(),
+                        headers: vec![],
+                        body: None,
+                        user: None,
+                        sources,
+                    },
+                )
+                .expect("dispatch");
+            assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+            serde_json::from_slice::<Value>(&resp.body).unwrap()
+        };
+
+        let v = call(Some(Arc::new(Mem)));
+        assert_eq!(v["fetch"], "hi");
+        assert_eq!(v["missing"], Value::Null);
+        assert_eq!(v["list"][0]["key"], "p/a.txt");
+        assert_eq!(v["list"][0]["size"], 7);
+        assert_eq!(v["get"], serde_json::json!({ "table": "issues", "id": "42" }));
+        assert_eq!(v["query"], serde_json::json!([{ "sql": "SELECT 1", "params": [1, "x"] }]));
+        assert_eq!(v["queryErr"], "SourceQueryError");
+        assert_eq!(v["unknownR2"], "SourceNotRegisteredError");
+        assert_eq!(v["unknownSqlite"], "SourceNotRegisteredError");
     }
 
     /// R756-F3: `invoke` reuses the registered route's default Fetch handler
@@ -860,6 +1075,8 @@ mod tests {
                     url: "http://dev/".into(),
                     headers: vec![],
                     body: None,
+                    user: None,
+                    sources: None,
                 },
             )
             .expect("dispatch");
@@ -917,6 +1134,8 @@ mod tests {
                     url: "http://dev/".into(),
                     headers: vec![],
                     body: None,
+                    user: None,
+                    sources: None,
                 },
             )
             .expect("dispatch");
@@ -986,6 +1205,8 @@ mod tests {
                     url: "http://dev/readyz?verbose".into(),
                     headers: vec![],
                     body: None,
+                    user: None,
+                    sources: None,
                 },
             )
             .expect("dispatch");
@@ -1024,6 +1245,8 @@ mod tests {
                         url: "http://dev/".into(),
                         headers: vec![],
                         body: None,
+                        user: None,
+                        sources: None,
                     },
                 )
                 .expect("dispatch");
@@ -1066,6 +1289,8 @@ mod tests {
                             url: "http://dev/".into(),
                             headers: vec![],
                             body: None,
+                            user: None,
+                            sources: None,
                         },
                     )
                     .unwrap()

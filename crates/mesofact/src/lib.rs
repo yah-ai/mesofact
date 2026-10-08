@@ -93,6 +93,8 @@ pub mod server;
 #[cfg(feature = "ssr")]
 pub mod revalidate;
 #[cfg(feature = "ssr")]
+mod sources;
+#[cfg(feature = "ssr")]
 pub mod ssr;
 #[cfg(feature = "ssr")]
 pub mod tenants;

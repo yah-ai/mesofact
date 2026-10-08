@@ -135,6 +135,18 @@ pub struct ServeArgs {
     #[arg(long, conflicts_with_all = ["workload", "publish_config", "allow_route"])]
     tenants: Option<PathBuf>,
 
+    /// Env var holding the session codec secret. Same flag, env form and
+    /// builder as `mesofact proxy` ([`mesofact_core::proxy::session::resolver_from_env`]):
+    /// when set, SSR route code receives the cookie-resolved user via
+    /// `__mesofact_ssr.currentUser()` (R750-F2). This hands identity over; it
+    /// does NOT enforce `requires: ["user"]` — see `trust_edge_auth`.
+    #[arg(long, env = "MESOFACT_SESSION_SECRET_ENV")]
+    session_secret_env: Option<String>,
+
+    /// Session cookie name (default `mesofact_session`), as for `mesofact proxy`.
+    #[arg(long, env = "MESOFACT_SESSION_COOKIE", default_value = "mesofact_session")]
+    session_cookie: String,
+
     /// Assert that an **authenticating edge** fronts this process, so routes
     /// declaring `requires: ["user"]` may be served (R556-B13).
     ///
@@ -319,6 +331,8 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         // binary cannot execute (static-only build), rather than silently
         // 404ing them one request at a time.
         let server = attach_bundle_ssr(server, &bundle_abs).await?;
+        #[cfg(feature = "ssr")]
+        let server = with_session_resolver(server, &args);
         // R749-F3: the domain manifest's declared response headers, on every
         // response this bundle serves. The bundle tier is the passway origin —
         // the front door this table used to be invisible to.
@@ -357,11 +371,10 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 ///   - `resilience` — the retry/timeout wrapper in [`crate::server`]'s SSR
 ///     dispatch, `ssr` builds only. A static-only build has no isolate, so it
 ///     refuses `mode:"ssr"` routes wholesale anyway.
-///   - `requires` — NOT enforced. `serve` has no session resolver; that check
-///     lives only in `mesofact_core::proxy::router`, and wiring one in needs
-///     more than calling the router (`mesofact_ssr::DispatchRequest` has no
-///     `user` field, so a resolved session has no channel into the isolate —
-///     W225 §2b, measured by R637). Delegated by `--trust-edge-auth`.
+///   - `requires` — NOT enforced. With `--session-secret-env`, `serve` resolves
+///     the session and hands the user to SSR route code (R750-F2), but the
+///     401/redirect gate lives only in `mesofact_core::proxy::router`.
+///     Delegated by `--trust-edge-auth`.
 ///   - `concurrency` — NOT enforced, by anything in this binary.
 fn serve_policy_support(args: &ServeArgs) -> mesofact_core::PolicySupport {
     use mesofact_core::RoutePolicy;
@@ -453,6 +466,16 @@ fn with_declared_cache_policy(
         );
     }
     Ok(server.with_cache_policy(table))
+}
+
+/// Attach the session resolver SSR dispatch resolves users with (R750-F2) —
+/// built by the same function `mesofact proxy` uses, from the same flags.
+#[cfg(feature = "ssr")]
+fn with_session_resolver(server: crate::Server, args: &ServeArgs) -> crate::Server {
+    server.with_session(mesofact_core::proxy::session::resolver_from_env(
+        args.session_secret_env.as_deref(),
+        &args.session_cookie,
+    ))
 }
 
 /// Attach an SSR isolate to a bundle server, same as the SSR-host path does
@@ -662,7 +685,7 @@ async fn run_workload_modes(args: ServeArgs) -> anyhow::Result<()> {
         .workload
         .clone()
         .ok_or_else(|| anyhow::anyhow!("a <workload> dir is required for the SSR host (or --bundle for static serving)"))?;
-    let server = Server::from_workload(&workload)?;
+    let server = with_session_resolver(Server::from_workload(&workload)?, &args);
 
     // Canonicalize so the isolate's manifest read + dynamic-import resolve
     // against absolute paths regardless of the container's working directory.

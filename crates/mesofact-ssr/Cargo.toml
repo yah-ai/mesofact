@@ -1,9 +1,9 @@
 # deno_core-hosted JS runtime shared by mesofact-build (SSG, one-shot render)
 # and mesofact-dev (long-lived SSR dispatch). Extracted from mesofact-build so
 # the dev-tier subprocess can be replaced with an in-process dispatch call
-# (W174 pillar 4, R449-F2). The Fetch API is provided by deno extension crates
-# (deno_web/deno_url/deno_fetch/deno_console) wired in by `SsrRuntime`; the
-# SSG path keeps using the lean polyfill bootstrap (build-time only, no I/O).
+# (W174 pillar 4, R449-F2). The SSR Fetch API is a pure-JS shim over one
+# reqwest-backed op (R750-F1 — no deno extension crates); the SSG path keeps
+# using the lean polyfill bootstrap (build-time only, no I/O).
 
 [package]
 name = "mesofact-ssr"
@@ -14,58 +14,24 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# https:// for SSR fetch(), same reqwest backend as mesofact-core. Enabled by
+# mesofact's `ssr` feature; off by default (standalone is http-only).
+tls = ["reqwest/rustls-tls"]
+
 [dependencies]
 deno_core = "0.404"
-# Web/Fetch extensions for the dev-tier SSR isolate. Versions chosen for
-# binary-API compatibility with deno_core 0.404 (deno extension crates track
-# deno_core releases tightly — they share serde_v8/op-registration internals).
-# deno_url and deno_console are deprecated empty husks; deno_web provides
-# URL/URLSearchParams/console alongside its other Web primitives.
-deno_webidl = "0.251"
-deno_web = "0.282"
-deno_fetch = "0.275"
-# deno_fetch's 22_http_client.js pulls in ext:deno_net/02_tls.js — must be
-# registered even if SSR routes never construct a TLS client manually.
-deno_net = "0.243"
-# deno_fetch/26_fetch.js destructures internals.__telemetry at module-load.
-# deno_telemetry ships its bootstrap as a .ts file that needs swc transpile,
-# which we don't want to pull in for dev SSR — we stub internals.__telemetry
-# in ssr_bootstrap.js with no-op tracer/propagators instead.
-# deno_fs::FsError + deno_permissions::CheckedPath appear in the FetchPermissions
-# signature; pin to whatever deno_fetch picked up.
-deno_fs = "0.161"
-deno_permissions = "0.110"
-# deno_fetch's HTTP client always builds a TLS-capable connector (even for a
-# plain-http:// request), which needs a process-wide rustls CryptoProvider.
-# Both `aws-lc-rs` and `ring` end up in the dependency graph (different deno_*
-# crates pick different rustls features), so rustls can't auto-select one —
-# the first real fetch() call panics ("Could not automatically determine the
-# process-level CryptoProvider") without an explicit `install_default()`.
-# aws-lc-rs matches what deno_net's own QUIC code already picks
-# (rustls::crypto::aws_lc_rs::default_provider(), see deno_net's quic.rs).
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
-sys_traits = { version = "0.1", features = ["libc", "winapi"] }
+# op2 error type; pinned to the exact version deno_core 0.404 uses.
+deno_error = "=0.7.1"
+# Backs op_mesofact_fetch (R750-F1). http-only by default so the lean closure
+# carries no TLS stack; the `tls` feature adds mesofact-core's backend.
+reqwest = { version = "0.12", default-features = false }
 
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-tokio = { version = "1", features = ["rt", "macros", "sync"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 tracing = "0.1"
-
-# R823 — build.rs copies the deno extension crates' JS into OUT_DIR so
-# `JsRuntime::new` stops reading it off the build machine's cargo registry.
-#
-# `serde_json` ONLY, and that restraint is load-bearing. The first cut took
-# deno_core + the four extension crates as build-dependencies to read the file
-# lists off real `Extension` values; that made the build SCRIPT link
-# `librusty_v8.a`, i.e. C++, as a HOST unit — and cargo does not apply RUSTFLAGS
-# to host units when `--target` is passed, so the musl builder image's
-# `-lstdc++ -latomic -lgcc` never reached that link and the fleet build died with
-# ~30 undefined libstdc++ symbols (R556-F6 run 8d5023a1, us-west-002). Nothing
-# here may pull deno_core, directly or transitively. build.rs's header has the
-# full account.
-[build-dependencies]
-serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"

@@ -37,4 +37,4 @@ pub use pointer::{
     ObjectPointerStore, Pointer, PointerError, PointerState, PointerStore, POINTER_PREFIX,
 };
 pub use publish::{publish_dist, publish_pin, PublishError, PublishReport, TagIndex};
-pub use s3::S3Store;
+pub use s3::{ListedObject, S3Store};

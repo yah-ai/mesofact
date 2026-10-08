@@ -10,18 +10,24 @@
 //! - `SsrRuntime` (to land in this crate alongside `SsgRuntime`) — long-lived
 //!   isolate that pre-loads each SSR route's render_entrypoint at startup and
 //!   exposes `dispatch(method, url, headers, body)` for the dev server's
-//!   request path. Wires the deno_web/url/fetch/console extension crates so
-//!   route code can use the real Fetch API.
+//!   request path. Route code gets a lean pure-JS Fetch surface
+//!   (`js/ssr_fetch_shim.js`) over one reqwest-backed op (R750-F1).
 //!
 //! `JsRuntime` is `!Send`, so each runtime owns a dedicated thread with a
 //! current-thread tokio runtime; callers talk to it through a small
 //! synchronous handle.
 
 mod ext_sources;
+mod ops_fetch;
+mod ops_session;
+mod ops_sources;
 mod ssg;
 mod ssr;
 
+pub use ops_sources::{ListOpts, R2Object, SourceBackend, SourceError, SourceFuture};
 pub use ssg::SsgRuntime;
+#[doc(hidden)]
+pub use ssr::{extensions as ssr_extensions, SSR_PRELUDE};
 pub use ssr::{
     DispatchRequest, DispatchResponse, R2SourceCoords, SsrPool, SsrRuntime, DEFAULT_POOL_SIZE,
 };

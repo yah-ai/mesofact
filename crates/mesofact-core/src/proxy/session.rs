@@ -24,6 +24,34 @@
 //! R019), surface it here instead.
 //!
 //! See `.yah/docs/architecture/mesofact.md` §"Auth & session contract".
+//!
+//! @yah:ticket(R750-F2, "op_mesofact_session: hand the Rust-resolved User (cheers SessionResolver) into the SSR isolate")
+//! @yah:status(review)
+//! @yah:at(2026-10-07T21:52:46Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R750)
+//! @yah:next("Tier: Warrior. Identity is already resolved Rust-side (R556-B13): SessionResolver::resolve(cookie_header) -> Option<User> at oss/mesofact/crates/mesofact-core/src/proxy/session.rs:70, User at :41. The isolate just needs it handed over — mesofact-ssr must NOT gain a cheers dependency.")
+//! @yah:next("Design: the SSR dispatch entry in mesofact-ssr (ssr.rs dispatch/invoke path) takes an optional resolved user (serde_json::Value or a small mesofact-ssr-owned SsrUser {id, attrs}) alongside the request, stores it in OpState per-dispatch; #[op2] op_mesofact_session() returns it (or null). The caller in mesofact-core (wherever the SSR route handler builds the request and has the cookie header + resolver) resolves and passes it. If a cookie_header-taking op is strictly required by the ticket text, implement it as op_mesofact_session(cookie_header) that looks up a resolver closure in OpState instead; prefer the pre-resolved shape — fewer moving parts.")
+//! @yah:next("JS side: expose it on the runtime API the TS package expects (check oss/mesofact/packages/mesofact-runtime/src for a session/user/auth export; if none exists, add `session()` / `currentUser()` to ssr_harness.js's globalThis.__mesofact_ssr context object and mirror the TS type in mesofact-runtime).")
+//! @yah:next("Add a unit test in mesofact-ssr that dispatches a tiny route reading the session and asserts both the user-present and null cases.")
+//! @yah:next("Return: single JSON object {ticket_id, status, commit_sha?, notes<=3 sentences with pass/fail counts vs baseline}. Full account goes in @yah:handoff. Git policy is defer: no commits; print the command you would have run.")
+//! @yah:verify("cargo test -p mesofact-ssr and cargo test -p mesofact-core pass (record counts vs baseline).")
+//! @yah:verify("cargo tree -p mesofact-ssr does not list cheers.")
+//! @yah:gotcha("Depends on MFT-R750-F1 landing the extension rewrite in ssr.rs first — register the op in the same extensions() fn. Do not edit js/ssr_runtime_shim.js (R820 header; T3's seam). Shared tree, git policy defer.")
+//! @yah:depends_on(MFT-R750-F1)
+//! @yah:files(oss/mesofact/crates/mesofact-core/src/proxy/session.rs)
+//! @yah:files(oss/mesofact/crates/mesofact-ssr/src/ssr.rs)
+//! @yah:files(oss/mesofact/crates/mesofact-ssr/js/ssr_harness.js)
+//! @yah:handoff("LANDED: DispatchRequest gains `#[serde(skip)] pub user: Option<serde_json::Value>`, which is mesofact-core's User as {id, attrs}. The isolate's Job::Dispatch puts it in OpState as DispatchSession before dispatch_harness and resets it to None afterwards. An isolate serves one dispatch at a time, so the user cannot leak into the next request. New src/ops_session.rs: sync #[op2] op_mesofact_session() returns the user or null, registered in extensions() next to mesofact_fetch. js/ssr_harness.js: __mesofact_ssr.currentUser(). mesofact-runtime: `SsrContext { currentUser(): User | null }` type in contract.ts, exported from index.ts. ssr_runtime_shim.js was not touched.")
+//! @yah:verify("cargo test -p mesofact-ssr: 11 passed, 0 failed (baseline 10, plus the new dispatch_hands_the_resolved_user_to_route_code test, which covers user-present, then null, and no leak across dispatches)")
+//! @yah:verify("cargo test -p mesofact-core: 77 passed (48+3+1+21+4), 0 failed; baseline measured before the change was also 77")
+//! @yah:verify("cargo check -p mesofact --features ssr --tests: EXIT 0")
+//! @yah:verify("cargo tree -p mesofact-ssr | grep -c cheers = 0")
+//! @yah:verify("packages/mesofact-runtime tsc --noEmit: exit 0")
+//! @yah:handoff("PRODUCTION CALLER WIRED (leader decision). proxy and serve are separate subcommands, i.e. separate processes, so they cannot share one resolver instance. They share the builder instead: the new mesofact_core::proxy::session::resolver_from_env(secret_env, cookie_name) is the body of proxy's old build_session_resolver, and cli/proxy.rs now delegates to it. `mesofact serve` gains the same --session-secret-env / --session-cookie flags with the same env vars (MESOFACT_SESSION_SECRET_ENV / MESOFACT_SESSION_COOKIE). with_session_resolver() attaches the resolver on both SSR paths: the bundle path after attach_bundle_ssr, and run_workload_modes. Server/ServerState hold `session: Option<Arc<dyn SessionResolver>>` (ssr builds; Server::with_session). serve_dynamic calls resolve_ssr_user(resolver, headers), which takes the Cookie header, runs SessionResolver::resolve and serializes the User to {id, attrs}, then passes the result to dispatch_to_ssr. DispatchRequest.user is set on every retry attempt. Not done in this ticket: serve still does not ENFORCE requires:[user]. The 401/redirect gate stays in the proxy router, and --trust-edge-auth is unchanged; the serve_policy_support doc was updated to say so.")
+//! @yah:verify("Server-level test ssr_dispatch_carries_the_resolved_user (crates/mesofact/src/server.rs) covers three cases: a verifying cookie gives {id:u_1, attrs:{}}, a missing cookie gives null, and no resolver gives null.")
+//! @yah:verify("cargo test -p mesofact --features ssr --no-fail-fast: lib 202 passed, 2 failed (baseline 201 passed, 2 failed). The 2 failures are the same cli::new version-pin tests in both runs (@mesofact/runtime 0.8.42 vs binary 0.8.43-pre.1) and are unrelated to this change. Integration tests: 5 + 2 passed.")
+//! @yah:verify("Re-run after the wiring: mesofact-ssr 11 passed; mesofact-core 77 passed; cargo check -p mesofact --tests with and without the ssr feature: EXIT 0. The one warning (resolve_mirror_key never used, default features) is in code this change did not touch.")
 
 use cheers_core::{Claims, Codec, CodecError};
 // Concrete symmetric codec moved out of cheers-core into cheers-server by the
@@ -111,6 +139,35 @@ impl SessionResolver for CookieSessionResolver {
         // system clock; any failure → unauthenticated.
         let claims = self.codec.verify(token).ok()?;
         Some(User::from_claims(claims))
+    }
+}
+
+/// Build the cookie resolver from deploy config: `secret_env` names the env var
+/// holding the codec secret (`--session-secret-env`), `cookie_name` the cookie.
+/// Shared by `mesofact proxy` and `mesofact serve` (R750-F2) so both
+/// subcommands resolve sessions from one configuration surface. A
+/// configured-but-unset/empty env var is a deploy error: warn and run without
+/// sessions rather than crash (fails safe — routes see no user, not a forged one).
+pub fn resolver_from_env(
+    secret_env: Option<&str>,
+    cookie_name: &str,
+) -> Option<std::sync::Arc<dyn SessionResolver>> {
+    let env_name = secret_env?;
+    match std::env::var(env_name) {
+        Ok(secret) if !secret.is_empty() => {
+            tracing::info!(cookie = %cookie_name, "session resolver enabled");
+            Some(std::sync::Arc::new(CookieSessionResolver::new(
+                cookie_name.to_owned(),
+                secret.into_bytes(),
+            )))
+        }
+        _ => {
+            tracing::warn!(
+                env = %env_name,
+                "session secret env var is unset/empty — sessions disabled"
+            );
+            None
+        }
     }
 }
 

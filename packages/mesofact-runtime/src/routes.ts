@@ -1,6 +1,5 @@
 //! @yah:relay(R015, "Render cube support — placement axis + SSR build path + lint (W173)")
 //! @yah:at(2026-06-04T19:31:37Z)
-//! @yah:status(open)
 //! @yah:next("W173 lives in the yah parent camp at .yah/docs/working/W173-mesofact-render-cube.md (relative from mesofact root: ../../.yah/docs/working/W173-mesofact-render-cube.md). Read § 'v1 schema delta' and § 'SSR_PREFIXES derivation rule' before T1/T2.")
 //! @yah:next("yah-side consumer relay is R434 in the parent camp — R434-F3 (mesofact-dev SSR subprocess), R434-F4 (pond reconciler ssr_runtime), R434-F5 (first SSR consumer route) all assume this relay ships first.")
 //! @yah:next("Coordinate handoff via @mesofact/runtime version bump: yah-side consumes via packages/yah/workload-spec/index.ts and crates/yah/cloud/src/reconciler/mesofact_static.rs.")

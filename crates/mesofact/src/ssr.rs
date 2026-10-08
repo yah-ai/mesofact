@@ -302,6 +302,9 @@ enum DispatchTarget {
         /// derived_prefix → absolute path of the registered render_entrypoint.
         /// `dispatch` does longest-prefix lookup here to pick the bundle.
         bundles: HashMap<String, PathBuf>,
+        /// R750-F3: attached to every dispatch; `None` when the workload
+        /// declares no `[sources]`.
+        sources: Option<Arc<dyn mesofact_ssr::SourceBackend>>,
     },
     #[cfg(test)]
     Mock(Box<dyn Fn(DispatchRequest) -> Result<DispatchResponse> + Send + Sync>),
@@ -310,9 +313,11 @@ enum DispatchTarget {
 impl DispatchTarget {
     async fn dispatch(&self, path: &str, req: DispatchRequest) -> Result<DispatchResponse> {
         match self {
-            DispatchTarget::Runtime { pool, bundles } => {
+            DispatchTarget::Runtime { pool, bundles, sources } => {
                 let bundle = longest_prefix_match(bundles, path)
                     .ok_or_else(|| anyhow::anyhow!("no SSR bundle registered for {path}"))?;
+                let mut req = req;
+                req.sources = sources.clone();
                 // R444: route code can now do real I/O during dispatch (an
                 // r2().fetch() against mesofact-dev's own dev S3 surface, or
                 // real R2 in prod), so "isolate-thread round-trip is fast, no
@@ -377,6 +382,8 @@ impl DispatchTarget {
                         .to_string(),
                     headers: Vec::new(),
                     body: None,
+                    user: None,
+                    sources: None,
                 };
                 let resp = f(req)?;
                 Ok(serde_json::json!({ "status": resp.status }))
@@ -615,6 +622,10 @@ struct RawR2Source {
     access_key_id_env: Option<String>,
     #[serde(default)]
     secret_access_key_env: Option<String>,
+    /// `kind = "sqlite"` only: database file (R750-F3). Relative paths
+    /// resolve against the workload dir.
+    #[serde(default)]
+    path: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -632,16 +643,71 @@ const DEFAULT_SECRET_ACCESS_KEY_ENV: &str = "AWS_SECRET_ACCESS_KEY";
 /// fails the whole spawn — mirrors `mesofact-worker`'s `runWorker`, which
 /// registers adapters from the same file before loading entrypoints and fails
 /// fast at boot rather than at the first request.
-fn resolve_r2_sources(workload: &Path, env: &[(String, String)]) -> Result<Vec<R2SourceCoords>> {
+/// Every `[sources.*]` entry the SSR backend serves (R750-F3): the r2 entries
+/// (also pushed into the isolate's name registry) plus `kind = "sqlite"`.
+fn resolve_sources(
+    workload: &Path,
+    env: &[(String, String)],
+) -> Result<(Vec<R2SourceCoords>, Vec<(String, crate::sources::SourceSpec)>)> {
+    use crate::sources::SourceSpec;
+    let resolved = resolve_r2_sources(workload, env)?;
+    let r2 = resolved
+        .iter()
+        .map(|c| R2SourceCoords {
+            name: c.name.clone(),
+            bucket: c.bucket.clone(),
+        })
+        .collect();
+    let mut specs: Vec<(String, SourceSpec)> = resolved
+        .iter()
+        .map(|c| {
+            (
+                c.name.clone(),
+                SourceSpec::R2 {
+                    bucket: c.bucket.clone(),
+                    endpoint: c.endpoint.clone(),
+                    access_key_id: c.access_key_id.clone(),
+                    secret_access_key: c.secret_access_key.clone(),
+                },
+            )
+        })
+        .collect();
+    for (name, src) in read_sources_file(workload)?.sources {
+        if src.kind != "sqlite" {
+            continue;
+        }
+        let path = src
+            .path
+            .with_context(|| format!("[sources.{name}] missing `path`"))?;
+        let path = workload.join(path).to_string_lossy().into_owned();
+        specs.push((name, SourceSpec::Sqlite { path }));
+    }
+    Ok((r2, specs))
+}
+
+fn read_sources_file(workload: &Path) -> Result<SourcesFile> {
     let path = workload.join("mesofact.config.toml");
     let text = match std::fs::read_to_string(&path) {
         Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(SourcesFile::default()),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    let file: SourcesFile =
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+}
 
+/// An r2 entry with credentials resolved. Stays on the Rust side (the signed
+/// `S3Store` needs them); the isolate registry only gets name + bucket.
+#[derive(Debug)]
+struct ResolvedR2 {
+    name: String,
+    bucket: String,
+    endpoint: String,
+    access_key_id: String,
+    secret_access_key: String,
+}
+
+fn resolve_r2_sources(workload: &Path, env: &[(String, String)]) -> Result<Vec<ResolvedR2>> {
+    let file = read_sources_file(workload)?;
     let mut out = Vec::new();
     for (name, src) in file.sources {
         if src.kind != "r2" {
@@ -659,7 +725,7 @@ fn resolve_r2_sources(workload: &Path, env: &[(String, String)]) -> Result<Vec<R
         let secret_access_key_env = src
             .secret_access_key_env
             .unwrap_or_else(|| DEFAULT_SECRET_ACCESS_KEY_ENV.to_string());
-        out.push(R2SourceCoords {
+        out.push(ResolvedR2 {
             endpoint: env_required(env, &endpoint_env, &name, "endpoint_env")?,
             access_key_id: env_required(env, &access_key_id_env, &name, "access_key_id_env")?,
             secret_access_key: env_required(
@@ -705,7 +771,15 @@ pub async fn spawn(opts: SpawnOptions) -> Result<Option<SsrChild>> {
     // R444: resolve [sources.r2] against opts.env before booting the isolate
     // — a bad/missing credential env var should fail the whole spawn, same as
     // mesofact-worker's boot-time registerSourcesFromConfig.
-    let r2_sources = resolve_r2_sources(&opts.workload, &opts.env)?;
+    let (r2_sources, source_specs) = resolve_sources(&opts.workload, &opts.env)?;
+    // R750-F3: the backend `r2()` / `sqlite()` read through, attached to every
+    // dispatch below. Built here, inside the server's runtime, which is where
+    // its I/O runs.
+    let sources: Option<Arc<dyn mesofact_ssr::SourceBackend>> = if source_specs.is_empty() {
+        None
+    } else {
+        Some(Arc::new(crate::sources::Sources::new(source_specs)?))
+    };
 
     let pool_size = resolve_pool_size(opts.pool_size);
     info!(
@@ -767,7 +841,7 @@ pub async fn spawn(opts: SpawnOptions) -> Result<Option<SsrChild>> {
     .await;
 
     Ok(Some(SsrChild {
-        target: DispatchTarget::Runtime { pool: Arc::new(pool), bundles },
+        target: DispatchTarget::Runtime { pool: Arc::new(pool), bundles, sources },
         prefixes: Arc::new(RwLock::new(prefixes)),
         policies: Arc::new(RwLock::new(policies)),
         hooks: Arc::new(RwLock::new(hooks)),
@@ -1042,6 +1116,8 @@ mod tests {
                     url: "http://dev/api/ping".into(),
                     headers: vec![],
                     body: None,
+                    user: None,
+                    sources: None,
                 },
             )
             .await
@@ -1268,6 +1344,8 @@ mod tests {
                                 url: "http://dev/api/slow".into(),
                                 headers: vec![],
                                 body: None,
+                                user: None,
+                                sources: None,
                             },
                         )
                         .await

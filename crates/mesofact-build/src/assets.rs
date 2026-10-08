@@ -5,7 +5,6 @@
 //!
 //! @yah:relay(R821, "Two build-output gaps a real WASM site hits: .wasm MIME and spa routes missing from the sitemap")
 //! @yah:at(2026-08-16T22:31:44Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //!
 //! @yah:ticket(R821-B1, "content_type_for has no .wasm arm, so every WASM site loses instantiateStreaming")

@@ -22,7 +22,6 @@
 //!
 //! @yah:relay(R600, "Prerender instance keys: renderer emits a flat name the edge router never resolves")
 //! @yah:at(2026-08-12T17:43:59Z)
-//! @yah:status(open)
 //!
 //! @yah:ticket(R600-B1, "Parametric prerender instances publish under a flat key the edge router never looks up - every /route/:param page 404s")
 //! @yah:status(review)

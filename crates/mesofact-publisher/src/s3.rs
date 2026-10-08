@@ -126,6 +126,45 @@ impl S3Store {
         format!("{}/{}/{}", self.endpoint, self.bucket, encoded)
     }
 
+/// One page of a LIST v2 call — what SSR's `r2(name).list(prefix, opts)`
+    /// returns (R750-F3): object metadata, not just keys, for exactly the
+    /// caller's `limit` / `cursor` / `delimiter`. Keys are logical (base prefix
+    /// stripped), same as [`ObjectStore::list`].
+    pub async fn list_page(
+        &self,
+        prefix: &str,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+        delimiter: Option<&str>,
+    ) -> Result<Vec<ListedObject>, StoreError> {
+        let (url, mut query) = self.list_url(prefix, cursor);
+        if let Some(n) = limit {
+            query.push(("max-keys".to_string(), n.to_string()));
+        }
+        if let Some(d) = delimiter {
+            query.push(("delimiter".to_string(), d.to_string()));
+        }
+        let query_refs: Vec<(&str, &str)> =
+            query.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let res = self
+            .signed_request(Method::GET, &url, &query_refs, HeaderMap::new(), Bytes::new())
+            .await?;
+        let res = check_status(res, "LIST", prefix).await?;
+        let xml = res
+            .text()
+            .await
+            .map_err(|e| StoreError::Transport(format!("read body: {e}")))?;
+        Ok(parse_list_objects(&xml)
+            .into_iter()
+            .map(|mut o| {
+                if let Some(k) = o.key.strip_prefix(&self.base_prefix) {
+                    o.key = k.to_string();
+                }
+                o
+            })
+            .collect())
+    }
+
     fn list_url(&self, prefix: &str, continuation: Option<&str>) -> (String, Vec<(String, String)>) {
         let mut query = vec![
             ("list-type".to_string(), "2".to_string()),
@@ -493,6 +532,38 @@ fn parse_list_v2(xml: &str) -> (Vec<String>, Option<String>) {
     (keys, next_token)
 }
 
+/// One `<Contents>` entry of a LIST v2 response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedObject {
+    pub key: String,
+    pub size: u64,
+    pub last_modified: String,
+    pub etag: Option<String>,
+}
+
+fn parse_list_objects(xml: &str) -> Vec<ListedObject> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while let Some(open) = xml[start..].find("<Contents>") {
+        let abs_open = start + open + "<Contents>".len();
+        let Some(close_rel) = xml[abs_open..].find("</Contents>") else {
+            break;
+        };
+        let inner = &xml[abs_open..abs_open + close_rel];
+        if let (Some(key), Some(size), Some(last_modified)) = (
+            pick_xml(inner, "Key"),
+            pick_xml(inner, "Size").and_then(|s| s.parse().ok()),
+            pick_xml(inner, "LastModified"),
+        ) {
+            let etag = pick_xml(inner, "ETag")
+                .map(|e| e.replace("&quot;", "").trim_matches('"').to_string());
+            out.push(ListedObject { key, size, last_modified, etag });
+        }
+        start = abs_open + close_rel + "</Contents>".len();
+    }
+    out
+}
+
 fn pick_xml(haystack: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
@@ -577,6 +648,20 @@ mod tests {
             hex::encode(key),
             "f4780e2d9f65fa895f9c67b32ce1baf0b0d8a43505a000a1a9e090d414db404d"
         );
+    }
+
+    #[test]
+    fn parse_list_objects_reads_metadata() {
+        let xml = r#"<ListBucketResult>
+          <Contents><Key>a/b.html</Key><Size>10</Size><LastModified>2026-10-07T00:00:00.000Z</LastModified><ETag>&quot;abc&quot;</ETag></Contents>
+          <Contents><Key>a/c.html</Key><Size>20</Size><LastModified>2026-10-08T00:00:00.000Z</LastModified></Contents>
+        </ListBucketResult>"#;
+        let got = parse_list_objects(xml);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].key, "a/b.html");
+        assert_eq!(got[0].size, 10);
+        assert_eq!(got[0].etag.as_deref(), Some("abc"));
+        assert_eq!(got[1].etag, None);
     }
 
     #[test]

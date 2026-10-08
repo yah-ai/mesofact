@@ -1,122 +1,53 @@
-// SSR bootstrap (W174 pillar 4 / R449-F2). Runs once per SsrRuntime startup
-// before any route module loads. Materialises the Fetch API globals out of
-// deno_web + deno_fetch's lazy-loaded JS modules.
+// SSR bootstrap (W174 pillar 4 / R449-F2, lean since R750-F1). Runs once per
+// SsrRuntime startup before any route module loads, as the first of the
+// three scripts in `ssr::SSR_PRELUDE`:
 //
-// Each `core.loadExtScript("ext:<crate>/<file>.js")` returns the file's IIFE
-// export object; the cascade of internal `loadExtScript` calls inside those
-// IIFEs wires up the transitive dependency graph (e.g. 23_request.js pulls
-// in 00_infra.js, 01_console.js, 01_dom_exception.js automatically). We only
-// touch the top-level entry points the dev SSR contract needs:
+//   1. this file        — timers, atob/btoa, process.env
+//   2. js/bootstrap.js  — the SSG polyfills shared verbatim: console,
+//                         TextEncoder/TextDecoder, self
+//   3. js/ssr_fetch_shim.js — URL, URLSearchParams, Headers, Request,
+//                         Response, fetch (over op_mesofact_fetch)
 //
-//   - URL / URLSearchParams           (ext:deno_web/00_url.js)
-//   - TextEncoder / TextDecoder       (ext:deno_web/08_text_encoding.js)
-//   - DOMException                    (ext:deno_web/01_dom_exception.js)
-//   - AbortController / AbortSignal   (ext:deno_web/03_abort_signal.js)
-//   - Event / EventTarget             (ext:deno_web/02_event.js)
-//   - ReadableStream + friends        (ext:deno_web/06_streams.js)
-//   - Blob / File / FormData          (ext:deno_web/09_file.js, ext:deno_fetch/21_formdata.js)
-//   - Headers / Request / Response    (ext:deno_fetch/{20,23}.js)
-//   - fetch                           (ext:deno_fetch/26_fetch.js)
+// Order matters: bootstrap.js installs a *throwing* setTimeout when none
+// exists (correct for build-time SSG), so the real one must land first.
 //
-// `process.env` is installed as an empty record so route code that reads
-// env vars (e.g. ISSUE_TRACKER_URL) gets `undefined` cleanly rather than a
-// TypeError. The Rust side will populate it before any route runs.
+// No deno extension JS is loaded any more — everything here is either
+// deno_core's own built-ins or plain JS. W225 §2b measured the surface.
 "use strict";
 ((globalThis) => {
   const core = globalThis.Deno.core;
-  const load = (specifier) => core.loadExtScript(specifier);
 
-  // Order matters only for IIFE-evaluation side effects; transitive deps
-  // resolve via the loadExtScript memoisation inside each file.
-  // deno_fetch/26_fetch.js destructures internals.__telemetry at module
-  // load. The real deno_telemetry crate ships its bootstrap as .ts which
-  // needs swc transpile we don't want — install minimal no-op stubs so the
-  // destructure resolves to functions/values that do nothing. Outbound
-  // fetch() still works; only tracing is disabled.
-  const noop = () => {};
-  const noopRestore = () => {};
-  const noopSpan = {
-    end: noop,
-    setAttribute: noop,
-    setAttributes: noop,
-    addEvent: noop,
-    setStatus: noop,
-    updateName: noop,
-    recordException: noop,
-    isRecording: () => false,
+  // R746-S4: timers are legitimate in a per-request handler — a Promise.race
+  // timeout, a retry delay — and the dispatch path drives the event loop
+  // (`with_event_loop_promise`), so a pending timer actually fires. Backed by
+  // deno_core's own timer wheel (core.createTimer), not deno_web.
+  const timers = new Map();
+  globalThis.setTimeout = (callback, delay = 0, ...args) => {
+    if (typeof callback !== "function") {
+      throw new TypeError("setTimeout: callback must be a function");
+    }
+    let id;
+    const timer = core.createTimer(
+      () => {
+        timers.delete(id);
+        callback(...args);
+      },
+      delay,
+      undefined,
+      false,
+      true,
+    );
+    id = timer._timerId;
+    timers.set(id, timer);
+    return id;
   };
-  const noopTracer = { startSpan: () => noopSpan };
-  globalThis.__bootstrap.internals.__telemetry = {
-    builtinTracer: () => noopTracer,
-    ContextManager: class { active() { return null; } with(_ctx, fn) { return fn(); } },
-    enterSpan: () => noopRestore,
-    restoreSnapshot: () => noopRestore,
-    TRACING_ENABLED: false,
-    PROPAGATORS: [],
+  globalThis.clearTimeout = (id) => {
+    const timer = timers.get(id);
+    if (timer) {
+      timers.delete(id);
+      core.cancelTimer(timer);
+    }
   };
-  globalThis.__bootstrap.internals.__telemetryUtil = {
-    updateSpanFromRequest: noop,
-    updateSpanFromResponse: noop,
-  };
-
-  load("ext:deno_web/00_infra.js");
-  load("ext:deno_web/01_dom_exception.js");
-  load("ext:deno_web/02_event.js");
-  load("ext:deno_web/03_abort_signal.js");
-  load("ext:deno_web/02_timers.js");
-  load("ext:deno_web/05_base64.js");
-  load("ext:deno_web/06_streams.js");
-  load("ext:deno_web/08_text_encoding.js");
-  load("ext:deno_web/09_file.js");
-  load("ext:deno_web/10_filereader.js");
-  load("ext:deno_web/15_performance.js");
-
-  const url = load("ext:deno_web/00_url.js");
-  const encoding = load("ext:deno_web/08_text_encoding.js");
-  const dom = load("ext:deno_web/01_dom_exception.js");
-  const event = load("ext:deno_web/02_event.js");
-  const abort = load("ext:deno_web/03_abort_signal.js");
-  const streams = load("ext:deno_web/06_streams.js");
-  const file = load("ext:deno_web/09_file.js");
-  const filereader = load("ext:deno_web/10_filereader.js");
-  const performance = load("ext:deno_web/15_performance.js");
-  const base64 = load("ext:deno_web/05_base64.js");
-  const timers = load("ext:deno_web/02_timers.js");
-  const headers = load("ext:deno_fetch/20_headers.js");
-  const formdata = load("ext:deno_fetch/21_formdata.js");
-  const request = load("ext:deno_fetch/23_request.js");
-  const response = load("ext:deno_fetch/23_response.js");
-  const fetch_ = load("ext:deno_fetch/26_fetch.js");
-
-  // Web primitives.
-  globalThis.URL = url.URL;
-  globalThis.URLSearchParams = url.URLSearchParams;
-  globalThis.TextEncoder = encoding.TextEncoder;
-  globalThis.TextDecoder = encoding.TextDecoder;
-  globalThis.TextEncoderStream = encoding.TextEncoderStream;
-  globalThis.TextDecoderStream = encoding.TextDecoderStream;
-  globalThis.DOMException = dom.DOMException;
-  globalThis.Event = event.Event;
-  globalThis.EventTarget = event.EventTarget;
-  globalThis.AbortController = abort.AbortController;
-  globalThis.AbortSignal = abort.AbortSignal;
-  globalThis.ReadableStream = streams.ReadableStream;
-  globalThis.WritableStream = streams.WritableStream;
-  globalThis.TransformStream = streams.TransformStream;
-  globalThis.Blob = file.Blob;
-  globalThis.File = file.File;
-  globalThis.FileReader = filereader.FileReader;
-  globalThis.performance = performance.performance;
-
-  // R746-S4: these were *loaded* but never bound, so an SSR route calling
-  // btoa() or setTimeout() got a bare ReferenceError on capability that was
-  // already compiled in. Timers are legitimate in a per-request handler — a
-  // Promise.race timeout, a retry delay — and the dispatch path drives the
-  // event loop (`with_event_loop_promise`), so a pending timer actually fires.
-  globalThis.atob = base64.atob;
-  globalThis.btoa = base64.btoa;
-  globalThis.setTimeout = timers.setTimeout;
-  globalThis.clearTimeout = timers.clearTimeout;
   // setInterval/clearInterval are deliberately NOT bound. A repeating timer
   // started by a request handler outlives its response and leaks into every
   // later request THIS isolate serves — and (R756-F2) a process now runs a
@@ -127,18 +58,55 @@
   // caching state at module scope; if a real need appears, it belongs in Rust
   // beside the isolate pool, not inside any one isolate.
 
-  // Fetch surface.
-  globalThis.Headers = headers.Headers;
-  globalThis.FormData = formdata.FormData;
-  globalThis.Request = request.Request;
-  globalThis.Response = response.Response;
-  globalThis.fetch = fetch_.fetch;
+  // atob/btoa over Latin-1 strings, per the HTML spec.
+  const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  globalThis.btoa = (input) => {
+    const s = String(input);
+    let out = "";
+    for (let i = 0; i < s.length; i += 3) {
+      const a = s.charCodeAt(i);
+      const b = s.charCodeAt(i + 1);
+      const c = s.charCodeAt(i + 2);
+      if (a > 255 || b > 255 || c > 255) {
+        throw new DOMExceptionLike("btoa: string contains characters outside Latin-1", "InvalidCharacterError");
+      }
+      const n = (a << 16) | ((b || 0) << 8) | (c || 0);
+      out += B64[n >> 18] + B64[(n >> 12) & 63];
+      out += i + 1 < s.length ? B64[(n >> 6) & 63] : "=";
+      out += i + 2 < s.length ? B64[n & 63] : "=";
+    }
+    return out;
+  };
+  globalThis.atob = (input) => {
+    let s = String(input).replace(/[\t\n\f\r ]/g, "");
+    if (s.length % 4 === 0) s = s.replace(/==?$/, "");
+    if (s.length % 4 === 1 || /[^A-Za-z0-9+/]/.test(s)) {
+      throw new DOMExceptionLike("atob: invalid base64", "InvalidCharacterError");
+    }
+    let out = "";
+    let bits = 0;
+    let acc = 0;
+    for (const ch of s) {
+      acc = (acc << 6) | B64.indexOf(ch);
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        out += String.fromCharCode((acc >> bits) & 255);
+      }
+    }
+    return out;
+  };
+  // No DOMException without deno_web; an Error carrying the same `name` is
+  // what route code can observe.
+  function DOMExceptionLike(message, name) {
+    const e = new Error(message);
+    e.name = name;
+    return e;
+  }
 
-  // process.env shim — populated by the Rust side via execute_script if the
-  // dev workload declares env vars. Routes that read it get undefined rather
-  // than a TypeError on `process` itself.
+  // process.env shim — the Rust side folds the caller's env onto it (R444).
+  // Routes that read it get undefined rather than a TypeError on `process`.
   if (globalThis.process === undefined) {
     globalThis.process = { env: { NODE_ENV: "production" } };
   }
-  if (globalThis.self === undefined) globalThis.self = globalThis;
 })(globalThis);

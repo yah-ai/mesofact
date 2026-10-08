@@ -30,7 +30,6 @@
 //!
 //! @yah:relay(R434, "Mesofact SSR support — yah-side rollout (cube + placement)")
 //! @yah:at(2026-06-04T19:11:39Z)
-//! @yah:status(open)
 //! @yah:next("P1 tickets (T1 dev.toml sweep, T2 dashboard dev.toml) are independent of the mesofact runtime delta — start there")
 //! @yah:next("P2 tickets (T3/T4/T5) need the external mesofact RouteEntry.placement field + SSR build-pipeline path live; coordinate via @mesofact/runtime version bump")
 //! @yah:next("Open question from W173: which marketing route becomes the first mode:\"ssr\" consumer? T5 depends on resolving this")
@@ -145,6 +144,8 @@ use futures::StreamExt;
 #[cfg(feature = "ssr")]
 use mesofact_publisher::ObjectStore;
 #[cfg(feature = "ssr")]
+use mesofact_core::proxy::session::SessionResolver;
+#[cfg(feature = "ssr")]
 use mesofact_ssr::{DispatchRequest, DispatchResponse};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
@@ -233,6 +234,11 @@ pub struct Server {
     /// readiness on a transient respawn.
     #[cfg(feature = "ssr")]
     expects_ssr: bool,
+    /// Resolves the request's `Cookie` into the user handed to SSR route code
+    /// (R750-F2). Same resolver `mesofact proxy` builds, from the same
+    /// `--session-secret-env` config. `None` → SSR routes see a null user.
+    #[cfg(feature = "ssr")]
+    session: Option<Arc<dyn SessionResolver>>,
     /// Whether [`Server::router`] mounts the standard probe routes. Cleared by
     /// [`Server::without_standard_probes`] for a service that mounts its own.
     standard_probes: bool,
@@ -259,6 +265,8 @@ struct ServerState {
     identity: Option<Arc<Identity>>,
     #[cfg(feature = "ssr")]
     instance_store: Option<Arc<dyn ObjectStore>>,
+    #[cfg(feature = "ssr")]
+    session: Option<Arc<dyn SessionResolver>>,
 }
 
 impl Server {
@@ -283,6 +291,8 @@ impl Server {
             health: crate::Health::new(),
             #[cfg(feature = "ssr")]
             expects_ssr: false,
+            #[cfg(feature = "ssr")]
+            session: None,
             standard_probes: true,
             route_headers: Arc::new(RouteHeaderTable::default()),
             cache_policy: Arc::new(CachePolicyTable::default()),
@@ -406,6 +416,14 @@ impl Server {
         self
     }
 
+    /// Attach the session resolver whose user SSR dispatch hands to route
+    /// code (R750-F2). `None` leaves sessions off.
+    #[cfg(feature = "ssr")]
+    pub fn with_session(mut self, session: Option<Arc<dyn SessionResolver>>) -> Self {
+        self.session = session;
+        self
+    }
+
     /// Install a same-origin reverse proxy. Requests whose path matches one of
     /// the map's prefixes (`/auth/*`, `/dev/*`, `/api/*` …) are forwarded to the
     /// mapped backend port *before* static serving; everything else falls
@@ -521,6 +539,8 @@ impl Server {
             identity: self.identity.clone().map(Arc::new),
             #[cfg(feature = "ssr")]
             instance_store: self.instance_store.clone(),
+            #[cfg(feature = "ssr")]
+            session: self.session.clone(),
         };
         let mut router = Router::new()
             // Logical-identity probe for the adopt path (R602-B4). Returns the
@@ -904,7 +924,8 @@ async fn serve_dynamic(State(state): State<ServerState>, req: Request) -> Respon
     if let Some(ssr) = state.ssr.current() {
         if ssr.matches(&uri_path) {
             let policy = ssr.policy_for(&uri_path);
-            return dispatch_to_ssr(ssr, policy, req).await;
+            let user = resolve_ssr_user(state.session.as_deref(), req.headers());
+            return dispatch_to_ssr(ssr, policy, user, req).await;
         }
     }
     // Same-origin reverse proxy (R513-F10): forward `/auth/*`, `/dev/*`, `/api/*`
@@ -944,10 +965,25 @@ async fn serve_dynamic(State(state): State<ServerState>, req: Request) -> Respon
 /// in-process SSR handler with W181 retry/timeout semantics wrapped around
 /// the call. Replaces the prior reqwest reverse-proxy hop (R434-F3) with a
 /// direct V8 dispatch — no port, no HTTP encoding, no streaming.
+/// The user an SSR dispatch carries (R750-F2): the request's `Cookie` header
+/// through the configured resolver, serialized to the `{id, attrs}` shape route
+/// code reads from `__mesofact_ssr.currentUser()`. `None` with no resolver, no
+/// cookie, or a cookie that does not verify.
+#[cfg(feature = "ssr")]
+fn resolve_ssr_user(
+    session: Option<&dyn SessionResolver>,
+    headers: &axum::http::HeaderMap,
+) -> Option<serde_json::Value> {
+    let cookie = headers.get(header::COOKIE).and_then(|v| v.to_str().ok());
+    let user = session?.resolve(cookie)?;
+    serde_json::to_value(user).ok()
+}
+
 #[cfg(feature = "ssr")]
 async fn dispatch_to_ssr(
     ssr: Arc<SsrChild>,
     policy: Option<ResiliencePolicy>,
+    user: Option<serde_json::Value>,
     req: Request,
 ) -> Response {
     let (parts, body) = req.into_parts();
@@ -1032,6 +1068,9 @@ async fn dispatch_to_ssr(
             url: dispatch_url.clone(),
             headers: headers.clone(),
             body: body_bytes.clone(),
+            user: user.clone(),
+            // Attached by `SsrChild` from the spawn-time backend (R750-F3).
+            sources: None,
         };
         let call = ssr.dispatch(&route_path, req);
         let outcome = match timeout_ms {
@@ -3018,6 +3057,63 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_string(response).await, "healthy");
+    }
+
+    /// R750-F2: a verifying session cookie reaches SSR route code as
+    /// `DispatchRequest::user`; no cookie, or no resolver, dispatches null.
+    #[cfg(feature = "ssr")]
+    #[tokio::test]
+    async fn ssr_dispatch_carries_the_resolved_user() {
+        use mesofact_core::proxy::session::User;
+        struct Fixed;
+        impl SessionResolver for Fixed {
+            fn resolve(&self, cookie: Option<&str>) -> Option<User> {
+                (cookie? == "mesofact_session=good").then(|| User {
+                    id: "u_1".into(),
+                    attrs: serde_json::Map::new(),
+                })
+            }
+        }
+        let echo_user = |req: DispatchRequest| {
+            Ok(DispatchResponse {
+                status: 200,
+                headers: vec![],
+                body: serde_json::to_vec(&req.user).unwrap(),
+            })
+        };
+        let get = |cookie: Option<&str>| {
+            let mut b = Request::builder().uri("/api/me");
+            if let Some(c) = cookie {
+                b = b.header(header::COOKIE, c);
+            }
+            b.body(Body::empty()).unwrap()
+        };
+        let workload = workload_with(&[("index.html", "<h1>static</h1>")]);
+        let server = |session: Option<Arc<dyn SessionResolver>>| {
+            Server::from_workload(workload.path())
+                .unwrap()
+                .with_ssr(ssr::detached_for_test_with_policies(
+                    vec!["/api/me".to_string()],
+                    vec![],
+                    echo_user,
+                ))
+                .with_session(session)
+                .router()
+        };
+
+        let resolver: Arc<dyn SessionResolver> = Arc::new(Fixed);
+        let resp = server(Some(resolver.clone()))
+            .oneshot(get(Some("mesofact_session=good")))
+            .await
+            .unwrap();
+        assert_eq!(body_string(resp).await, r#"{"id":"u_1","attrs":{}}"#);
+        let resp = server(Some(resolver)).oneshot(get(None)).await.unwrap();
+        assert_eq!(body_string(resp).await, "null");
+        let resp = server(None)
+            .oneshot(get(Some("mesofact_session=good")))
+            .await
+            .unwrap();
+        assert_eq!(body_string(resp).await, "null");
     }
 
     /// Verify item #2: with SSR wired, static routes still serve from disk.

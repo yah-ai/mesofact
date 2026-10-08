@@ -10,13 +10,13 @@ use mesofact_core::proxy::config::Config;
 use mesofact_core::proxy::manifest_loader::{load_from_file, watch_manifest};
 use mesofact_core::proxy::metrics::Metrics;
 use mesofact_core::proxy::router::{handle, metrics_handler, AppState, SharedState};
-use mesofact_core::proxy::session::{CookieSessionResolver, SessionResolver};
+use mesofact_core::proxy::session::SessionResolver;
 use mesofact_core::proxy::source_gen::Generations;
 use mesofact_core::proxy::worker_pool::{rolling_reload, WorkerPool};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{watch, RwLock};
-use tracing::{info, warn};
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
@@ -170,26 +170,11 @@ async fn assert_declared_policy_is_enforced(
     mesofact_core::check_manifest(&raw, support).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-/// Build a `CookieSessionResolver` when `--session-secret-env` names a set env
-/// var. A configured-but-unset/empty env var is a deploy error: warn and run
-/// without sessions rather than crash (the route-level `requires` check still
-/// redirects/401s, so this fails safe — not open).
+/// See [`mesofact_core::proxy::session::resolver_from_env`] — the same builder
+/// `mesofact serve` uses for its SSR dispatch (R750-F2).
 fn build_session_resolver(cfg: &Config) -> Option<Arc<dyn SessionResolver>> {
-    let env_name = cfg.session_secret_env.as_ref()?;
-    match std::env::var(env_name) {
-        Ok(secret) if !secret.is_empty() => {
-            info!(cookie = %cfg.session_cookie, "session resolver enabled");
-            Some(Arc::new(CookieSessionResolver::new(
-                cfg.session_cookie.clone(),
-                secret.into_bytes(),
-            )))
-        }
-        _ => {
-            warn!(
-                env = %env_name,
-                "session secret env var is unset/empty — sessions disabled"
-            );
-            None
-        }
-    }
+    mesofact_core::proxy::session::resolver_from_env(
+        cfg.session_secret_env.as_deref(),
+        &cfg.session_cookie,
+    )
 }
