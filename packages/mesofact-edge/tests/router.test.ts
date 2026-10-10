@@ -9,6 +9,14 @@ const BUNDLE = join(__dirname, "../dist/router.bundle.js");
 
 type Assets = Record<string, { body: string; type: string }>;
 
+// One declared rule as the fixture tables spell it — `DomainConfig::route_headers_json`'s
+// wire shape, which the stand-in producer below widens into a ROUTE_TABLE entry.
+type RouteHeaderRule = {
+  path: string;
+  headers: Record<string, string>;
+  cors_origins?: string[];
+};
+
 interface MfSetup {
   mf: Miniflare;
   port: number;
@@ -40,7 +48,7 @@ async function makeMf(cfg: {
   mesofactBackendOrigin?: string;
   issuesOrigin?: string;
   uploadOrigin?: string;
-  routeHeaders?: { path: string; headers: Record<string, string> }[];
+  routeHeaders?: RouteHeaderRule[];
   /** Escape hatch for the malformed-binding cases, which the typed fields
    *  cannot express. */
   rawRouteTable?: string;
@@ -75,7 +83,7 @@ function routeTable(
     mesofactBackendOrigin?: string;
     issuesOrigin?: string;
     uploadOrigin?: string;
-    routeHeaders?: { path: string; headers: Record<string, string> }[];
+    routeHeaders?: RouteHeaderRule[];
   },
   assetOrigin: string,
 ): unknown[] {
@@ -114,6 +122,7 @@ function routeTable(
       mode: "static",
       origin: assetOrigin,
       headers: rule.headers,
+      ...(rule.cors_origins ? { cors_origins: rule.cors_origins } : {}),
     });
   }
   return entries;
@@ -967,7 +976,7 @@ describe("per-route response headers", () => {
 // `passway` silently dropped COOP/COEP — correct bytes, 200 OK, dead wasm app.
 // See tests/fixtures/route-headers/README.md.
 type ParityFixture = {
-  table: { path: string; headers: Record<string, string> }[];
+  table: RouteHeaderRule[];
   assets: Assets;
   cases: {
     name: string;
@@ -975,6 +984,8 @@ type ParityFixture = {
     status: number;
     expect: Record<string, string>;
     absent?: string[];
+    /** Sent as the request's `Origin` (R826's `cors_origins` cases). */
+    origin?: string;
   }[];
 };
 
@@ -1004,7 +1015,9 @@ describe("route-header front-door parity fixture", () => {
 
   for (const c of PARITY.cases) {
     test(`${c.name} (${c.path})`, async () => {
-      const resp = await setup.mf.dispatchFetch(`http://w.test${c.path}`);
+      const resp = await setup.mf.dispatchFetch(`http://w.test${c.path}`, {
+        headers: c.origin ? { Origin: c.origin } : {},
+      });
       expect(resp.status).toBe(c.status);
       for (const [name, value] of Object.entries(c.expect)) {
         expect(resp.headers.get(name)).toBe(value);
@@ -1133,6 +1146,163 @@ describe("ROUTE_TABLE entry whose header cannot be set", () => {
     expect(await resp.text()).toContain("hello");
     // Not asserted by reading the header back: `Headers.get` rejects the name
     // too, which is the whole reason the edge could not have applied it.
+  });
+});
+
+// R826, the two hand-edited-binding postures for `cors_origins`. A list that is
+// not an array of strings is mis-SHAPED — `includes` on a bare string is a
+// substring test, so "https://noisetable.com.evil" would pass — and fails the
+// request closed like any other malformed entry. A well-shaped list naming
+// `null` (or `*`, or beside a literal ACAO) is a header-level fault: the table's
+// headers AND lists are dropped, logged, and routing continues — which for a
+// CORS grant fails closed by construction, since no grant means no read.
+describe("ROUTE_TABLE entry whose cors_origins is not a string array", () => {
+  let setup: MfSetup;
+
+  beforeAll(async () => {
+    setup = await makeMf({
+      mode: "static",
+      assets: { "index.html": { body: "<h1>hello</h1>", type: "text/html" } },
+      rawRouteTable: JSON.stringify([
+        { path: "/*", mode: "static", cors_origins: "https://noisetable.com" },
+      ]),
+    });
+  });
+
+  afterAll(async () => {
+    await setup.mf.dispose();
+    setup.stop();
+  });
+
+  test("fails closed rather than substring-matching origins", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/", {
+      headers: { Origin: "https://noisetable.com" },
+    });
+    expect(resp.status).toBe(503);
+    expect(resp.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  });
+});
+
+describe("ROUTE_TABLE entry whose cors_origins grants null", () => {
+  let setup: MfSetup;
+
+  beforeAll(async () => {
+    setup = await makeMf({
+      mode: "static",
+      assets: { "index.html": { body: "<h1>hello</h1>", type: "text/html" } },
+      rawRouteTable: JSON.stringify([
+        {
+          path: "/*",
+          mode: "static",
+          headers: { "X-Good": "1" },
+          cors_origins: ["https://noisetable.com", "null"],
+        },
+      ]),
+    });
+  });
+
+  afterAll(async () => {
+    await setup.mf.dispose();
+    setup.stop();
+  });
+
+  test("serves with no grant and no headers, to anyone", async () => {
+    for (const origin of ["null", "https://noisetable.com"]) {
+      const resp = await setup.mf.dispatchFetch("http://w.test/", {
+        headers: { Origin: origin },
+      });
+      expect(resp.status).toBe(200);
+      expect(resp.headers.get("Access-Control-Allow-Origin")).toBeNull();
+      expect(resp.headers.get("X-Good")).toBeNull();
+    }
+  });
+});
+
+describe("ROUTE_TABLE entry with cors_origins beside a literal ACAO header", () => {
+  let setup: MfSetup;
+
+  beforeAll(async () => {
+    setup = await makeMf({
+      mode: "static",
+      assets: { "index.html": { body: "<h1>hello</h1>", type: "text/html" } },
+      rawRouteTable: JSON.stringify([
+        {
+          path: "/*",
+          mode: "static",
+          headers: { "access-control-allow-origin": "https://noisetable.com" },
+          cors_origins: ["https://staging.noisetable.com"],
+        },
+      ]),
+    });
+  });
+
+  afterAll(async () => {
+    await setup.mf.dispose();
+    setup.stop();
+  });
+
+  test("applies neither answer", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/", {
+      headers: { Origin: "https://staging.noisetable.com" },
+    });
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  });
+});
+
+// R826 on a proxied entry: the origin's own `Access-Control-Allow-Origin: *`
+// does not survive a declared list, and its own `Vary` is merged into, not
+// replaced.
+describe("cors_origins on a backend entry whose origin sets its own CORS", () => {
+  let setup: MfSetup;
+  let backend: ReturnType<typeof Bun.serve>;
+
+  beforeAll(async () => {
+    backend = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response("api", {
+          headers: {
+            "Access-Control-Allow-Origin": "*",
+            Vary: "Accept-Encoding",
+          },
+        });
+      },
+    });
+    setup = await makeMf({
+      mode: "static",
+      assets: { "index.html": { body: "<h1>hello</h1>", type: "text/html" } },
+      rawRouteTable: JSON.stringify([
+        {
+          path: "/api/*",
+          mode: "backend",
+          origin: `http://localhost:${backend.port}`,
+          cors_origins: ["https://noisetable.com"],
+        },
+      ]),
+    });
+  });
+
+  afterAll(async () => {
+    await setup.mf.dispose();
+    setup.stop();
+    backend.stop(true);
+  });
+
+  test("an unlisted origin loses the upstream's wildcard grant", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/api/x", {
+      headers: { Origin: "https://evil.example" },
+    });
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get("Access-Control-Allow-Origin")).toBeNull();
+    expect(resp.headers.get("Vary")).toBe("Accept-Encoding, Origin");
+  });
+
+  test("a listed origin gets itself, not the wildcard", async () => {
+    const resp = await setup.mf.dispatchFetch("http://w.test/api/x", {
+      headers: { Origin: "https://noisetable.com" },
+    });
+    expect(resp.headers.get("Access-Control-Allow-Origin")).toBe("https://noisetable.com");
   });
 });
 
@@ -1405,6 +1575,141 @@ describe("static entries serve from the matched entry's source", () => {
   test("an entry naming a binding the Worker lacks fails closed with 502", async () => {
     const resp = await mf.dispatchFetch("http://w.test/unbound/x.txt");
     expect(resp.status).toBe(502);
+  });
+});
+
+// ── MFT-R825-F2: bucket reads go through the zone's edge cache ──────────────
+//
+// A hit is proved by CONTENT, not by a header: after the first GET the object
+// is overwritten in R2, so only a cached copy can still answer with the old
+// bytes. The cache fills under `ctx.waitUntil`, so a hit is polled for rather
+// than expected on the very next request.
+
+describe("bucket entries serve cacheable objects through caches.default", () => {
+  let mf: Miniflare;
+  let bucket: Awaited<ReturnType<Miniflare["getR2Bucket"]>>;
+  const IMMUTABLE = "public, max-age=31536000, immutable";
+
+  beforeAll(async () => {
+    const table = [
+      {
+        path: "/*",
+        mode: "static",
+        bucket: "cdn",
+        binding: "R2_CDN",
+        headers: { "Cross-Origin-Resource-Policy": "cross-origin" },
+        cors_origins: ["https://app.test"],
+        auth: "anonymous",
+      },
+    ];
+    mf = new Miniflare({
+      modules: true,
+      scriptPath: BUNDLE,
+      bindings: { ASSET_ORIGIN: "", WORKER_MODE: "static", ROUTE_TABLE: JSON.stringify(table) },
+      r2Buckets: ["R2_CDN"],
+    });
+    bucket = await mf.getR2Bucket("R2_CDN");
+  });
+
+  afterAll(async () => {
+    await mf.dispose();
+  });
+
+  async function put(key: string, body: string, cacheControl?: string) {
+    await bucket.put(key, body, {
+      httpMetadata: { contentType: "application/wasm", cacheControl },
+    });
+  }
+
+  /** GET until the body stops being `fresh` (a cache hit) or tries run out. */
+  async function getUntilStale(
+    url: string,
+    fresh: string,
+    init?: { headers: Record<string, string> },
+  ) {
+    for (let i = 0; i < 20; i++) {
+      const resp = await mf.dispatchFetch(url, init);
+      const text = await resp.text();
+      if (text !== fresh) return { resp, text };
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    const resp = await mf.dispatchFetch(url, init);
+    return { resp, text: await resp.text() };
+  }
+
+  test("an immutable object is served from the edge cache once warmed", async () => {
+    await put("app/abc.wasm", "v1", IMMUTABLE);
+    const first = await mf.dispatchFetch("http://w.test/app/abc.wasm");
+    expect(await first.text()).toBe("v1");
+    const etag = first.headers.get("etag");
+
+    // Let the waitUntil put land, then change what R2 would say.
+    await new Promise((r) => setTimeout(r, 100));
+    await put("app/abc.wasm", "v2-r2-only", IMMUTABLE);
+
+    const { resp, text } = await getUntilStale(
+      "http://w.test/app/abc.wasm",
+      "v2-r2-only",
+      { headers: { Origin: "https://app.test" } },
+    );
+    expect(text).toBe("v1");
+    expect(resp.headers.get("etag")).toBe(etag);
+    expect(resp.headers.get("content-type")).toBe("application/wasm");
+    expect(resp.headers.get("cache-control")).toBe(IMMUTABLE);
+    // Route headers are stamped AFTER the cache, per request.
+    expect(resp.headers.get("cross-origin-resource-policy")).toBe("cross-origin");
+    expect(resp.headers.get("access-control-allow-origin")).toBe("https://app.test");
+  });
+
+  test("a hit never replays one Origin's CORS grant to another", async () => {
+    await put("app/cors.wasm", "c1", IMMUTABLE);
+    await mf.dispatchFetch("http://w.test/app/cors.wasm", {
+      headers: { Origin: "https://app.test" },
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    await put("app/cors.wasm", "c2-r2-only", IMMUTABLE);
+    const { resp, text } = await getUntilStale(
+      "http://w.test/app/cors.wasm",
+      "c2-r2-only",
+      { headers: { Origin: "https://evil.test" } },
+    );
+    expect(text).toBe("c1");
+    expect(resp.headers.get("access-control-allow-origin")).toBeNull();
+  });
+
+  test("a no-cache pointer is read from R2 every time", async () => {
+    await put("latest.txt", "0.1.0", "no-cache");
+    expect(await (await mf.dispatchFetch("http://w.test/latest.txt")).text()).toBe("0.1.0");
+    await new Promise((r) => setTimeout(r, 100));
+    await put("latest.txt", "0.2.0", "no-cache");
+    expect(await (await mf.dispatchFetch("http://w.test/latest.txt")).text()).toBe("0.2.0");
+  });
+
+  test("an object with no Cache-Control is not cached", async () => {
+    await put("plain.json", "a");
+    await mf.dispatchFetch("http://w.test/plain.json");
+    await new Promise((r) => setTimeout(r, 100));
+    await put("plain.json", "b");
+    expect(await (await mf.dispatchFetch("http://w.test/plain.json")).text()).toBe("b");
+  });
+
+  test("s-maxage=0 keeps an object out of the shared cache despite max-age", async () => {
+    await put("shared.json", "a", "public, max-age=600, s-maxage=0");
+    await mf.dispatchFetch("http://w.test/shared.json");
+    await new Promise((r) => setTimeout(r, 100));
+    await put("shared.json", "b", "public, max-age=600, s-maxage=0");
+    expect(await (await mf.dispatchFetch("http://w.test/shared.json")).text()).toBe("b");
+  });
+
+  test("a 404 is never cached: the object is visible as soon as it lands", async () => {
+    const miss = await mf.dispatchFetch("http://w.test/app/late.wasm");
+    expect(miss.status).toBe(404);
+    await miss.arrayBuffer();
+    await new Promise((r) => setTimeout(r, 100));
+    await put("app/late.wasm", "here", IMMUTABLE);
+    const resp = await mf.dispatchFetch("http://w.test/app/late.wasm");
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toBe("here");
   });
 });
 

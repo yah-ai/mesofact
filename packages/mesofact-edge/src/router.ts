@@ -106,6 +106,9 @@ interface RouteEntry {
   target?: string;
   status?: number;
   headers?: Record<string, string>;
+  /** Origins granted cross-origin reads on this route (R826) — see
+   *  `applyCors`. Omitted by the producer when empty. */
+  cors_origins?: string[];
   auth?: string;
 }
 
@@ -162,22 +165,94 @@ function httpGet(origin: string): AssetGet {
  *  (content-type, cache-control, …) and its etag travel on the response, which
  *  is what an R2 custom domain would have served for the same key. */
 /// @yah:ticket(R825-F2, "mesofact-edge: R2-bound static routes bypass the edge cache — serve cacheable objects through caches.default")
-/// @yah:at(2026-10-10T01:09:26Z)
-/// @yah:assignee(agent:bundle-anthropic-glimmerstone)
+/// @yah:status(review)
+/// @yah:at(2026-10-10T02:49:03Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
 /// @yah:parent(R825)
 /// @yah:next("Measured 2026-10-10 01:03Z: two back-to-back GETs of https://cdn.noisetable.com/desktop/v0.4.1/aarch64-apple-darwin.json (a noisetable-releases object behind a `bucket =` route) carry NO cf-cache-status header at all. r2Get calls bucket.get(key) on every request and nothing in the Worker touches caches.default, so on a Worker custom domain every hit is an R2 read; Cloudflare's edge cache never sees these responses. Compression is not the problem: the same responses come back content-encoding: br.")
 /// @yah:next("Route R2-binding GETs through the Cache API: caches.default.match first; on a miss, r2Get, and when the object's own Cache-Control is cacheable (e.g. the `public, max-age=31536000, immutable` that `yah cloud bucket put --cache-control immutable` stores) put the response with ctx.waitUntil. Key on the URL alone: route headers are stamped afterwards by applyRouteHeaders, so they need not live in the cached entry. Never cache a 404, and keep a `no-cache` pointer (latest.txt, index.json) uncached.")
 /// @yah:next("Consumer: noisetable camp R822-F1 (board path ~/ss/noisetable). It moves noisetable.com/app's ~35 MB wasm to https://cdn.noisetable.com/app/<blake3>.wasm on a noisetable-releases route, immutable. Done when a second GET of that URL reports cf-cache-status: HIT. A cross-camp depends_on will not fire, so ping that ticket by board_update when this lands and the Worker is redeployed (yah cloud apply --env prod from ~/ss/noisetable).")
 /// @yah:verify("curl -sI twice on an immutable object under a bucket route: the second response carries cf-cache-status: HIT and the same ETag, Content-Type and Cache-Control as the first, and the route's declared headers (ACAO, CORP) are still present on the HIT.")
-function r2Get(bucket: R2Bucket): AssetGet {
+/// @yah:handoff("r2Get (packages/mesofact-edge/src/router.ts) now reads caches.default first and, on a miss whose object Cache-Control carries a positive s-maxage/max-age and no no-store/no-cache/private, tees the response into caches.default.put under ctx.waitUntil. 404s and objects with no Cache-Control are never cached. ExecutionContext is threaded fetch -> route -> assetSource.")
+/// @yah:handoff("Cache key is `<request origin>/__mesofact/r2/<binding>/<bucket key>`, NOT the request URL: route() reads keys the URL never named (index.html, <build_id>/html/<key>) and two entries on one host can read different buckets. Consequence: purge-by-URL must name that namespaced URL. Route headers + CORS stay outside the cache (applyRouteHeaders runs after route()).")
+/// @yah:handoff("Discovered: yubaba's worker_script_reads_r2_only_through_route_bindings forbade any `.put(` in the bundle; it now exempts `caches.default.put(` (oss/yubaba/crates/cloud/src/reconciler/mesofact_static.rs:1829). Vendored bundle re-vendored via scripts/check-worker-bundle.sh --update.")
+/// @yah:verify("cd oss/mesofact/packages/mesofact-edge && bun run build && bun run typecheck && bun test tests/ -> 112 pass, 0 fail. 6 new tests under 'bucket entries serve cacheable objects through caches.default' prove a hit by content (R2 object overwritten after warm, old bytes still served) incl. ETag/Content-Type/Cache-Control/CORP/ACAO on the hit, no CORS replay across Origins, no-cache / no-header / s-maxage=0 / 404 stay uncached.")
+/// @yah:verify("cd oss/yubaba && cargo test -p yah-cloud --lib -- worker_script -> 5 passed.")
+/// @yah:verify("NOT RUN: live curl -sI twice against cdn.noisetable.com expecting cf-cache-status: HIT. Needs a yah binary built from this tree (WORKER_SCRIPT is include_str!) and `yah cloud apply --env prod` from ~/ss/noisetable — an outward-facing deploy left to the operator. Unverified whether Cache API hits surface cf-cache-status on a Worker custom domain; the content-based test is the authoritative check.")
+function r2Get(bucket: R2Bucket, cache: R2EdgeCache): AssetGet {
   return async (key) => {
+    const cacheKey = cache.keyFor(key);
+    const hit = await caches.default.match(cacheKey);
+    if (hit) return hit;
     const obj = await bucket.get(key);
     if (!obj) return new Response(null, { status: 404 });
     const headers = new Headers();
     obj.writeHttpMetadata(headers);
     headers.set("ETag", obj.httpEtag);
-    return new Response(obj.body, { headers });
+    const resp = new Response(obj.body, { headers });
+    if (!edgeCacheable(headers.get("Cache-Control"))) return resp;
+    // Tee, don't buffer: the client streams one branch while the cache fills
+    // from the other, so a 35 MB wasm never sits whole in Worker memory.
+    cache.ctx.waitUntil(caches.default.put(cacheKey, resp.clone()));
+    return resp;
   };
+}
+
+/** What `r2Get` needs to put an object in the zone's edge cache (R825-F2).
+ *
+ *  Without this layer a Worker custom domain never consults Cloudflare's
+ *  cache for a bucket route — every GET is an R2 read and the response carries
+ *  no `cf-cache-status` at all, `immutable` or not. */
+interface R2EdgeCache {
+  ctx: ExecutionContext;
+  /** The cache key for one bucket key. */
+  keyFor: (key: string) => string;
+}
+
+/** The edge cache for one binding on this request's host.
+ *
+ *  Keyed by BINDING and bucket key, not by the request URL: `route` reads
+ *  keys the URL never named (`index.html` under a directory, the build tree's
+ *  `<build_id>/html/<key>`), and two entries on one host may read different
+ *  buckets, so a URL key could replay one bucket's bytes for another's path.
+ *  The `/__mesofact/r2/` namespace is only ever a cache key, never fetched.
+ *  Purging an object by URL means purging THIS url, not the public one. */
+function r2EdgeCache(
+  request: Request,
+  ctx: ExecutionContext,
+  binding: string,
+): R2EdgeCache {
+  const origin = new URL(request.url).origin;
+  return {
+    ctx,
+    keyFor: (key) =>
+      `${origin}/__mesofact/r2/${encodeURIComponent(binding)}/${key}`,
+  };
+}
+
+/** Whether an object's own `Cache-Control` lets the edge hold it.
+ *
+ *  Only an explicit, positive freshness lifetime qualifies — the `public,
+ *  max-age=31536000, immutable` `yah cloud bucket put --cache-control
+ *  immutable` stores, or any `max-age` / `s-maxage` above zero. A mutable
+ *  pointer (`latest.txt`, `index.json`) carries `no-cache` and stays an R2
+ *  read every time; an object with no header at all is not guessed at, since
+ *  the cache's default TTL would then decide how stale a pointer may go. */
+function edgeCacheable(cacheControl: string | null): boolean {
+  if (!cacheControl) return false;
+  let maxAge: number | undefined;
+  let sMaxAge: number | undefined;
+  for (const raw of cacheControl.split(",")) {
+    const [name, value] = raw.trim().toLowerCase().split("=", 2);
+    if (name === "no-store" || name === "no-cache" || name === "private") {
+      return false;
+    }
+    const n = Number.parseInt(value ?? "", 10);
+    if (name === "max-age" && Number.isFinite(n)) maxAge = n;
+    if (name === "s-maxage" && Number.isFinite(n)) sMaxAge = n;
+  }
+  // `s-maxage` is the shared-cache lifetime and overrides `max-age` here.
+  return (sMaxAge ?? maxAge ?? 0) > 0;
 }
 
 /** The source the MATCHED entry serves from (R560-F13), or the `Response` that
@@ -189,7 +264,9 @@ function r2Get(bucket: R2Bucket): AssetGet {
  *  half-deployed Worker, and falling through would serve the path out of the
  *  catch-all with a 200. */
 function assetSource(
+  request: Request,
   env: Env,
+  ctx: ExecutionContext,
   entry: RouteEntry | undefined,
 ): AssetSource | Response {
   if (entry?.mode === "static" && entry.binding !== undefined) {
@@ -200,7 +277,7 @@ function assetSource(
       );
       return new Response("Bad Gateway", { status: 502 });
     }
-    const get = r2Get(bucket);
+    const get = r2Get(bucket, r2EdgeCache(request, ctx, entry.binding));
     return { get, pointers: get };
   }
   if (entry?.mode === "static" && entry.origin) {
@@ -218,7 +295,11 @@ function assetSource(
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<Response> {
     // ONE walk of the table decides both halves of this request: which origin
     // serves it, and which declared headers it carries. They were two
     // independent decisions before R898-F3 — four `if` blocks for routing and
@@ -240,8 +321,8 @@ export default {
     // than none for the case that motivated this (COOP/COEP: a document
     // served without them silently loses SharedArrayBuffer instead of failing
     // loudly).
-    const resp = await route(request, env, entry);
-    return applyRouteHeaders(resp, entry);
+    const resp = await route(request, env, ctx, entry);
+    return applyRouteHeaders(resp, entry, request.headers.get("Origin"));
   },
 };
 
@@ -254,6 +335,7 @@ export default {
 async function route(
   request: Request,
   env: Env,
+  ctx: ExecutionContext,
   entry: RouteEntry | undefined,
 ): Promise<Response> {
   const url = new URL(request.url);
@@ -286,7 +368,7 @@ async function route(
   }
 
   // Static: served from the MATCHED entry's own source, not a Worker-wide one.
-  const source = assetSource(env, entry);
+  const source = assetSource(request, env, ctx, entry);
   if (source instanceof Response) return source;
 
   // Resolve asset key from URL path
@@ -663,25 +745,78 @@ function routingUnavailable(path: string, err: unknown): Response {
 }
 
 /// @yah:relay(R826, "Route CORS allowlist: reflect Origin from a declared list with Vary: Origin, in both doors")
-/// @yah:at(2026-10-10T01:13:32Z)
+/// @yah:status(review)
+/// @yah:at(2026-10-10T01:59:24Z)
 /// @yah:assignee(agent:bundle-anthropic-glimmerstone)
 /// @yah:next("Consumer: noisetable camp R822-F1 (board path ~/ss/noisetable). noisetable.com/app now loads its wasm from https://cdn.noisetable.com/app/<blake3>.wasm, a CORS-mode fetch under COEP require-corp. A route's [routes.headers] map can carry one literal Access-Control-Allow-Origin, so staging.noisetable.com/app and the dev mirror's localhost door are refused. Operator 2026-10-10: not `*` (no third-party sites embedding the wasm); wants the most robust CORS setup, one that does not fail.")
 /// @yah:next("Primitive: a route-level origin allowlist declared in the domain TOML beside [routes.headers]. The door echoes the request's Origin as ACAO only when it is listed, sends `Vary: Origin` on EVERY response from that route (including ones without ACAO, so neither the edge nor a browser cache replays one origin's answer to another), and refuses nothing else. yubaba validates at manifest load: refuse a route that declares both the list and a literal ACAO header, and refuse `*` or `null` entries.")
 /// @yah:next("One table, both doors (R898-F3's one-walk rule): mesofact-edge's applyRouteHeaders for the Worker and the passway route_headers path. Apply after any edge-cache lookup (R825-F2) so cached entries stay origin-neutral.")
+/// @yah:handoff("Primitive shipped: `cors_origins = [..]` on a `[[routes]]` entry (yubaba DomainRoute, oss/yubaba/crates/cloud/src/config.rs). Every door: echo the request Origin as ACAO only when listed (exact bytes), strip any upstream/handler ACAO otherwise (the list is the policy), and append `Vary: Origin` (merged into an existing Vary) on EVERY response the route serves. Nothing is refused.")
+/// @yah:handoff("Validation at manifest load (validate_route_headers + new pub validate_cors_origin): refuses a literal Access-Control-Allow-Origin beside the list (any case), `*`, `null`, and any entry that is not a browser-serialized origin (uppercase, path/trailing slash, default port, userinfo, non-http(s)), each error naming domain, route and entry.")
+/// @yah:handoff("Three doors, one field: Worker (ROUTE_TABLE entry `cors_origins`, applyRouteHeaders -> applyCors in mesofact-edge router.ts; runs after route(), so a future R825-F2 caches.default layer inside route() stays origin-neutral); mesofact sovereign door (MESOFACT_ROUTE_HEADERS wire rule gains optional `cors_origins`, route_headers.rs apply_cors); passway (path-routes file mount `cors_origins` -> MountSource -> PathRoute -> RequestCtx CorsVerdict, new oss/passway/crates/passway/src/cors.rs). headers_json keeps a cors-only route and omits the key when empty, and inner_door's RouteEntry omits it when empty, so tables that do not use it are byte-identical for older doors.")
+/// @yah:handoff("Also: worker_route_table's synthesized backend entries inherit the governing route's cors_origins beside its headers (mesofact_static.rs); vendored Worker bundle re-vendored (scripts/check-worker-bundle.sh --update); .yah/schema/domain.toml.schema.json regenerated (+7, cors_origins only); worker_script_reads_r2_only_through_route_bindings now exempts `headers.delete(` from its R2-write grep (mesofact_static.rs); shared parity fixture (oss/mesofact/tests/fixtures/route-headers/parity.json) gains an `origin` case field + 6 R826 cases asserted at both Worker and sovereign doors, README updated.")
+/// @yah:verify("cd oss/yubaba && cargo test -p yah-cloud --lib -> 1344 passed, 0 failed (new: cors_origins_load_and_reach_the_header_column, cors_origins_beside_a_literal_acao_header_fails_the_load, a_cors_origin_that_could_never_match_fails_the_load_naming_it, serialized_origins_pass_the_cors_origin_check, route_table cors_origins_reach_both_projections_identically, inner_door cors_origins_travel_with_their_own_mount_into_the_routes_file).")
+/// @yah:verify("cd oss/passway && cargo test -p passway -- cors path_routes route_headers -> 19 lib + 7 integration passed, incl. 8 cors::tests and path_routing::cors_origins_echo_only_listed_origins_and_always_vary (live pingora proxy: each listed Origin echoed + vary: origin; evil.example and no-Origin get vary only; sibling mount untouched).")
+/// @yah:verify("cd oss/mesofact && cargo test -p mesofact --lib -- route_headers (13 passed) and --test route_headers_parity (2 passed, fixture includes the 6 R826 cases).")
+/// @yah:verify("cd oss/mesofact/packages/mesofact-edge && bun run build && bun run typecheck && bun test tests/ -> 106 pass, 0 fail; `bun test tests/router.test.ts -t R826` -> 6 pass. scripts/check-worker-bundle.sh -> in sync.")
+/// @yah:verify("NOT RUN: the live curl against cdn.noisetable.com. It needs (1) a yah binary built from a tree containing this change (WORKER_SCRIPT is include_str! in yah-cloud), (2) noisetable's cdn-noisetable-com.toml /app/* route switched from the literal ACAO to cors_origins, (3) `yah cloud apply --env prod --service noisetable-marketing --door-only` from ~/ss/noisetable. Sequenced on noisetable R822-T2 (told by board_update).")
+/// @yah:gotcha("Roll order for passway doors: passway parses the path-routes file with deny_unknown_fields, so a pre-R826 passway refuses a file whose mount carries `cors_origins`. The key is omitted when empty, so only a passway-fronted domain that actually declares a list needs the newer passway rolled first (the R876-B20 shape, confined to opt-in domains). Worker and sovereign door accept old tables unchanged.")
+/// @yah:gotcha("No preflight handling: OPTIONS is served like any other method (ACAO + Vary, no Access-Control-Allow-Methods/Headers). Enough for the wasm fetch (a CORS-safelisted GET); a consumer sending non-safelisted request headers would need preflight support, which is new scope.")
 /// @yah:next("Done when the noisetable cdn /app/* route declares [https://noisetable.com, https://staging.noisetable.com]: curl with each Origin gets that origin echoed plus Vary: Origin, Origin https://evil.example gets no ACAO, and no Origin gets CORP only. A cross-camp depends_on will not fire, so tell R822-F1 by board_update.")
+///
+/// Stamps the matched entry's declared headers, then its CORS allowlist
+/// (`applyCors`), onto whatever `route` returned. Running here — after
+/// `route`, never inside it — is what keeps an edge-cached object
+/// origin-neutral: anything `route` caches (R825-F2's `caches.default` layer
+/// belongs there) is cached before the per-request `Access-Control-Allow-Origin`
+/// exists, so one origin's grant can never be replayed to another.
 function applyRouteHeaders(
   resp: Response,
   entry: RouteEntry | undefined,
+  origin: string | null,
 ): Response {
   const entries = Object.entries(entry?.headers ?? {});
-  if (entries.length === 0) return resp;
+  const corsOrigins = entry?.cors_origins ?? [];
+  if (entries.length === 0 && corsOrigins.length === 0) return resp;
   const headers = new Headers(resp.headers);
   for (const [name, value] of entries) headers.set(name, value);
+  applyCors(headers, corsOrigins, origin);
   return new Response(NULL_BODY_STATUS.has(resp.status) ? null : resp.body, {
     status: resp.status,
     statusText: resp.statusText,
     headers,
   });
+}
+
+/**
+ * R826 — a route's CORS allowlist, the rule mesofact's sovereign door
+ * (`apply_cors` in `crates/mesofact/src/route_headers.rs`) and passway's `cors`
+ * module apply to the same manifest field.
+ *
+ * On a route that declares a list, every response carries
+ * `Access-Control-Allow-Origin: <the request's Origin>` when that origin is
+ * listed (compared exactly) and none otherwise — including one the origin
+ * served, since the declared list is the policy — plus `Vary: Origin` in all
+ * cases, merged into any `Vary` already present, so neither the edge nor a
+ * browser cache hands one origin's answer to another. Nothing is refused: an
+ * unlisted origin gets the bytes without the grant, and the browser blocks the
+ * read. A route with no list is untouched.
+ */
+function applyCors(
+  headers: Headers,
+  corsOrigins: readonly string[],
+  origin: string | null,
+): void {
+  if (corsOrigins.length === 0) return;
+  headers.delete("Access-Control-Allow-Origin");
+  if (origin !== null && corsOrigins.includes(origin)) {
+    headers.set("Access-Control-Allow-Origin", origin);
+  }
+  const varies = (headers.get("Vary") ?? "")
+    .split(",")
+    .map((t) => t.trim())
+    .some((t) => t === "*" || t.toLowerCase() === "origin");
+  if (!varies) headers.append("Vary", "Origin");
 }
 
 function parseRouteTable(raw: string | undefined): RouteEntry[] {
@@ -698,7 +833,11 @@ function parseRouteTable(raw: string | undefined): RouteEntry[] {
         err instanceof Error ? err.message : String(err)
       }`,
     );
-    entries = entries.map(({ headers: _drop, ...rest }) => rest);
+    // The CORS list goes with the headers: a grant is a header too, and
+    // dropping it fails closed (the browser blocks the read).
+    entries = entries.map(
+      ({ headers: _drop, cors_origins: _dropCors, ...rest }) => rest,
+    );
   }
   routeTableCache = { raw, entries };
   return entries;
@@ -722,7 +861,7 @@ export function validateRouteTable(raw: string): RouteEntry[] {
   return v.map((entry, i) => {
     if (!isRouteEntry(entry)) {
       throw new Error(
-        `entry ${i} is not a {path: string, mode: "static"|"backend"|"redirect", headers?: object}`,
+        `entry ${i} is not a {path: string, mode: "static"|"backend"|"redirect", headers?: object, cors_origins?: string[]}`,
       );
     }
     if (entry.path === "") {
@@ -769,6 +908,27 @@ function assertSettableHeaders(entries: RouteEntry[]): void {
         );
       }
     }
+    // R826: the two list entries whose meaning would CHANGE rather than merely
+    // fail to match, and the literal header the list replaces. The producer
+    // (`DomainConfig::validate_route_headers`) refuses all three at manifest
+    // load; reaching one here means a hand-edited binding.
+    const cors = entry.cors_origins ?? [];
+    const wild = cors.find((o) => o === "*" || o === "null");
+    if (wild !== undefined) {
+      throw new Error(
+        `entry ${i} lists ${JSON.stringify(wild)} in cors_origins, which would grant every site (or every sandboxed page) rather than the ones named`,
+      );
+    }
+    if (
+      cors.length > 0 &&
+      Object.keys(entry.headers ?? {}).some(
+        (name) => name.toLowerCase() === "access-control-allow-origin",
+      )
+    ) {
+      throw new Error(
+        `entry ${i} declares both cors_origins and a literal Access-Control-Allow-Origin header`,
+      );
+    }
   });
 }
 
@@ -789,6 +949,16 @@ function isRouteEntry(v: unknown): v is RouteEntry {
   // header `0` at the edge while the Rust side rejects the table outright.
   if (e.headers !== undefined) {
     if (!e.headers || typeof e.headers !== "object" || Array.isArray(e.headers)) {
+      return false;
+    }
+  }
+  // `cors_origins` (R826) likewise: optional, but an array of strings when
+  // present — a bare string would be walked by `includes` as a substring test.
+  if (e.cors_origins !== undefined) {
+    if (
+      !Array.isArray(e.cors_origins) ||
+      !e.cors_origins.every((o) => typeof o === "string")
+    ) {
       return false;
     }
   }

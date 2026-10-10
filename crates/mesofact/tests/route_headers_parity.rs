@@ -41,6 +41,9 @@ struct Case {
     expect: BTreeMap<String, String>,
     #[serde(default)]
     absent: Vec<String>,
+    /// Sent as the request's `Origin` (R826's `cors_origins` cases).
+    #[serde(default)]
+    origin: Option<String>,
 }
 
 /// Materialize the fixture's assets as a W272 bundle — the tree the bundle tier
@@ -82,14 +85,13 @@ async fn the_sovereign_door_serves_the_declared_headers_the_worker_serves() {
         .router();
 
     for case in &parity.cases {
+        let mut request = Request::builder().uri(&case.path);
+        if let Some(origin) = &case.origin {
+            request = request.header("origin", origin);
+        }
         let response = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(&case.path)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(request.body(Body::empty()).unwrap())
             .await
             .unwrap();
 

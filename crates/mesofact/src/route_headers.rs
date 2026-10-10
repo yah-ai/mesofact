@@ -33,6 +33,11 @@
 //! is declared and not enforced by the tier serving it is a hard error, never a
 //! warning and never a silent skip. An absent or empty value is not malformed:
 //! it reads as "no route headers configured" and serves normally.
+//!
+//! A rule may also carry the route's `cors_origins` (R826), applied after its
+//! literal headers by [`apply_cors`]: the request's `Origin` echoed when listed,
+//! `Vary: Origin` always. A list naming `*` or `null` is a malformed table here
+//! like any other.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -40,7 +45,10 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use axum::{
     extract::{Request, State},
-    http::{HeaderMap, HeaderName, HeaderValue},
+    http::{
+        header::{ACCESS_CONTROL_ALLOW_ORIGIN, ORIGIN, VARY},
+        HeaderMap, HeaderName, HeaderValue,
+    },
     middleware::Next,
     response::Response,
 };
@@ -58,14 +66,19 @@ struct RouteHeaderRule {
     path: String,
     /// Pre-validated header pairs, in the manifest's own (`BTreeMap`) order.
     headers: Vec<(HeaderName, HeaderValue)>,
+    /// The route's `cors_origins` (R826) — see [`apply_cors`].
+    cors_origins: Vec<String>,
 }
 
 /// One wire entry — mirrors `RouteHeaderRule` in the Worker and the `Rule`
-/// struct `DomainConfig::route_headers_json` serializes.
+/// struct `DomainConfig::route_headers_json` serializes. `cors_origins` is
+/// optional because the producer omits it when empty.
 #[derive(serde::Deserialize)]
 struct WireRule {
     path: String,
     headers: BTreeMap<String, String>,
+    #[serde(default)]
+    cors_origins: Vec<String>,
 }
 
 impl RouteHeaderTable {
@@ -105,6 +118,17 @@ impl RouteHeaderTable {
                 })?;
                 headers.push((header_name, header_value));
             }
+            if let Some(bad) = rule
+                .cors_origins
+                .iter()
+                .find(|o| o.as_str() == "*" || o.as_str() == "null")
+            {
+                bail!(
+                    "route {} lists {bad:?} in cors_origins, which would grant every site (or \
+                     every sandboxed page) rather than the ones named",
+                    rule.path
+                );
+            }
             // A matching rule with no headers is KEPT, not dropped: in the
             // Worker it consumes the match and stops the search, so dropping it
             // here would let a later catch-all apply where the edge applies
@@ -112,6 +136,7 @@ impl RouteHeaderTable {
             rules.push(RouteHeaderRule {
                 path: rule.path,
                 headers,
+                cors_origins: rule.cors_origins,
             });
         }
         Ok(Self { rules })
@@ -128,8 +153,9 @@ impl RouteHeaderTable {
     }
 
     /// Stamp the first matching rule's headers onto `headers`, overwriting any
-    /// same-named header already there (the Worker's `Headers.set`).
-    pub fn apply(&self, path: &str, headers: &mut HeaderMap) {
+    /// same-named header already there (the Worker's `Headers.set`), then its
+    /// CORS list against the request's `origin` ([`apply_cors`]).
+    pub fn apply(&self, path: &str, origin: Option<&HeaderValue>, headers: &mut HeaderMap) {
         let Some(rule) = self
             .rules
             .iter()
@@ -140,6 +166,38 @@ impl RouteHeaderTable {
         for (name, value) in &rule.headers {
             headers.insert(name.clone(), value.clone());
         }
+        apply_cors(&rule.cors_origins, origin, headers);
+    }
+}
+
+/// R826 — a route's CORS allowlist, the rule the Worker's `applyRouteHeaders`
+/// and passway's `cors` module apply to the same field.
+///
+/// On a route that declares a list, every response carries
+/// `Access-Control-Allow-Origin: <the request's Origin>` when that origin is
+/// listed (byte-for-byte) and none otherwise — including one the handler set,
+/// since the declared list is the policy — plus `Vary: Origin` in all cases,
+/// merged into any existing `Vary`, so no cache can hand one origin's answer
+/// to another. Nothing is refused. A route with no list is untouched.
+fn apply_cors(cors_origins: &[String], origin: Option<&HeaderValue>, headers: &mut HeaderMap) {
+    if cors_origins.is_empty() {
+        return;
+    }
+    headers.remove(ACCESS_CONTROL_ALLOW_ORIGIN);
+    if let Some(origin) =
+        origin.filter(|o| cors_origins.iter().any(|listed| listed.as_bytes() == o.as_bytes()))
+    {
+        headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
+    }
+    let varies = headers
+        .get_all(VARY)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .any(|t| t == "*" || t.eq_ignore_ascii_case("origin"));
+    if !varies {
+        headers.append(VARY, HeaderValue::from_static("Origin"));
     }
 }
 
@@ -179,8 +237,9 @@ pub async fn apply_route_headers(
     next: Next,
 ) -> Response {
     let path = req.uri().path().to_owned();
+    let origin = req.headers().get(ORIGIN).cloned();
     let mut resp = next.run(req).await;
-    table.apply(&path, resp.headers_mut());
+    table.apply(&path, origin.as_ref(), resp.headers_mut());
     resp
 }
 
@@ -205,8 +264,63 @@ mod tests {
 
     fn applied(table: &RouteHeaderTable, path: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        table.apply(path, &mut headers);
+        table.apply(path, None, &mut headers);
         headers
+    }
+
+    const CORS: &str = r#"[
+        {"path":"/app/*","headers":{"Cross-Origin-Resource-Policy":"cross-origin"},
+         "cors_origins":["https://noisetable.com","https://staging.noisetable.com"]},
+        {"path":"/*","headers":{"X-Tier":"marketing"}}
+    ]"#;
+
+    fn from_origin(table: &RouteHeaderTable, path: &str, origin: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        let origin = origin.map(|o| HeaderValue::from_str(o).unwrap());
+        table.apply(path, origin.as_ref(), &mut headers);
+        headers
+    }
+
+    #[test]
+    fn cors_echoes_each_listed_origin_and_always_varies() {
+        let table = RouteHeaderTable::parse(CORS).unwrap();
+        for origin in ["https://noisetable.com", "https://staging.noisetable.com"] {
+            let headers = from_origin(&table, "/app/x.wasm", Some(origin));
+            assert_eq!(headers.get(ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(), origin);
+            assert_eq!(headers.get(VARY).unwrap(), "Origin");
+            assert_eq!(
+                headers.get("cross-origin-resource-policy").unwrap(),
+                "cross-origin"
+            );
+        }
+        for origin in [Some("https://evil.example"), Some("https://noisetable.com/"), None] {
+            let headers = from_origin(&table, "/app/x.wasm", origin);
+            assert!(headers.get(ACCESS_CONTROL_ALLOW_ORIGIN).is_none(), "{origin:?}");
+            assert_eq!(headers.get(VARY).unwrap(), "Origin", "{origin:?}");
+        }
+        let other = from_origin(&table, "/", Some("https://noisetable.com"));
+        assert!(other.get(ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+        assert!(other.get(VARY).is_none(), "a route with no list is untouched");
+    }
+
+    #[test]
+    fn cors_overrides_a_handler_grant_and_merges_vary() {
+        let table = RouteHeaderTable::parse(CORS).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+        headers.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+        table.apply("/app/", None, &mut headers);
+        assert!(headers.get(ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+        let vary: Vec<_> = headers.get_all(VARY).iter().collect();
+        assert_eq!(vary, ["Accept-Encoding", "Origin"]);
+    }
+
+    #[test]
+    fn cors_wildcards_are_refused() {
+        for bad in ["*", "null"] {
+            let raw = format!(r#"[{{"path":"/*","headers":{{}},"cors_origins":["{bad}"]}}]"#);
+            assert!(RouteHeaderTable::parse(&raw).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -279,7 +393,7 @@ mod tests {
                 .unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("cache-control", HeaderValue::from_static("public"));
-        table.apply("/", &mut headers);
+        table.apply("/", None, &mut headers);
         assert_eq!(headers.get("cache-control").unwrap(), "no-store");
         assert_eq!(headers.get_all("cache-control").iter().count(), 1);
     }

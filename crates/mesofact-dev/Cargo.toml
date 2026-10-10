@@ -105,12 +105,12 @@ serde_json = "1"
 toml = "0.8"
 # The serving engine. This crate is now a thin dev-affordance layer ON TOP of
 # the facade rather than the crate that owned the engine (W225 §2a).
-mesofact = { path = "../mesofact", version = "0.8.45", default-features = false }
+mesofact = { path = "../mesofact", version = "0.8.46", default-features = false }
 # Direct publisher dep for the instance-store wiring in cli.rs (drives
 # S3Store itself against the camp-injected dev S3 coordinates).
 # `version` is required now that this crate publishes: cargo rejects a path dep
 # without one, since a path means nothing to a downstream consumer.
-mesofact-publisher = { path = "../mesofact-publisher", version = "0.8.45", optional = true }
+mesofact-publisher = { path = "../mesofact-publisher", version = "0.8.46", optional = true }
 # Embedded dev-tier S3 surface, restored 2026-09-17 after R584-T1 deleted it.
 # R584-T1's premise was that a `yah camp` always injects S3_* coordinates; that
 # is true inside a camp and false for every other way `mes` is run — a bare

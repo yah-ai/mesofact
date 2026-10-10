@@ -32,3 +32,12 @@ Shape:
 `absent` names headers that must NOT be (this is how "first match wins, no
 merging across rules" is asserted rather than assumed). Add a case here and
 both doors pick it up.
+
+A table entry may carry `cors_origins` (R826) and a case may carry `origin`,
+sent as the request's `Origin` header — that is how the allowlist's three
+answers (listed → echoed, unlisted → no grant, absent → no grant, `Vary:
+Origin` on all three) are pinned identically at both doors. passway, the third
+door reading the same manifest field, asserts the same rule in
+`oss/passway/crates/passway/src/cors.rs` and `tests/path_routing.rs`; it serves
+from a different file (the inner-door path-routes table), so it cannot share
+this fixture's `table`.

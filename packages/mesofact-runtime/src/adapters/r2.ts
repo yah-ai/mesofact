@@ -59,7 +59,10 @@ export class R2Adapter extends BaseSource implements BlobSource {
     const res = await this.send(url, { method: "GET" }, timeout_ms);
     if (res.status === 404) return null;
     if (!res.ok) {
-      throw new SourceQueryError(this.name, `r2 GET ${key} → HTTP ${res.status}`);
+      throw new SourceQueryError(
+        this.name,
+        `r2 GET ${key} → HTTP ${res.status}${await s3ErrorDetail(res)}`,
+      );
     }
     const buf = await res.arrayBuffer();
     return new Uint8Array(buf);
@@ -75,7 +78,10 @@ export class R2Adapter extends BaseSource implements BlobSource {
     const url = `${this.endpoint}/${this.bucket}?${params.toString()}`;
     const res = await this.send(url, { method: "GET" }, timeout_ms);
     if (!res.ok) {
-      throw new SourceQueryError(this.name, `r2 LIST ${prefix} → HTTP ${res.status}`);
+      throw new SourceQueryError(
+        this.name,
+        `r2 LIST ${prefix} → HTTP ${res.status}${await s3ErrorDetail(res)}`,
+      );
     }
     return parseListV2(await res.text());
   }
@@ -132,6 +138,23 @@ function parseListV2(xml: string): R2Object[] {
     });
   }
   return out;
+}
+
+// S3 error bodies are `<Error><Code>…</Code><Message>…</Message></Error>`. A bare
+// status hides which of a dozen 400s it was (yah R556-F6: a 400 that the same
+// credentials did not produce off-runtime), so the code and message ride the
+// error. Neither carries credential material.
+async function s3ErrorDetail(res: Response): Promise<string> {
+  let body: string;
+  try {
+    body = await res.text();
+  } catch {
+    return "";
+  }
+  const code = pick(body, "Code");
+  const message = pick(body, "Message");
+  if (code === undefined && message === undefined) return "";
+  return ` (${[code, message].filter((s) => s !== undefined).join(": ")})`;
 }
 
 function pick(haystack: string, tag: string): string | undefined {

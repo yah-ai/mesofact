@@ -7,15 +7,76 @@
         "Cross-Origin-Embedder-Policy": "require-corp"
       }
     },
+    {
+      "path": "/pkg/*",
+      "headers": { "Cross-Origin-Resource-Policy": "cross-origin" },
+      "cors_origins": ["https://noisetable.com", "https://staging.noisetable.com"]
+    },
     { "path": "/*", "headers": { "X-Tier": "marketing" } }
   ],
   "assets": {
     "index.html": { "body": "<h1>marketing</h1>", "type": "text/html" },
     "app/index.html": { "body": "<h1>wasm app</h1>", "type": "text/html" },
     "app/bundle.wasm": { "body": "\u0000asm", "type": "application/wasm" },
+    "pkg/app.wasm": { "body": "\u0000asm", "type": "application/wasm" },
     "404.html": { "body": "<h1>not found</h1>", "type": "text/html" }
   },
   "cases": [
+    {
+      "name": "R826: a listed origin is echoed, with Vary: Origin",
+      "path": "/pkg/app.wasm",
+      "origin": "https://noisetable.com",
+      "status": 200,
+      "expect": {
+        "Access-Control-Allow-Origin": "https://noisetable.com",
+        "Vary": "Origin",
+        "Cross-Origin-Resource-Policy": "cross-origin"
+      },
+      "absent": ["X-Tier"]
+    },
+    {
+      "name": "R826: every listed origin is echoed, not just the first",
+      "path": "/pkg/app.wasm",
+      "origin": "https://staging.noisetable.com",
+      "status": 200,
+      "expect": {
+        "Access-Control-Allow-Origin": "https://staging.noisetable.com",
+        "Vary": "Origin"
+      }
+    },
+    {
+      "name": "R826: an unlisted origin gets the bytes, no grant, and still varies",
+      "path": "/pkg/app.wasm",
+      "origin": "https://evil.example",
+      "status": 200,
+      "expect": { "Vary": "Origin", "Cross-Origin-Resource-Policy": "cross-origin" },
+      "absent": ["Access-Control-Allow-Origin"]
+    },
+    {
+      "name": "R826: no Origin gets CORP and Vary only",
+      "path": "/pkg/app.wasm",
+      "status": 200,
+      "expect": { "Vary": "Origin", "Cross-Origin-Resource-Policy": "cross-origin" },
+      "absent": ["Access-Control-Allow-Origin"]
+    },
+    {
+      "name": "R826: a 404 under the route carries the grant too",
+      "path": "/pkg/missing.wasm",
+      "origin": "https://noisetable.com",
+      "status": 404,
+      "expect": {
+        "Access-Control-Allow-Origin": "https://noisetable.com",
+        "Vary": "Origin"
+      }
+    },
+    {
+      "name": "R826: a route with no list is untouched by the request's Origin",
+      "path": "/",
+      "origin": "https://noisetable.com",
+      "status": 200,
+      "expect": { "X-Tier": "marketing" },
+      "absent": ["Access-Control-Allow-Origin", "Vary"]
+    },
     {
       "name": "the apex document takes the catch-all",
       "path": "/",
