@@ -84,6 +84,7 @@ pub use mesofact_publisher as publisher;
 // the file watcher and the dev S3 surface — breaking the dev/prod crate
 // boundary W225 §2 claims. `mesofact-dev` now depends on THIS crate and holds
 // only `watcher` + `s3` + the dev bin, so that boundary finally holds.
+mod asset_response;
 pub mod cache_headers;
 pub mod cli;
 pub mod health;

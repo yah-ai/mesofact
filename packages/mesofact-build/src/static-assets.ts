@@ -7,9 +7,14 @@
 // Files are copied byte-for-byte (no minify, no rename): public/ is the
 // "serve exactly this" overlay, matching the historical
 // `cp -R public/. dist/html/` step the marketing app carried in its build
-// script. Content hashes are sha-256 hex so the publisher can diff uploads;
-// `immutable: false` because the keys are NOT content-addressed (a new build
-// can change the bytes behind the same key).
+// script. Content hashes are sha-256 hex so the publisher can diff uploads.
+//
+// `immutable` DIVERGES from the Rust twin (MFT-R825-F1): Rust sets it from the
+// project's declared `[build] immutable` patterns in mesofact.config.toml
+// (yah_mesofact_bundle::assets::declared_immutable); this mirror still writes
+// `false` for every key — safe (it only ever under-claims), but not lockstep.
+// Production builds go through the Rust binary. Porting needs the same glob
+// semantics, not a second, subtly different matcher.
 
 import { createHash } from "node:crypto";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";

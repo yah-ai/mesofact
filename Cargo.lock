@@ -87,6 +87,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "alloc-no-stdlib"
+version = "2.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc7bb162ec39d46ab1ca8c77bf72e890535becd1751bb45f64c597edb4c8c6b3"
+
+[[package]]
+name = "alloc-stdlib"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e76a019e91224d279006ff972f1e984179a6e9feb050adba6ce8274aef23195"
+dependencies = [
+ "alloc-no-stdlib",
+]
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -550,6 +565,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "brotli"
+version = "8.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5cc91aac060a7a1e25823bdccbfb6af1875b88f17c6daac97894eed8207166b3"
+dependencies = [
+ "alloc-no-stdlib",
+ "alloc-stdlib",
+ "brotli-decompressor",
+]
+
+[[package]]
+name = "brotli-decompressor"
+version = "5.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a32acac15fe1967bc3986b2a6347dffc965602354ea6f450ad07e8bfd253583"
+dependencies = [
+ "alloc-no-stdlib",
+ "alloc-stdlib",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -702,7 +738,7 @@ checksum = "18758054972164c3264f7c8386f5fc6da6114cb46b619fd365d4e3b2dc3ae487"
 
 [[package]]
 name = "cheers-core"
-version = "0.8.43"
+version = "0.8.45"
 dependencies = [
  "async-trait",
  "base64",
@@ -713,7 +749,7 @@ dependencies = [
 
 [[package]]
 name = "cheers-server"
-version = "0.8.43"
+version = "0.8.45"
 dependencies = [
  "async-trait",
  "base64",
@@ -733,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "cheers-verify"
-version = "0.8.43"
+version = "0.8.45"
 dependencies = [
  "async-trait",
  "base64",
@@ -1567,7 +1603,7 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "fob"
-version = "0.8.43"
+version = "0.8.45"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2431,7 +2467,7 @@ dependencies = [
 
 [[package]]
 name = "jsget"
-version = "0.8.43"
+version = "0.8.45"
 dependencies = [
  "anyhow",
  "rnpm",
@@ -2692,7 +2728,7 @@ dependencies = [
 
 [[package]]
 name = "mes"
-version = "0.8.43"
+version = "0.8.45"
 dependencies = [
  "mesofact-dev",
  "tokio",
@@ -2701,7 +2737,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact"
-version = "0.8.43"
+version = "0.8.45"
 dependencies = [
  "anyhow",
  "axum",
@@ -2729,7 +2765,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact-build"
-version = "0.8.43"
+version = "0.8.45"
 dependencies = [
  "anyhow",
  "clap",
@@ -2757,7 +2793,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact-core"
-version = "0.8.43"
+version = "0.8.45"
 dependencies = [
  "anyhow",
  "axum",
@@ -2784,7 +2820,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact-dev"
-version = "0.8.43"
+version = "0.8.45"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2809,7 +2845,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact-publisher"
-version = "0.8.43"
+version = "0.8.45"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2831,7 +2867,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact-render"
-version = "0.8.43"
+version = "0.8.45"
 dependencies = [
  "anyhow",
  "mesofact-core",
@@ -2842,7 +2878,7 @@ dependencies = [
 
 [[package]]
 name = "mesofact-ssr"
-version = "0.8.43"
+version = "0.8.45"
 dependencies = [
  "anyhow",
  "deno_core",
@@ -4442,7 +4478,7 @@ dependencies = [
 
 [[package]]
 name = "rnpm"
-version = "0.8.43"
+version = "0.8.45"
 dependencies = [
  "anyhow",
  "node-semver",
@@ -7218,7 +7254,7 @@ checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"
 
 [[package]]
 name = "yah-almanac"
-version = "0.8.43"
+version = "0.8.45"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7240,7 +7276,7 @@ dependencies = [
 
 [[package]]
 name = "yah-local-driver"
-version = "0.8.43"
+version = "0.8.45"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7258,18 +7294,21 @@ dependencies = [
 
 [[package]]
 name = "yah-mesofact-bundle"
-version = "0.8.43"
+version = "0.8.45"
 dependencies = [
  "blake3",
+ "brotli",
+ "flate2",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
  "toml",
 ]
 
 [[package]]
 name = "yah-object-store"
-version = "0.8.43"
+version = "0.8.45"
 dependencies = [
  "fob",
  "hex",
@@ -7282,7 +7321,7 @@ dependencies = [
 
 [[package]]
 name = "yah-workload-spec"
-version = "0.8.43"
+version = "0.8.45"
 dependencies = [
  "anyhow",
  "async-trait",

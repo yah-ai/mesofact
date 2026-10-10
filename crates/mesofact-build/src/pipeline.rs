@@ -362,9 +362,17 @@ pub async fn build(opts: BuildOptions) -> Result<BuildResult> {
         inferred_sources.insert(r.route.clone(), infer_from_file(&entry)?.source_reads);
     }
 
-    // Phase 6 — static assets (R490-F4).
-    let static_assets =
-        crate::assets::discover_static_assets(&project_root, &out_dir, &config.public_dir)?;
+    // Phase 6 — static assets (R490-F4). Immutability is the component's own
+    // `[build] immutable` declaration (MFT-R825-F1) — the same patterns the
+    // publish-time asset index is built from, so the manifest and the served
+    // `Cache-Control` cannot disagree.
+    let declared_immutable = yah_mesofact_bundle::assets::declared_immutable(&project_root)?;
+    let static_assets = crate::assets::discover_static_assets(
+        &project_root,
+        &out_dir,
+        &config.public_dir,
+        &declared_immutable,
+    )?;
 
     // Phase 7 — manifest assembly + validation (before any HTML lands).
     let mut manifest = crate::manifest_build::assemble_manifest(crate::manifest_build::AssembleInput {

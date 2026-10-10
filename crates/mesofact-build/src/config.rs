@@ -18,6 +18,10 @@ impl Default for BuildConfig {
     }
 }
 
+/// `[build] immutable` lives in the same file but is deliberately NOT read
+/// here: its one reader is `yah_mesofact_bundle::assets::declared_immutable`,
+/// shared with bundle assembly, which also runs for non-mesofact components
+/// (MFT-R825-F1). A second parse of the key here would be a second rule.
 pub fn load_config(project_root: &Path) -> Result<BuildConfig> {
     let path = project_root.join("mesofact.config.toml");
     if !path.exists() {

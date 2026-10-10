@@ -173,7 +173,13 @@ impl CachePolicyTable {
         };
         // 3xx/5xx get nothing: a redirect's lifetime is not the page's, and
         // caching a 500 for the page's TTL turns a blip into an outage.
-        let cc = if status.is_success() {
+        //
+        // Except 304, which is not a redirect but a re-validation of the 200
+        // (MFT-R825-F1: the static tier answers `If-None-Match` now). A cache
+        // REPLACES the stored response's headers with the 304's (RFC 9111
+        // §4.3.4), so a 304 without the page's `Cache-Control` would silently
+        // downgrade the declared TTL to whatever the static tier defaulted to.
+        let cc = if status.is_success() || status == StatusCode::NOT_MODIFIED {
             rule.ok.as_ref()
         } else if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
             rule.negative.as_ref()
@@ -285,6 +291,18 @@ mod tests {
             header_of(&table, "/issues", StatusCode::OK).as_deref(),
             Some("public, max-age=3600, stale-while-revalidate=86400"),
         );
+    }
+
+    /// A 304 refreshes the cached 200's headers, so it must carry the same
+    /// declared policy — or one revalidation erases the route's TTL.
+    #[test]
+    fn a_not_modified_revalidation_carries_the_declared_ttl() {
+        let table = CachePolicyTable::from_routes(&[route("/issues", policy(3600, None, None, None), None)]);
+        assert_eq!(
+            header_of(&table, "/issues", StatusCode::NOT_MODIFIED).as_deref(),
+            Some("public, max-age=3600"),
+        );
+        assert_eq!(header_of(&table, "/issues", StatusCode::FOUND), None, "a redirect still gets nothing");
     }
 
     /// The row that is a correctness bug rather than a missing optimization:

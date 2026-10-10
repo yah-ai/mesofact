@@ -161,6 +161,14 @@ function httpGet(origin: string): AssetGet {
 /** An R2 binding as an `AssetGet`. The object's own HTTP metadata
  *  (content-type, cache-control, …) and its etag travel on the response, which
  *  is what an R2 custom domain would have served for the same key. */
+/// @yah:ticket(R825-F2, "mesofact-edge: R2-bound static routes bypass the edge cache — serve cacheable objects through caches.default")
+/// @yah:at(2026-10-10T01:09:26Z)
+/// @yah:assignee(agent:bundle-anthropic-glimmerstone)
+/// @yah:parent(R825)
+/// @yah:next("Measured 2026-10-10 01:03Z: two back-to-back GETs of https://cdn.noisetable.com/desktop/v0.4.1/aarch64-apple-darwin.json (a noisetable-releases object behind a `bucket =` route) carry NO cf-cache-status header at all. r2Get calls bucket.get(key) on every request and nothing in the Worker touches caches.default, so on a Worker custom domain every hit is an R2 read; Cloudflare's edge cache never sees these responses. Compression is not the problem: the same responses come back content-encoding: br.")
+/// @yah:next("Route R2-binding GETs through the Cache API: caches.default.match first; on a miss, r2Get, and when the object's own Cache-Control is cacheable (e.g. the `public, max-age=31536000, immutable` that `yah cloud bucket put --cache-control immutable` stores) put the response with ctx.waitUntil. Key on the URL alone: route headers are stamped afterwards by applyRouteHeaders, so they need not live in the cached entry. Never cache a 404, and keep a `no-cache` pointer (latest.txt, index.json) uncached.")
+/// @yah:next("Consumer: noisetable camp R822-F1 (board path ~/ss/noisetable). It moves noisetable.com/app's ~35 MB wasm to https://cdn.noisetable.com/app/<blake3>.wasm on a noisetable-releases route, immutable. Done when a second GET of that URL reports cf-cache-status: HIT. A cross-camp depends_on will not fire, so ping that ticket by board_update when this lands and the Worker is redeployed (yah cloud apply --env prod from ~/ss/noisetable).")
+/// @yah:verify("curl -sI twice on an immutable object under a bucket route: the second response carries cf-cache-status: HIT and the same ETag, Content-Type and Cache-Control as the first, and the route's declared headers (ACAO, CORP) are still present on the HIT.")
 function r2Get(bucket: R2Bucket): AssetGet {
   return async (key) => {
     const obj = await bucket.get(key);
@@ -654,6 +662,13 @@ function routingUnavailable(path: string, err: unknown): Response {
   });
 }
 
+/// @yah:relay(R826, "Route CORS allowlist: reflect Origin from a declared list with Vary: Origin, in both doors")
+/// @yah:at(2026-10-10T01:13:32Z)
+/// @yah:assignee(agent:bundle-anthropic-glimmerstone)
+/// @yah:next("Consumer: noisetable camp R822-F1 (board path ~/ss/noisetable). noisetable.com/app now loads its wasm from https://cdn.noisetable.com/app/<blake3>.wasm, a CORS-mode fetch under COEP require-corp. A route's [routes.headers] map can carry one literal Access-Control-Allow-Origin, so staging.noisetable.com/app and the dev mirror's localhost door are refused. Operator 2026-10-10: not `*` (no third-party sites embedding the wasm); wants the most robust CORS setup, one that does not fail.")
+/// @yah:next("Primitive: a route-level origin allowlist declared in the domain TOML beside [routes.headers]. The door echoes the request's Origin as ACAO only when it is listed, sends `Vary: Origin` on EVERY response from that route (including ones without ACAO, so neither the edge nor a browser cache replays one origin's answer to another), and refuses nothing else. yubaba validates at manifest load: refuse a route that declares both the list and a literal ACAO header, and refuse `*` or `null` entries.")
+/// @yah:next("One table, both doors (R898-F3's one-walk rule): mesofact-edge's applyRouteHeaders for the Worker and the passway route_headers path. Apply after any edge-cache lookup (R825-F2) so cached entries stay origin-neutral.")
+/// @yah:next("Done when the noisetable cdn /app/* route declares [https://noisetable.com, https://staging.noisetable.com]: curl with each Origin gets that origin echoed plus Vary: Origin, Origin https://evil.example gets no ACAO, and no Origin gets CORP only. A cross-camp depends_on will not fire, so tell R822-F1 by board_update.")
 function applyRouteHeaders(
   resp: Response,
   entry: RouteEntry | undefined,

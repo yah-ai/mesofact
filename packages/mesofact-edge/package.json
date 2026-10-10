@@ -1,6 +1,6 @@
 {
   "name": "@mesofact/edge",
-  "version": "0.8.43",
+  "version": "0.8.45",
   "description": "Manifest-driven Cloudflare Worker for mesofact sites: static / SPA / SSR routing, error_routes, and pointer-store resolution for instance-addressed routes. The versioned serving artifact yah's cloud reconciler deploys.",
   "license": "MIT OR Apache-2.0",
   "private": true,

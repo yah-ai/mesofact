@@ -101,6 +101,7 @@
 // facade crate root (`lib.rs`); this module only needs them in scope. The
 // dev-only `watcher` / `s3` modules stayed behind in `mesofact-dev` — the whole
 // point of the split (W225 §2: prod must not link dev affordances).
+use crate::asset_response::AssetCache;
 use crate::proxy::{ProxyMap, ProxyState};
 use crate::cache_headers::{apply_cache_policy, CachePolicyTable};
 use crate::route_headers::{apply_route_headers, RouteHeaderTable};
@@ -258,6 +259,9 @@ pub struct Server {
 #[derive(Clone)]
 struct ServerState {
     pointer: DistPointer,
+    /// Parsed asset indexes + on-demand hashes behind static responses'
+    /// `ETag` / `Cache-Control` / `Content-Encoding` (MFT-R825-F1).
+    assets: Arc<AssetCache>,
     #[cfg(feature = "ssr")]
     ssr: SsrSlot,
     proxy: Option<ProxyState>,
@@ -532,6 +536,7 @@ impl Server {
         self.install_gates();
         let state = ServerState {
             pointer: self.pointer.clone(),
+            assets: Arc::new(AssetCache::default()),
             #[cfg(feature = "ssr")]
             ssr: self.ssr.clone(),
             proxy: self.proxy.clone(),
@@ -942,7 +947,7 @@ async fn serve_dynamic(State(state): State<ServerState>, req: Request) -> Respon
 
     // Static disk resolution first (the common hit). `None` = a normal-path
     // miss, eligible for instance-addressed resolution then the error page.
-    if let Some(resp) = serve_static(&dist, &uri_path).await {
+    if let Some(resp) = serve_static(&state.assets, &dist, &uri_path, req.headers()).await {
         return resp;
     }
 
@@ -1204,7 +1209,17 @@ fn forward_response(resp: DispatchResponse) -> Response {
 /// for a hit, a bad request, or a hydrate-bundle outcome (all terminal); `None`
 /// for a normal-path miss, which [`serve_dynamic`] resolves as an
 /// instance-addressed route (W270 §9) then the error page.
-async fn serve_static(dist: &Path, uri_path: &str) -> Option<Response> {
+///
+/// Every hit goes through [`crate::asset_response::respond`], which adds the
+/// `ETag` / `Cache-Control` / `Content-Encoding` the tree's asset index
+/// declares (MFT-R825-F1). `req` is read for `If-None-Match` and
+/// `Accept-Encoding` only.
+async fn serve_static(
+    assets: &AssetCache,
+    dist: &Path,
+    uri_path: &str,
+    req: &axum::http::HeaderMap,
+) -> Option<Response> {
     let Some(rel) = sanitize(uri_path) else {
         return Some((StatusCode::BAD_REQUEST, "invalid path").into_response());
     };
@@ -1212,12 +1227,15 @@ async fn serve_static(dist: &Path, uri_path: &str) -> Option<Response> {
     // Hydrate bundles live at <dist>/../hydrate/ (peer of html/).
     // Prerendered HTML references them as /{build_id}/hydrate/<hash>.js;
     // strip the opaque build_id prefix (or serve /hydrate/<file> directly).
+    // The hydrate dir is its own served root: it carries its own asset index.
     if let Some(hydrate_rel) = hydrate_suffix(&rel) {
         let hydrate_dir = dist.parent().unwrap_or(dist).join("hydrate");
         let target = hydrate_dir.join(&hydrate_rel);
-        if let Ok(bytes) = tokio::fs::read(&target).await {
-            let mime = mime_for(&target);
-            return Some(([(header::CONTENT_TYPE, mime)], bytes).into_response());
+        let mime = mime_for(&target);
+        if let Some(resp) =
+            crate::asset_response::respond(assets, &hydrate_dir, &target, mime, req).await
+        {
+            return Some(resp);
         }
         // A hydrate-bundle miss is an asset 404, not an instance-addressed
         // route — resolve the error page directly (terminal).
@@ -1246,9 +1264,9 @@ async fn serve_static(dist: &Path, uri_path: &str) -> Option<Response> {
         candidates.push(base.join("index.html"));
     }
     for target in &candidates {
-        if let Ok(bytes) = tokio::fs::read(target).await {
-            let mime = mime_for(target);
-            return Some(([(header::CONTENT_TYPE, mime)], bytes).into_response());
+        let mime = mime_for(target);
+        if let Some(resp) = crate::asset_response::respond(assets, dist, target, mime, req).await {
+            return Some(resp);
         }
     }
 
@@ -2612,6 +2630,130 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("application/wasm"),
         );
+    }
+
+    /// Stage a Trunk-shaped component at `/app` the way a merged bundle does
+    /// (MFT-R825-F1): its out_dir is finalized by the real
+    /// `collect_component_files`, then every collected file lands at its
+    /// bundle path. Returns `(bundle, out_dir)`.
+    fn bundle_with_mounted_component() -> (tempfile::TempDir, tempfile::TempDir) {
+        let bundle = bundle_with("mesofact/0.8.20", &[("index.html", "<h1>site</h1>")]);
+        let project = tempdir().unwrap();
+        std::fs::write(
+            project.path().join("mesofact.config.toml"),
+            "[build]\nimmutable = [\"*_bg.wasm\"]\n",
+        )
+        .unwrap();
+        let out = project.path().join("dist");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("index.html"), "<p>app shell</p>\n".repeat(200)).unwrap();
+        std::fs::write(out.join("app-0123abcd_bg.wasm"), b"\0asm\x01\0\0\0".repeat(1000)).unwrap();
+
+        let files =
+            yah_mesofact_bundle::collect_component_files(project.path(), &out, Some("app"), false)
+                .unwrap();
+        for (bundle_path, src) in files {
+            let dest = bundle.path().join(bundle_path);
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::copy(src, dest).unwrap();
+        }
+        (bundle, project)
+    }
+
+    async fn fetch(app: &Router, uri: &str, headers: &[(&str, &str)]) -> Response {
+        let mut req = Request::builder().uri(uri);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
+    }
+
+    fn hdr<'a>(resp: &'a Response, name: header::HeaderName) -> Option<&'a str> {
+        resp.headers().get(name).and_then(|v| v.to_str().ok())
+    }
+
+    /// The R825 measurement, inverted: a declared-immutable asset under a
+    /// mount gets a year of cache, a validator, and brotli bytes written at
+    /// publish time — not the identity bytes with no headers at all.
+    #[tokio::test]
+    async fn a_declared_immutable_asset_is_cacheable_validated_and_precompressed() {
+        let (bundle, project) = bundle_with_mounted_component();
+        let app = Server::from_bundle(bundle.path()).unwrap().router();
+
+        let resp = fetch(&app, "/app/app-0123abcd_bg.wasm", &[("accept-encoding", "gzip, br")]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(hdr(&resp, header::CACHE_CONTROL), Some("public, max-age=31536000, immutable"));
+        assert_eq!(hdr(&resp, header::CONTENT_ENCODING), Some("br"));
+        assert_eq!(hdr(&resp, header::CONTENT_TYPE), Some("application/wasm"), "type of the identity, not of .br");
+        assert_eq!(hdr(&resp, header::VARY), Some("accept-encoding"));
+        let identity = std::fs::read(project.path().join("dist/app-0123abcd_bg.wasm")).unwrap();
+        let sha = yah_mesofact_bundle::assets::sha256_hex(&identity);
+        assert_eq!(hdr(&resp, header::ETAG).map(str::to_string), Some(format!("\"{sha}.br\"")));
+        let br = std::fs::read(project.path().join("dist/app-0123abcd_bg.wasm.br")).unwrap();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), br.as_slice());
+
+        // No Accept-Encoding ⇒ identity bytes, identity ETag = the content hash.
+        let plain = fetch(&app, "/app/app-0123abcd_bg.wasm", &[]).await;
+        assert_eq!(hdr(&plain, header::CONTENT_ENCODING), None);
+        assert_eq!(hdr(&plain, header::ETAG).map(str::to_string), Some(format!("\"{sha}\"")));
+        assert_eq!(hdr(&plain, header::VARY), Some("accept-encoding"));
+        let body = to_bytes(plain.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), identity.as_slice());
+    }
+
+    /// Unlisted files revalidate on every use, and the revalidation is a
+    /// bodiless 304 carrying the same validator headers.
+    #[tokio::test]
+    async fn an_undeclared_file_is_no_cache_and_revalidates_with_304() {
+        let (bundle, _project) = bundle_with_mounted_component();
+        let app = Server::from_bundle(bundle.path()).unwrap().router();
+
+        let first = fetch(&app, "/app/index.html", &[("accept-encoding", "gzip")]).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(hdr(&first, header::CACHE_CONTROL), Some("no-cache"));
+        assert_eq!(hdr(&first, header::CONTENT_ENCODING), Some("gzip"));
+        let etag = hdr(&first, header::ETAG).unwrap().to_string();
+        assert!(etag.ends_with(".gzip\""), "{etag}");
+
+        let again = fetch(&app, "/app/index.html", &[("accept-encoding", "gzip"), ("if-none-match", &etag)]).await;
+        assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(hdr(&again, header::ETAG), Some(etag.as_str()));
+        assert_eq!(hdr(&again, header::CACHE_CONTROL), Some("no-cache"));
+        assert_eq!(hdr(&again, header::VARY), Some("accept-encoding"));
+        assert!(to_bytes(again.into_body(), usize::MAX).await.unwrap().is_empty());
+
+        // A different representation's tag does not validate this one.
+        let other = fetch(&app, "/app/index.html", &[("accept-encoding", "br"), ("if-none-match", &etag)]).await;
+        assert_eq!(other.status(), StatusCode::OK);
+    }
+
+    /// A tree no publish step finalized (dev, a hand-run serve) still gets a
+    /// validator — hashed on demand — and is never claimed immutable.
+    #[tokio::test]
+    async fn an_unindexed_file_still_gets_a_content_hash_etag() {
+        let bundle = bundle_with("mesofact/0.8.20", &[("index.html", "<h1>home</h1>")]);
+        let app = Server::from_bundle(bundle.path()).unwrap().router();
+
+        let resp = fetch(&app, "/", &[("accept-encoding", "br")]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sha = yah_mesofact_bundle::assets::sha256_hex(b"<h1>home</h1>");
+        assert_eq!(hdr(&resp, header::ETAG).map(str::to_string), Some(format!("\"{sha}\"")));
+        assert_eq!(hdr(&resp, header::CACHE_CONTROL), Some("no-cache"));
+        assert_eq!(hdr(&resp, header::CONTENT_ENCODING), None);
+
+        let etag = format!("\"{sha}\"");
+        let again = fetch(&app, "/", &[("if-none-match", &etag)]).await;
+        assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    /// The index is serving metadata, not content.
+    #[tokio::test]
+    async fn the_asset_index_itself_is_not_served() {
+        let (bundle, _project) = bundle_with_mounted_component();
+        let app = Server::from_bundle(bundle.path()).unwrap().router();
+        let resp = fetch(&app, "/app/.mesofact-assets.json", &[]).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     /// The other half of the same contract: a bundle with no beacon must 404,
